@@ -30,14 +30,14 @@ export type UpdateHook = {
   command: string;
 };
 
-export type CollectionPath = {
+type CollectionPath = {
   collection: string;
   path: string;
 };
 
-export type ModelSlot = "embed" | "rerank" | "generate";
+type ModelSlot = "embed" | "rerank" | "generate";
 
-export type ModelsSnapshot = {
+type ModelsSnapshot = {
   embed?: string;
   rerank?: string;
   generate?: string;
@@ -85,12 +85,12 @@ export function isLocalConfigPath(configPath: string): boolean {
 }
 
 /** Directory that contains the `.qmd` folder for a project-local config. */
-export function projectRootFromConfig(configPath: string): string {
+function projectRootFromConfig(configPath: string): string {
   return dirname(dirname(resolve(configPath)));
 }
 
 /** Expand a leading `~` to the user home directory. */
-export function expandUserPath(raw: string): string {
+function expandUserPath(raw: string): string {
   if (raw === "~") return qmdHomedir();
   if (raw.startsWith("~/") || raw.startsWith("~\\")) {
     return join(qmdHomedir(), raw.slice(2));
@@ -132,7 +132,7 @@ export function isCollectionPathInsideProject(configPath: string, rawPath: strin
   return !rel.split(/[/\\]/).includes("..");
 }
 
-export function gatedModels(
+function gatedModels(
   models: ModelsSnapshot,
   builtins: BuiltinModels,
 ): Array<{ slot: ModelSlot; uri: string }> {

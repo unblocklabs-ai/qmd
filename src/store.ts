@@ -16,6 +16,7 @@ import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
+import { performance } from "node:perf_hooks";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
 import { qmdHomedir } from "./paths.js";
@@ -37,6 +38,10 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
+import {
+  chunkMarkdownSemantically,
+  SEMANTIC_CHUNKING_VERSION,
+} from "./semantic-chunking.js";
 
 // =============================================================================
 // Configuration
@@ -46,6 +51,25 @@ export const DEFAULT_EMBED_MODEL = DEFAULT_EMBED_MODEL_URI;
 export const DEFAULT_RERANK_MODEL = DEFAULT_RERANK_MODEL_URI;
 export const DEFAULT_QUERY_MODEL = DEFAULT_GENERATE_MODEL_URI;
 export const DEFAULT_GLOB = "**/*.md";
+
+export type VectorSearchStage =
+  | "index_check"
+  | "embedding"
+  | "scope_resolution"
+  | "vector_scan_knn"
+  | "hydration"
+  | "result_mapping";
+
+export interface VectorSearchTiming {
+  stage: VectorSearchStage;
+  durationMs: number;
+  /** Present for stages that can repeat while adaptive over-fetch finds unique documents. */
+  attempt?: number;
+  /** Native KNN candidate count requested for this attempt. */
+  candidateK?: number;
+}
+
+export type VectorSearchTrace = (timing: VectorSearchTiming) => void;
 
 /**
  * Split a collection glob mask into fast-glob patterns.
@@ -94,7 +118,7 @@ export function splitGlobMask(mask: string): string[] {
 export const DEFAULT_MULTI_GET_MAX_BYTES = 64 * 1024; // 64KB
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
-export const DEFAULT_EMBED_MAX_DURATION_MS = 30 * 60 * 1000; // 30 minutes; see EmbedOptions.maxDurationMs
+const DEFAULT_EMBED_MAX_DURATION_MS = 30 * 60 * 1000; // 30 minutes; see EmbedOptions.maxDurationMs
 
 const EMBED_FINGERPRINT_PROBE_QUERY = "__qmd_embedding_query_probe__";
 const EMBED_FINGERPRINT_PROBE_TITLE = "__qmd_embedding_title_probe__";
@@ -102,24 +126,31 @@ const EMBED_FINGERPRINT_PROBE_DOC = "__qmd_embedding_document_probe__";
 
 // Chunking: 900 tokens per chunk with 15% overlap
 // Increased from 800 to accommodate smart chunking finding natural break points
-export const CHUNK_SIZE_TOKENS = 900;
-export const CHUNK_OVERLAP_TOKENS = Math.floor(CHUNK_SIZE_TOKENS * 0.15);  // 135 tokens (15% overlap)
+const CHUNK_SIZE_TOKENS = 900;
+const CHUNK_OVERLAP_TOKENS = Math.floor(CHUNK_SIZE_TOKENS * 0.15);  // 135 tokens (15% overlap)
 // Fallback char-based approximation for sync chunking (~4 chars per token)
-export const CHUNK_SIZE_CHARS = CHUNK_SIZE_TOKENS * 4;  // 3600 chars
-export const CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP_TOKENS * 4;  // 540 chars
+const CHUNK_SIZE_CHARS = CHUNK_SIZE_TOKENS * 4;  // 3600 chars
+const CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP_TOKENS * 4;  // 540 chars
 // Search window for finding optimal break points (in tokens, ~200 tokens)
-export const CHUNK_WINDOW_TOKENS = 200;
-export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
+const CHUNK_WINDOW_TOKENS = 200;
+const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
 
-export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): string {
+export function getEmbeddingFingerprint(
+  model: string = DEFAULT_EMBED_MODEL,
+  chunkStrategy: ChunkStrategy = "regex",
+): string {
   const significant = [
     `model:${model}`,
     `query:${formatQueryForEmbedding(EMBED_FINGERPRINT_PROBE_QUERY, model)}`,
     `doc:${formatDocForEmbedding(EMBED_FINGERPRINT_PROBE_DOC, EMBED_FINGERPRINT_PROBE_TITLE, model)}`,
     `chunk_tokens:${CHUNK_SIZE_TOKENS}`,
     `chunk_overlap_tokens:${CHUNK_OVERLAP_TOKENS}`,
-  ].join("\n");
-  return createHash("sha256").update(significant).digest("hex").slice(0, 6);
+  ];
+  // Keep the historical regex fingerprint stable so adding this opt-in mode
+  // does not force every existing default index to rebuild.
+  if (chunkStrategy !== "regex") significant.push(`chunk_strategy:${chunkStrategy}`);
+  if (chunkStrategy === "semantic") significant.push(`semantic_chunking_version:${SEMANTIC_CHUNKING_VERSION}`);
+  return createHash("sha256").update(significant.join("\n")).digest("hex").slice(0, 6);
 }
 
 /**
@@ -158,7 +189,7 @@ export interface CodeFenceRegion {
  * Scores are spread wide so headings decisively beat lower-quality breaks.
  * Order matters for scoring - more specific patterns first.
  */
-export const BREAK_PATTERNS: [RegExp, number, string][] = [
+const BREAK_PATTERNS: [RegExp, number, string][] = [
   [/\n#{1}(?!#)/g, 100, 'h1'],     // # but not ##
   [/\n#{2}(?!#)/g, 90, 'h2'],      // ## but not ###
   [/\n#{3}(?!#)/g, 80, 'h3'],      // ### but not ####
@@ -291,7 +322,7 @@ export function findBestCutoff(
 // Chunk Strategy
 // =============================================================================
 
-export type ChunkStrategy = "auto" | "regex";
+export type ChunkStrategy = "auto" | "regex" | "semantic";
 
 /**
  * Merge two sets of break points (e.g. regex + AST), keeping the highest
@@ -418,7 +449,7 @@ export const STRONG_SIGNAL_MIN_SCORE = 0.85;
 export const STRONG_SIGNAL_MIN_GAP = 0.15;
 // Max candidates to pass to reranker — balances quality vs latency.
 // 40 keeps rank 31-40 visible to the reranker (matters for recall on broad queries).
-export const RERANK_CANDIDATE_LIMIT = 40;
+const RERANK_CANDIDATE_LIMIT = 40;
 
 /**
  * A typed query expansion result. Decoupled from llm.ts internal Queryable —
@@ -871,7 +902,7 @@ const STORE_SCHEMA_VERSION = 1;
  * Normalize CJK runs by spacing every character so exact CJK queries can be
  * translated into phrase queries while Latin text keeps the default tokenizer.
  */
-export function normalizeCjkForFTS(text: string): string {
+function normalizeCjkForFTS(text: string): string {
   return text.replace(CJK_RUN_PATTERN, run => ` ${Array.from(run).join(' ')} `);
 }
 
@@ -1242,6 +1273,7 @@ function initializeDatabase(db: Database): void {
       hash TEXT NOT NULL,
       seq INTEGER NOT NULL DEFAULT 0,
       pos INTEGER NOT NULL DEFAULT 0,
+      chunk_len INTEGER NOT NULL DEFAULT 0,
       model TEXT NOT NULL,
       embed_fingerprint TEXT NOT NULL DEFAULT '',
       total_chunks INTEGER NOT NULL DEFAULT 1,
@@ -1323,6 +1355,22 @@ export function getStoreGlobalContext(db: Database): string | undefined {
   const row = db.prepare(`SELECT value FROM store_config WHERE key = 'global_context'`).get() as { value: string } | null | undefined;
   if (row == null) return undefined;
   return row.value || undefined;
+}
+
+const EMBEDDING_CHUNK_STRATEGY_KEY = "embedding_chunk_strategy";
+
+export function getEmbeddingChunkStrategy(db: Database): ChunkStrategy {
+  const row = db.prepare(`SELECT value FROM store_config WHERE key = ?`).get(EMBEDDING_CHUNK_STRATEGY_KEY) as { value: string } | null | undefined;
+  return row?.value === "auto" || row?.value === "semantic" || row?.value === "regex"
+    ? row.value
+    : "regex";
+}
+
+function setEmbeddingChunkStrategy(db: Database, strategy: ChunkStrategy): void {
+  db.prepare(`
+    INSERT INTO store_config (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(EMBEDDING_CHUNK_STRATEGY_KEY, strategy);
 }
 
 export function getStoreContexts(db: Database): Array<{ collection: string; path: string; context: string }> {
@@ -1457,7 +1505,7 @@ export function syncConfigToDb(db: Database, config: CollectionConfig): void {
 }
 
 
-export function isSqliteVecAvailable(): boolean {
+function isSqliteVecAvailable(): boolean {
   return _sqliteVecAvailable === true;
 }
 
@@ -1531,7 +1579,7 @@ export type Store = {
 
   // Search
   searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[]) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], trace?: VectorSearchTrace) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
@@ -1562,7 +1610,7 @@ export type Store = {
   // Vector/embedding operations
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
   clearAllEmbeddings: () => void;
-  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number, fingerprint?: string) => void;
+  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number, fingerprint?: string, chunkLen?: number) => void;
 };
 
 // =============================================================================
@@ -1583,7 +1631,7 @@ export type ReindexProgress = {
   total: number;
 };
 
-export type ReindexSkippedFile = {
+type ReindexSkippedFile = {
   file: string;
   code: string;
 };
@@ -1724,7 +1772,7 @@ export async function reindexCollection(
   return { indexed, updated, unchanged, removed, orphanedCleaned, skipped: skippedFiles.length, skippedFiles };
 }
 
-export type EmbedFailure = {
+type EmbedFailure = {
   path: string;
   hash: string;
   seq: number;
@@ -1789,6 +1837,7 @@ type ChunkItem = {
   text: string;
   seq: number;
   pos: number;
+  chunkLen: number;
   tokens: number;
   bytes: number;
   expectedTotalChunks: number;
@@ -1812,6 +1861,7 @@ function resolveEmbedOptions(options?: EmbedOptions): Required<Pick<EmbedOptions
 const CONTENT_VECTOR_DESIRED_COLUMNS: { name: string; definition: string }[] = [
   { name: "seq", definition: "INTEGER NOT NULL DEFAULT 0" },
   { name: "pos", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { name: "chunk_len", definition: "INTEGER NOT NULL DEFAULT 0" },
   { name: "model", definition: "TEXT NOT NULL DEFAULT ''" },
   { name: "embed_fingerprint", definition: "TEXT NOT NULL DEFAULT ''" },
   { name: "total_chunks", definition: "INTEGER NOT NULL DEFAULT 1" },
@@ -1882,9 +1932,14 @@ function withLazyContentVectorMigration<T>(db: Database, operation: () => T): T 
   }
 }
 
-function getPendingEmbeddingDocs(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): PendingEmbeddingDoc[] {
+function getPendingEmbeddingDocs(
+  db: Database,
+  collection?: string,
+  model: string = DEFAULT_EMBED_MODEL,
+  chunkStrategy: ChunkStrategy = getEmbeddingChunkStrategy(db),
+): PendingEmbeddingDoc[] {
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
-  const fingerprint = getEmbeddingFingerprint(model);
+  const fingerprint = getEmbeddingFingerprint(model, chunkStrategy);
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
       SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
@@ -1966,7 +2021,13 @@ export async function generateEmbeddings(
   const db = store.db;
   const llm = getLlm(store);
   const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
-  const fingerprint = getEmbeddingFingerprint(model);
+  const storedChunkStrategy = getEmbeddingChunkStrategy(db);
+  const chunkStrategy = options?.chunkStrategy ?? storedChunkStrategy;
+  if (options?.collection && options.chunkStrategy && options.chunkStrategy !== storedChunkStrategy) {
+    throw new Error("Changing chunk strategy requires embedding the full index; omit --collection");
+  }
+  setEmbeddingChunkStrategy(db, chunkStrategy);
+  const fingerprint = getEmbeddingFingerprint(model, chunkStrategy);
   const now = new Date().toISOString();
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
   const encoder = new TextEncoder();
@@ -1975,7 +2036,7 @@ export async function generateEmbeddings(
     clearAllEmbeddings(db, options?.collection);
   }
 
-  const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection, model);
+  const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection, model, chunkStrategy);
 
   if (docsToEmbed.length === 0) {
     return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
@@ -2032,7 +2093,7 @@ export async function generateEmbeddings(
           recordFailure(chunk, "embedding returned no vector");
           return false;
         }
-        insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
+        insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, chunk.expectedTotalChunks, fingerprint, chunk.chunkLen);
         chunksEmbedded++;
         successesSinceRetry++;
         clearFailure(chunk);
@@ -2083,13 +2144,42 @@ export async function generateEmbeddings(
         if (!doc.body.trim()) continue;
 
         const title = extractTitle(doc.body, doc.path);
-        const chunks = await chunkDocumentByTokens(
-          doc.body,
-          undefined, undefined, undefined,
-          doc.path,
-          options?.chunkStrategy,
-          session.signal,
-        );
+        let chunks: { text: string; pos: number; tokens: number }[];
+        if (chunkStrategy === "semantic") {
+          const { detectLanguage } = await import("./ast.js");
+          chunks = detectLanguage(doc.path)
+            ? await chunkDocumentByTokens(
+              doc.body,
+              undefined, undefined, undefined,
+              doc.path,
+              "auto",
+              session.signal,
+            )
+            : await chunkMarkdownSemantically(doc.body, doc.path, {
+              signal: session.signal,
+              countTokens: async (text) => (await llm.tokenize(text)).length,
+              embedBatch: async (texts) => {
+                const results = await session.embedBatch(
+                  texts.map(text => formatDocForEmbedding(text, undefined, embedModelUri)),
+                  { model },
+                );
+                return results.map((result) => {
+                  if (!result) throw new Error("semantic boundary embedding returned no vector");
+                  return result.embedding;
+                });
+              },
+            });
+        } else {
+          chunks = await chunkDocumentByTokens(
+            doc.body,
+            undefined, undefined, undefined,
+            doc.path,
+            chunkStrategy,
+            session.signal,
+          );
+        }
+
+        removeStaleEmbeddingChunks(db, doc.hash, model, fingerprint);
 
         for (let seq = 0; seq < chunks.length; seq++) {
           batchChunks.push({
@@ -2099,6 +2189,7 @@ export async function generateEmbeddings(
             text: chunks[seq]!.text,
             seq,
             pos: chunks[seq]!.pos,
+            chunkLen: chunks[seq]!.text.length,
             tokens: chunks[seq]!.tokens,
             bytes: encoder.encode(chunks[seq]!.text).length,
             expectedTotalChunks: chunks.length,
@@ -2157,7 +2248,7 @@ export async function generateEmbeddings(
             const chunk = chunkBatch[i]!;
             const embedding = embeddings[i];
             if (embedding) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, chunk.expectedTotalChunks, fingerprint, chunk.chunkLen);
               chunksEmbedded++;
               successesSinceRetry++;
               clearFailure(chunk);
@@ -2272,7 +2363,7 @@ export function createStore(dbPath?: string): Store {
 
     // Search
     searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[]) => searchFTS(db, query, limit, collectionName),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, getLlm(store)),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], trace?: VectorSearchTrace) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, getLlm(store), trace),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, store.llm),
@@ -2308,7 +2399,7 @@ export function createStore(dbPath?: string): Store {
     // Vector/embedding operations
     getHashesForEmbedding: () => getHashesForEmbedding(db),
     clearAllEmbeddings: () => clearAllEmbeddings(db),
-    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number, fingerprint?: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, totalChunks, fingerprint),
+    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number, fingerprint?: string, chunkLen?: number) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, totalChunks, fingerprint, chunkLen),
   };
 
   return store;
@@ -2338,7 +2429,7 @@ export type DocumentResult = {
 /**
  * Extract short docid from a full hash (first 6 characters).
  */
-export function getDocid(hash: string): string {
+function getDocid(hash: string): string {
   return hash.slice(0, 6);
 }
 
@@ -2419,6 +2510,14 @@ export type SearchResult = DocumentResult & {
   score: number;              // Relevance score (0-1)
   source: "fts" | "vec";      // Search source (full-text or vector)
   chunkPos?: number;          // Character position of matching chunk (for vector search)
+  chunkLen?: number;          // Exact UTF-16 length of the matching embedded chunk
+  /** Other active paths with the same canonical document content. */
+  aliases?: Array<{
+    filepath: string;
+    displayPath: string;
+    title: string;
+    collectionName: string;
+  }>;
 };
 
 /**
@@ -2430,9 +2529,11 @@ export type RankedResult = {
   title: string;
   body: string;
   score: number;
+  chunkPos?: number;
+  chunkLen?: number;
 };
 
-export type RRFContributionTrace = {
+type RRFContributionTrace = {
   listIndex: number;
   source: "fts" | "vec";
   queryType: "original" | "lex" | "vec" | "hyde";
@@ -2498,7 +2599,7 @@ export type MultiGetResult = {
   skipReason: string;
 };
 
-export type CollectionInfo = {
+type CollectionInfo = {
   name: string;
   path: string | null;
   pattern: string | null;
@@ -2519,7 +2620,7 @@ export type IndexStatus = {
 
 export function getHashesNeedingEmbedding(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): number {
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
-  const fingerprint = getEmbeddingFingerprint(model);
+  const fingerprint = getEmbeddingFingerprint(model, getEmbeddingChunkStrategy(db));
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
       SELECT COUNT(DISTINCT d.hash) as count
@@ -2553,7 +2654,11 @@ export type LegacyFingerprintAdoptionResult = {
 
 export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: string = DEFAULT_EMBED_MODEL): Promise<LegacyFingerprintAdoptionResult> {
   const db = store.db;
-  const fingerprint = getEmbeddingFingerprint(model);
+  const chunkStrategy = getEmbeddingChunkStrategy(db);
+  if (chunkStrategy === "semantic") {
+    return { checked: false, adopted: 0, reason: "legacy embeddings predate semantic chunking" };
+  }
+  const fingerprint = getEmbeddingFingerprint(model, chunkStrategy);
   const legacyCount = withLazyContentVectorMigration(db, () => {
     const row = db.prepare(`SELECT COUNT(DISTINCT hash) AS count FROM content_vectors WHERE model = ? AND embed_fingerprint = ''`).get(model) as { count: number };
     return row.count;
@@ -2587,7 +2692,7 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
   const llm = getLlm(store);
 
   return await withLLMSessionForLlm(llm, async (session) => {
-    const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
+    const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, chunkStrategy, session.signal);
     const chunk = chunks[sample.seq];
     if (!chunk) {
       return { checked: true, adopted: 0, reason: `sample chunk ${expectedHashSeq} no longer exists` };
@@ -3374,7 +3479,7 @@ export function isDocid(input: string): boolean {
  *
  * Accepts lenient input: #abc123, abc123, "#abc123", "abc123"
  */
-export function findDocumentByDocid(db: Database, docid: string): { filepath: string; hash: string } | null {
+function findDocumentByDocid(db: Database, docid: string): { filepath: string; hash: string } | null {
   const shortHash = normalizeDocid(docid);
 
   if (shortHash.length < 1) return null;
@@ -3571,7 +3676,7 @@ export function getContextForFile(db: Database, filepath: string): string | null
 /**
  * Get collection by name from DB store_collections table.
  */
-export function getCollectionByName(db: Database, name: string): { name: string; pwd: string; glob_pattern: string } | null {
+function getCollectionByName(db: Database, name: string): { name: string; pwd: string; glob_pattern: string } | null {
   const collection = getStoreCollection(db, name);
   if (!collection) return null;
 
@@ -3668,73 +3773,6 @@ export function insertContext(db: Database, collectionName: string, pathPrefix: 
   }
 
   updateStoreContext(db, coll.name, pathPrefix, context);
-}
-
-/**
- * Delete a context for a specific collection and path prefix.
- * Returns the number of contexts deleted.
- */
-export function deleteContext(db: Database, collectionName: string, pathPrefix: string): number {
-  // Remove context from store_collections
-  const success = removeStoreContext(db, collectionName, pathPrefix);
-  return success ? 1 : 0;
-}
-
-/**
- * Delete all global contexts (contexts with empty path_prefix).
- * Returns the number of contexts deleted.
- */
-export function deleteGlobalContexts(db: Database): number {
-  let deletedCount = 0;
-
-  // Remove global context
-  setStoreGlobalContext(db, undefined);
-  deletedCount++;
-
-  // Remove root context (empty string) from all collections
-  const collections = getStoreCollections(db);
-  for (const coll of collections) {
-    const success = removeStoreContext(db, coll.name, '');
-    if (success) {
-      deletedCount++;
-    }
-  }
-
-  return deletedCount;
-}
-
-/**
- * List all contexts, grouped by collection.
- * Returns contexts ordered by collection name, then by path prefix length (longest first).
- */
-export function listPathContexts(db: Database): { collection_name: string; path_prefix: string; context: string }[] {
-  const allContexts = getStoreContexts(db);
-
-  // Convert to expected format and sort
-  return allContexts.map(ctx => ({
-    collection_name: ctx.collection,
-    path_prefix: ctx.path,
-    context: ctx.context,
-  })).sort((a, b) => {
-    // Sort by collection name first
-    if (a.collection_name !== b.collection_name) {
-      return a.collection_name.localeCompare(b.collection_name);
-    }
-    // Then by path prefix length (longest first)
-    if (a.path_prefix.length !== b.path_prefix.length) {
-      return b.path_prefix.length - a.path_prefix.length;
-    }
-    // Then alphabetically
-    return a.path_prefix.localeCompare(b.path_prefix);
-  });
-}
-
-/**
- * Get all collections (name only - from YAML config).
- */
-export function getAllCollections(db: Database): { name: string }[] {
-  const collections = getStoreCollections(db);
-  return collections.map(c => ({ name: c.name }));
 }
 
 /**
@@ -4027,14 +4065,14 @@ export function validateLexQuery(query: string): string | null {
 }
 
 /** One collection, several (OR), or all (undefined). */
-export type CollectionScope = string | readonly string[] | undefined;
+type CollectionScope = string | readonly string[] | undefined;
 
 function scopedCollectionNames(scope: CollectionScope): string[] | undefined {
   if (scope == null) return undefined;
   const names = (typeof scope === "string" ? [scope] : Array.from(scope))
     .map(n => n.trim())
     .filter(n => n.length > 0);
-  return names.length > 0 ? names : undefined;
+  return names.length > 0 ? Array.from(new Set(names)) : undefined;
 }
 
 function mergeSearchResultsByScore(lists: SearchResult[][], limit: number): SearchResult[] {
@@ -4136,179 +4174,212 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 /** sqlite-vec rejects k above this in MATCH queries (v0.1.9). */
 const SQLITE_VEC_MAX_K = 4096;
 
-/**
- * Max collection-scoped vectors for an exact cosine scan. Above this we fall
- * back to global ANN with a capped over-fetch. Exact scan avoids the
- * post-filter starvation of small collections (#791, #803); ANN remains for
- * very large collections where a full scan would be expensive.
- */
-const COLLECTION_VEC_EXACT_SCAN_MAX = 20_000;
-
-const VEC_HASH_SEQ_IN_CHUNK = 400;
+type VecMatch = { hash_seq: string; distance: number };
 
 /**
- * Exact cosine-distance scan over a known set of hash_seq keys.
- * Uses vec_distance_cosine with chunked IN lists (no JOIN with vectors_vec).
+ * Exact sqlite-vec KNN constrained to active, current-model document chunks.
+ *
+ * sqlite-vec v0.1.9 recognizes an IN constraint on a vec0 primary key during
+ * MATCH. Keeping the relational joins inside the IN subquery avoids the old
+ * direct vec0 JOIN hang while making the collection allowlist part of native
+ * KNN rather than an incomplete post-filter.
  */
-function exactVecScanByHashSeq(
-  db: Database,
-  embedding: number[],
-  hashSeqs: string[],
-  limit: number,
-): { hash_seq: string; distance: number }[] {
-  if (hashSeqs.length === 0 || limit <= 0) return [];
-
-  const queryVec = new Float32Array(embedding);
-  // Over-fetch a bit so multi-chunk docs can still yield `limit` unique files.
-  const fetchLimit = Math.max(limit * 3, limit);
-  const scored: { hash_seq: string; distance: number }[] = [];
-
-  for (let i = 0; i < hashSeqs.length; i += VEC_HASH_SEQ_IN_CHUNK) {
-    const chunk = hashSeqs.slice(i, i + VEC_HASH_SEQ_IN_CHUNK);
-    const placeholders = chunk.map(() => "?").join(",");
-    const rows = db.prepare(`
-      SELECT hash_seq, vec_distance_cosine(embedding, ?) AS distance
-      FROM vectors_vec
-      WHERE hash_seq IN (${placeholders})
-    `).all(queryVec, ...chunk) as { hash_seq: string; distance: number }[];
-    scored.push(...rows);
-  }
-
-  scored.sort((a, b) => a.distance - b.distance);
-  return scored.slice(0, fetchLimit);
-}
-
-function annVecScan(
+function knnVecScan(
   db: Database,
   embedding: number[],
   k: number,
-): { hash_seq: string; distance: number }[] {
+  model: string,
+  fingerprint: string,
+  collectionNames: readonly string[] | undefined,
+): VecMatch[] {
   const vecK = Math.max(1, Math.min(SQLITE_VEC_MAX_K, k));
+  const collectionFilter = collectionNames
+    ? `AND d.collection IN (${collectionNames.map(() => "?").join(",")})`
+    : "";
   return db.prepare(`
     SELECT hash_seq, distance
     FROM vectors_vec
-    WHERE embedding MATCH ? AND k = ?
-  `).all(new Float32Array(embedding), vecK) as { hash_seq: string; distance: number }[];
+    WHERE embedding MATCH ?
+      AND k = ?
+      AND hash_seq IN (
+        SELECT DISTINCT cv.hash || '_' || cv.seq
+        FROM content_vectors cv
+        JOIN documents d ON d.hash = cv.hash
+        WHERE d.active = 1
+          AND cv.model = ?
+          AND cv.embed_fingerprint = ?
+          ${collectionFilter}
+      )
+  `).all(
+    new Float32Array(embedding),
+    vecK,
+    model,
+    fingerprint,
+    ...(collectionNames ?? []),
+  ) as VecMatch[];
 }
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, trace?: VectorSearchTrace): Promise<SearchResult[]> {
+  const indexCheckStart = performance.now();
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  trace?.({ stage: "index_check", durationMs: performance.now() - indexCheckStart });
   if (!tableExists) return [];
 
+  const requestedLimit = Math.max(0, Math.floor(limit));
+  if (requestedLimit === 0) return [];
+
+  const scopeStart = performance.now();
+  const names = scopedCollectionNames(collectionName);
+  trace?.({ stage: "scope_resolution", durationMs: performance.now() - scopeStart });
+  // An explicit empty allowlist must never broaden into a global search.
+  if (collectionName !== undefined && names === undefined) return [];
+
+  const embeddingStart = performance.now();
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, llm);
+  trace?.({ stage: "embedding", durationMs: performance.now() - embeddingStart });
   if (!embedding) return [];
 
-  const names = scopedCollectionNames(collectionName);
-  if (names && names.length > 1) {
-    const lists = await Promise.all(
-      names.map(name => searchVec(db, query, model, limit, name, session, embedding, llm)),
-    );
-    return mergeSearchResultsByScore(lists, limit);
-  }
-  const collectionFilter = names?.[0];
+  const fingerprint = getEmbeddingFingerprint(model, getEmbeddingChunkStrategy(db));
+  let candidateK = Math.min(SQLITE_VEC_MAX_K, Math.max(20, requestedLimit * 4));
+  let attempt = 1;
 
-  // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
-  // hang indefinitely when combined with JOINs in the same query. Do NOT try to
-  // "optimize" this by combining into a single query with JOINs - it will break.
-  // See: https://github.com/tobi/qmd/pull/23
-
-  // Step 1: Get vector matches from sqlite-vec (no JOINs allowed).
-  //
-  // Collection filter cannot be pushed into MATCH (sqlite-vec has no join-safe
-  // predicate here). Global ANN + post-filter starves small collections: they
-  // never enter the top-k (#791, #803). Multiplier over-fetch alone is not
-  // enough either — sqlite-vec caps k at 4096. For a collection filter we
-  // therefore exact-scan that collection's vectors when the set is small
-  // enough, and only then fall back to capped ANN + post-filter.
-  let vecResults: { hash_seq: string; distance: number }[];
-
-  if (collectionFilter) {
-    const collectionHashSeqs = withLazyContentVectorMigration(db, () =>
-      db.prepare(`
-        SELECT cv.hash || '_' || cv.seq AS hash_seq
-        FROM content_vectors cv
-        JOIN documents d ON d.hash = cv.hash AND d.active = 1
-        WHERE d.collection = ?
-      `).all(collectionFilter) as { hash_seq: string }[],
-    ).map((r) => r.hash_seq);
-
-    if (collectionHashSeqs.length === 0) return [];
-
-    if (collectionHashSeqs.length <= COLLECTION_VEC_EXACT_SCAN_MAX) {
-      vecResults = exactVecScanByHashSeq(db, embedding, collectionHashSeqs, limit);
-    } else {
-      // Large collection: ANN with over-fetch, hard-capped at sqlite-vec's max k.
-      vecResults = annVecScan(db, embedding, Math.max(limit * 30, limit * 3));
-    }
-  } else {
-    vecResults = annVecScan(db, embedding, limit * 3);
-  }
-
-  if (vecResults.length === 0) return [];
-
-  // Step 2: Get chunk info and document data
-  const hashSeqs = vecResults.map(r => r.hash_seq);
-  const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
-
-  // Build query for document lookup
-  const placeholders = hashSeqs.map(() => '?').join(',');
-  let docSql = `
-    SELECT
-      cv.hash || '_' || cv.seq as hash_seq,
-      cv.hash,
-      cv.pos,
-      'qmd://' || d.collection || '/' || d.path as filepath,
-      d.collection || '/' || d.path as display_path,
-      d.title,
-      content.doc as body
-    FROM content_vectors cv
-    JOIN documents d ON d.hash = cv.hash AND d.active = 1
-    JOIN content ON content.hash = d.hash
-    WHERE cv.hash || '_' || cv.seq IN (${placeholders})
-  `;
-  const params: string[] = [...hashSeqs];
-
-  if (collectionFilter) {
-    docSql += ` AND d.collection = ?`;
-    params.push(collectionFilter);
-  }
-
-  const docRows = withLazyContentVectorMigration(db, () => db.prepare(docSql).all(...params) as {
-    hash_seq: string; hash: string; pos: number; filepath: string;
-    display_path: string; title: string; body: string;
-  }[]);
-
-  // Combine with distances and dedupe by filepath
-  const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
-  for (const row of docRows) {
-    const distance = distanceMap.get(row.hash_seq) ?? 1;
-    const existing = seen.get(row.filepath);
-    if (!existing || distance < existing.bestDist) {
-      seen.set(row.filepath, { row, bestDist: distance });
-    }
-  }
-
-  return Array.from(seen.values())
-    .sort((a, b) => a.bestDist - b.bestDist)
-    .slice(0, limit)
-    .map(({ row, bestDist }) => {
-      const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
-      return {
-        filepath: row.filepath,
-        displayPath: row.display_path,
-        title: row.title,
-        hash: row.hash,
-        docid: getDocid(row.hash),
-        collectionName,
-        modifiedAt: "",  // Not available in vec query
-        bodyLength: row.body.length,
-        body: row.body,
-        context: getContextForFile(db, row.filepath),
-        score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
-        source: "vec" as const,
-        chunkPos: row.pos,
-      };
+  while (true) {
+    const vectorScanStart = performance.now();
+    const vecResults = knnVecScan(db, embedding, candidateK, model, fingerprint, names);
+    trace?.({
+      stage: "vector_scan_knn",
+      durationMs: performance.now() - vectorScanStart,
+      attempt,
+      candidateK,
     });
+    if (vecResults.length === 0) return [];
+
+    const hydrationStart = performance.now();
+    const hashSeqs = vecResults.map(result => result.hash_seq);
+    const distanceMap = new Map(vecResults.map(result => [result.hash_seq, result.distance]));
+    const placeholders = hashSeqs.map(() => "?").join(",");
+    const collectionFilter = names
+      ? `AND d.collection IN (${names.map(() => "?").join(",")})`
+      : "";
+    const docRows = withLazyContentVectorMigration(db, () => db.prepare(`
+      SELECT
+        cv.hash || '_' || cv.seq AS hash_seq,
+        cv.hash,
+        cv.pos,
+        cv.chunk_len,
+        d.collection,
+        'qmd://' || d.collection || '/' || d.path AS filepath,
+        d.collection || '/' || d.path AS display_path,
+        d.title,
+        content.doc AS body
+      FROM content_vectors cv
+      JOIN documents d ON d.hash = cv.hash
+      JOIN content ON content.hash = d.hash
+      WHERE cv.hash || '_' || cv.seq IN (${placeholders})
+        AND d.active = 1
+        AND cv.model = ?
+        AND cv.embed_fingerprint = ?
+        ${collectionFilter}
+    `).all(...hashSeqs, model, fingerprint, ...(names ?? [])) as Array<{
+      hash_seq: string;
+      hash: string;
+      pos: number;
+      chunk_len: number;
+      collection: string;
+      filepath: string;
+      display_path: string;
+      title: string;
+      body: string;
+    }>);
+    trace?.({
+      stage: "hydration",
+      durationMs: performance.now() - hydrationStart,
+      attempt,
+      candidateK,
+    });
+
+    const resultMappingStart = performance.now();
+    const collectionPriority = new Map(names?.map((name, index) => [name, index]));
+    const pathOrder = (a: typeof docRows[number], b: typeof docRows[number]): number => {
+      const priorityA = collectionPriority.get(a.collection) ?? Number.MAX_SAFE_INTEGER;
+      const priorityB = collectionPriority.get(b.collection) ?? Number.MAX_SAFE_INTEGER;
+      return priorityA - priorityB || a.filepath.localeCompare(b.filepath);
+    };
+    const byHash = new Map<string, {
+      bestChunk: typeof docRows[number];
+      bestDist: number;
+      paths: Map<string, typeof docRows[number]>;
+    }>();
+
+    for (const row of docRows) {
+      const distance = distanceMap.get(row.hash_seq);
+      if (distance === undefined) continue;
+      const existing = byHash.get(row.hash);
+      if (!existing) {
+        byHash.set(row.hash, {
+          bestChunk: row,
+          bestDist: distance,
+          paths: new Map([[row.filepath, row]]),
+        });
+        continue;
+      }
+      existing.paths.set(row.filepath, row);
+      if (
+        distance < existing.bestDist
+        || (distance === existing.bestDist && pathOrder(row, existing.bestChunk) < 0)
+      ) {
+        existing.bestChunk = row;
+        existing.bestDist = distance;
+      }
+    }
+
+    const results = Array.from(byHash.values())
+      .sort((a, b) => a.bestDist - b.bestDist || a.bestChunk.hash.localeCompare(b.bestChunk.hash))
+      .map(({ bestChunk, bestDist, paths }) => {
+        const orderedPaths = Array.from(paths.values()).sort(pathOrder);
+        const primary = orderedPaths[0] ?? bestChunk;
+        const aliases = orderedPaths.slice(1).map(row => ({
+          filepath: row.filepath,
+          displayPath: row.display_path,
+          title: row.title,
+          collectionName: row.collection,
+        }));
+        return {
+          filepath: primary.filepath,
+          displayPath: primary.display_path,
+          title: primary.title,
+          hash: bestChunk.hash,
+          docid: getDocid(bestChunk.hash),
+          collectionName: primary.collection,
+          modifiedAt: "",  // Not available in vec query
+          bodyLength: bestChunk.body.length,
+          body: bestChunk.body,
+          context: getContextForFile(db, primary.filepath),
+          score: 1 - bestDist,
+          source: "vec" as const,
+          chunkPos: bestChunk.pos,
+          chunkLen: bestChunk.chunk_len,
+          ...(aliases.length > 0 ? { aliases } : {}),
+        } satisfies SearchResult;
+      });
+    trace?.({
+      stage: "result_mapping",
+      durationMs: performance.now() - resultMappingStart,
+      attempt,
+      candidateK,
+    });
+
+    if (
+      results.length >= requestedLimit
+      || vecResults.length < candidateK
+      || candidateK === SQLITE_VEC_MAX_K
+    ) {
+      return results.slice(0, requestedLimit);
+    }
+
+    candidateK = Math.min(SQLITE_VEC_MAX_K, candidateK * 2);
+    attempt++;
+  }
 }
 
 // =============================================================================
@@ -4328,8 +4399,8 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
  * Get all unique content hashes that need embeddings (from active documents).
  * Returns hash, document body, and a sample path for display purposes.
  */
-export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBED_MODEL): { hash: string; body: string; path: string }[] {
-  const fingerprint = getEmbeddingFingerprint(model);
+function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBED_MODEL): { hash: string; body: string; path: string }[] {
+  const fingerprint = getEmbeddingFingerprint(model, getEmbeddingChunkStrategy(db));
   return withLazyContentVectorMigration(db, () => db.prepare(`
     SELECT d.hash, c.doc as body, MIN(d.path) as path
     FROM documents d
@@ -4432,14 +4503,15 @@ export function insertEmbedding(
   model: string,
   embeddedAt: string,
   totalChunks: number = 1,
-  fingerprint: string = getEmbeddingFingerprint(model)
+  fingerprint: string = getEmbeddingFingerprint(model, getEmbeddingChunkStrategy(db)),
+  chunkLen: number = 0,
 ): void {
   const hashSeq = `${hash}_${seq}`;
 
   withLazyContentVectorMigration(db, () => {
     // Insert content_vectors first — crash-safe ordering (see getHashesForEmbedding)
-    const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
-    insertContentVectorStmt.run(hash, seq, pos, model, fingerprint, totalChunks, embeddedAt);
+    const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, chunk_len, model, embed_fingerprint, total_chunks, embedded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+    insertContentVectorStmt.run(hash, seq, pos, chunkLen, model, fingerprint, totalChunks, embeddedAt);
 
     // vec0 virtual tables don't support OR REPLACE — use DELETE + INSERT
     const deleteVecStmt = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
@@ -4468,6 +4540,23 @@ function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<stri
     }
 
     return removed;
+  });
+}
+
+function removeStaleEmbeddingChunks(db: Database, hash: string, model: string, fingerprint: string): void {
+  withLazyContentVectorMigration(db, () => {
+    const staleRows = db.prepare(`
+      SELECT seq FROM content_vectors
+      WHERE hash = ? AND (model != ? OR embed_fingerprint != ?)
+    `).all(hash, model, fingerprint) as { seq: number }[];
+    if (staleRows.length === 0) return;
+
+    const deleteVector = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
+    for (const row of staleRows) deleteVector.run(`${hash}_${row.seq}`);
+    db.prepare(`
+      DELETE FROM content_vectors
+      WHERE hash = ? AND (model != ? OR embed_fingerprint != ?)
+    `).run(hash, model, fingerprint);
   });
 }
 
@@ -4521,7 +4610,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
  * expansion's sub-queries all came back empty — left in place, the dud entry
  * would replay the same misses on every warm repeat of the query.
  */
-export function deleteExpansionCacheEntry(db: Database, query: string, model: string = DEFAULT_QUERY_MODEL): void {
+function deleteExpansionCacheEntry(db: Database, query: string, model: string = DEFAULT_QUERY_MODEL): void {
   const cacheKey = getCacheKey("expandQuery", { query, model });
   db.prepare(`DELETE FROM llm_cache WHERE hash = ?`).run(cacheKey);
 }
@@ -4587,7 +4676,7 @@ export function reciprocalRankFusion(
   weights: number[] = [],
   k: number = 60
 ): RankedResult[] {
-  const scores = new Map<string, { result: RankedResult; rrfScore: number; topRank: number }>();
+  const scores = new Map<string, { result: RankedResult; rrfScore: number; topRank: number; bestVectorScore: number }>();
 
   for (let listIdx = 0; listIdx < resultLists.length; listIdx++) {
     const list = resultLists[listIdx];
@@ -4603,11 +4692,19 @@ export function reciprocalRankFusion(
       if (existing) {
         existing.rrfScore += rrfContribution;
         existing.topRank = Math.min(existing.topRank, rank);
+        if (result.chunkPos !== undefined && result.chunkPos >= 0 && result.chunkLen !== undefined && result.chunkLen > 0 && result.score > existing.bestVectorScore) {
+          existing.result.chunkPos = result.chunkPos;
+          existing.result.chunkLen = result.chunkLen;
+          existing.bestVectorScore = result.score;
+        }
       } else {
         scores.set(result.file, {
           result,
           rrfScore: rrfContribution,
           topRank: rank,
+          bestVectorScore: result.chunkPos !== undefined && result.chunkPos >= 0 && result.chunkLen !== undefined && result.chunkLen > 0
+            ? result.score
+            : -Infinity,
         });
       }
     }
@@ -4943,7 +5040,7 @@ export function escapeLikePattern(value: string): string {
   return value.replace(/#/g, "##").replace(/%/g, "#%").replace(/_/g, "#_");
 }
 
-export type CommaListMatch = {
+type CommaListMatch = {
   collection: string;
   path: string;
   virtualPath: string;
@@ -5434,6 +5531,55 @@ export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] 
   return rankedListMeta.map(meta => meta.queryType === "original" ? 2.0 : 1.0);
 }
 
+type RerankChunkMap = Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>;
+
+async function selectRerankChunks(
+  candidates: RankedResult[],
+  queryTerms: string[],
+  intentTerms: string[],
+  chunkStrategy?: ChunkStrategy,
+): Promise<RerankChunkMap> {
+  const selected: RerankChunkMap = new Map();
+
+  for (const candidate of candidates) {
+    const pos = candidate.chunkPos;
+    const len = candidate.chunkLen;
+    if (pos !== undefined && len !== undefined && pos >= 0 && len > 0 && pos + len <= candidate.body.length) {
+      selected.set(candidate.file, {
+        chunks: [{ text: candidate.body.slice(pos, pos + len), pos }],
+        bestIdx: 0,
+      });
+      continue;
+    }
+
+    const chunks = await chunkDocumentAsync(
+      candidate.body,
+      undefined, undefined, undefined,
+      candidate.file,
+      chunkStrategy === "semantic" ? "regex" : chunkStrategy,
+    );
+    if (chunks.length === 0) continue;
+
+    let bestIdx = 0;
+    let bestScore = -1;
+    for (let i = 0; i < chunks.length; i++) {
+      const chunkLower = chunks[i]!.text.toLowerCase();
+      let score = queryTerms.reduce((sum, term) => sum + (chunkLower.includes(term) ? 1 : 0), 0);
+      for (const term of intentTerms) {
+        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestIdx = i;
+      }
+    }
+
+    selected.set(candidate.file, { chunks, bestIdx });
+  }
+
+  return selected;
+}
+
 /**
  * Hybrid search: BM25 + vector + query expansion + RRF + chunked reranking.
  *
@@ -5556,6 +5702,7 @@ export async function hybridQuery(
         rankedLists.push(vecResults.map(r => ({
           file: r.filepath, displayPath: r.displayPath,
           title: r.title, body: r.body || "", score: r.score,
+          chunkPos: r.chunkPos, chunkLen: r.chunkLen,
         })));
         rankedListMeta.push({
           source: "vec",
@@ -5592,28 +5739,8 @@ export async function hybridQuery(
   // Reranking full bodies is O(tokens) — the critical perf lesson that motivated this refactor.
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
-  const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
-
   const chunkStrategy = options?.chunkStrategy;
-  for (const cand of candidates) {
-    const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, chunkStrategy);
-    if (chunks.length === 0) continue;
-
-    // Pick chunk with most keyword overlap (fallback: first chunk)
-    // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
-    let bestIdx = 0;
-    let bestScore = -1;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkLower = chunks[i]!.text.toLowerCase();
-      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-      for (const term of intentTerms) {
-        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
-      }
-      if (score > bestScore) { bestScore = score; bestIdx = i; }
-    }
-
-    docChunkMap.set(cand.file, { chunks, bestIdx });
-  }
+  const docChunkMap = await selectRerankChunks(candidates, queryTerms, intentTerms, chunkStrategy);
 
   if (skipRerank) {
     // Skip LLM reranking — return candidates scored by RRF only
@@ -5748,7 +5875,9 @@ export interface VectorSearchOptions {
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
   intent?: string;          // domain intent hint for disambiguation
+  expand?: boolean;         // default true; false runs only the original query
   hooks?: Pick<SearchHooks, 'onExpand'>;
+  trace?: VectorSearchTrace;
 }
 
 export interface VectorSearchResult {
@@ -5759,6 +5888,9 @@ export interface VectorSearchResult {
   score: number;
   context: string | null;
   docid: string;
+  bestChunk: string;
+  chunkPos: number;
+  chunkLen: number;
 }
 
 /**
@@ -5787,7 +5919,7 @@ export async function vectorSearchQuery(
 
   // Expand query — filter to vec/hyde only (lex queries target FTS, not vector)
   const expandStart = Date.now();
-  const allExpanded = await store.expandQuery(query);
+  const allExpanded = options?.expand === false ? [] : await store.expandQuery(query);
   const vecExpanded = allExpanded.filter(q => q.type !== 'lex');
   options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
@@ -5796,7 +5928,7 @@ export async function vectorSearchQuery(
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, embedModel, limit, collection);
+    const vecResults = await store.searchVec(q, embedModel, limit, collection, undefined, undefined, options?.trace);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
@@ -5808,6 +5940,9 @@ export async function vectorSearchQuery(
           score: r.score,
           context: store.getContextForFile(r.filepath),
           docid: r.docid,
+          bestChunk: r.body?.slice(r.chunkPos ?? 0, (r.chunkPos ?? 0) + (r.chunkLen ?? 0)) ?? "",
+          chunkPos: r.chunkPos ?? 0,
+          chunkLen: r.chunkLen ?? 0,
         });
       }
     }
@@ -5955,6 +6090,7 @@ export async function structuredSearch(
             rankedLists.push(vecResults.map(r => ({
               file: r.filepath, displayPath: r.displayPath,
               title: r.title, body: r.body || "", score: r.score,
+              chunkPos: r.chunkPos, chunkLen: r.chunkLen,
             })));
             rankedListMeta.push({
               source: "vec",
@@ -5986,28 +6122,8 @@ export async function structuredSearch(
     || searches[0]?.query || "";
   const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
-  const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
   const ssChunkStrategy = options?.chunkStrategy;
-
-  for (const cand of candidates) {
-    const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, ssChunkStrategy);
-    if (chunks.length === 0) continue;
-
-    // Pick chunk with most keyword overlap
-    // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
-    let bestIdx = 0;
-    let bestScore = -1;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkLower = chunks[i]!.text.toLowerCase();
-      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-      for (const term of intentTerms) {
-        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
-      }
-      if (score > bestScore) { bestScore = score; bestIdx = i; }
-    }
-
-    docChunkMap.set(cand.file, { chunks, bestIdx });
-  }
+  const docChunkMap = await selectRerankChunks(candidates, queryTerms, intentTerms, ssChunkStrategy);
 
   if (skipRerank) {
     // Skip LLM reranking — return candidates scored by RRF only

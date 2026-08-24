@@ -9,12 +9,21 @@
  * Run: bun test/eval-deep-research.ts
  */
 
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import { readFileSync, existsSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const qmdCliPath = fileURLToPath(new URL("../src/cli/qmd.ts", import.meta.url));
+
+function runQmd(args: string[], timeout: number): string {
+  return execFileSync("bun", [qmdCliPath, ...args], {
+    encoding: "utf-8",
+    timeout,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+}
 
 interface EvalQuery {
   query: string;
@@ -41,10 +50,7 @@ function loadQueries(): EvalQuery[] {
 
 function runBM25Search(query: string): SearchResult[] {
   try {
-    const output = execSync(
-      `bun src/qmd.ts search "${query.replace(/"/g, '\\"')}" -c eval-docs --json -n 5 2>/dev/null`,
-      { encoding: "utf-8", timeout: 30000 }
-    );
+    const output = runQmd(["search", query, "-c", "eval-docs", "--json", "-n", "5"], 30000);
     return JSON.parse(output);
   } catch {
     return [];
@@ -53,10 +59,7 @@ function runBM25Search(query: string): SearchResult[] {
 
 function runDeepResearch(query: string): SearchResult[] {
   try {
-    const output = execSync(
-      `bun src/qmd.ts query "${query.replace(/"/g, '\\"')}" -c eval-docs --json -n 5 2>/dev/null`,
-      { encoding: "utf-8", timeout: 120000 }
-    );
+    const output = runQmd(["query", query, "-c", "eval-docs", "--json", "-n", "5"], 120000);
     return JSON.parse(output);
   } catch {
     return [];
@@ -140,9 +143,7 @@ async function main() {
 
   // Check if eval-docs collection exists
   try {
-    const status = execSync("bun src/qmd.ts status --json 2>/dev/null", {
-      encoding: "utf-8",
-    });
+    const status = runQmd(["status", "--json"], 30000);
     if (!status.includes("eval-docs")) {
       console.log("\n⚠️  eval-docs collection not found. Run:");
       console.log("   qmd collection add test/eval-docs --name eval-docs");

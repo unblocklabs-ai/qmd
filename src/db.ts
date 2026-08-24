@@ -14,7 +14,7 @@
 export const isBun = "Bun" in globalThis;
 
 export type SQLiteValue = string | number | bigint | Buffer | Uint8Array | Float32Array | null;
-export type SQLiteParams = readonly SQLiteValue[];
+type SQLiteParams = readonly SQLiteValue[];
 
 type DatabaseConstructor = new (path: string) => Database;
 type LoadableSqliteDatabase = Pick<Database, "loadExtension">;
@@ -136,7 +136,7 @@ export interface Database {
   close(): void;
 }
 
-export interface Statement {
+interface Statement {
   run(...params: SQLiteValue[]): { changes: number; lastInsertRowid: number | bigint };
   get<T = unknown>(...params: SQLiteValue[]): T | undefined;
   all<T = unknown>(...params: SQLiteValue[]): T[];

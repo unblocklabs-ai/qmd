@@ -387,8 +387,7 @@ const result = await store.update({
 
 // Generate vector embeddings
 const embedResult = await store.embed({
-  force: false,           // true to re-embed everything
-  chunkStrategy: "auto",  // "regex" (default) or "auto" (AST for code files)
+  force: false, // true to re-embed everything; chunkStrategy defaults to "regex"
   onProgress: ({ current, total, collection }) => {
     console.log(`Embedding ${current}/${total}`)
   },
@@ -653,8 +652,8 @@ qmd embed -f
 # Enable AST-aware chunking for code files (TS, JS, Python, Go, Rust)
 qmd embed --chunk-strategy auto
 
-# Also works with query for consistent chunk selection
-qmd query "auth flow" --chunk-strategy auto
+# Opt into semantic chunking for Markdown
+qmd embed --chunk-strategy semantic
 
 # Memory control for large corpora / constrained systems
 qmd embed --max-docs-per-batch 50   # cap docs per embedding batch
@@ -664,11 +663,30 @@ qmd embed --max-batch-mb 64         # cap batch size in MB
 **AST-aware chunking** (`--chunk-strategy auto`) uses tree-sitter to chunk code
 files at function, class, and import boundaries instead of arbitrary text
 positions. This produces higher-quality chunks and better search results for
-codebases. Markdown and other file types always use regex-based chunking
-regardless of strategy.
+codebases. Under `auto`, Markdown and other file types continue to use
+regex-based chunking.
 
 The default is `regex` (existing behavior). Use `--chunk-strategy auto` to
 opt in. Run `qmd status` to verify which grammars are available.
+
+**Semantic chunking** (`--chunk-strategy semantic`) is an opt-in, ingest-time
+strategy for Markdown. Headings and horizontal rules are hard boundaries. Local
+typed facts (`Decision:`, `Preference:`, and similar), timestamps, and session
+markers are hard event boundaries wherever they occur; filenames do not select a
+journal mode, and speaker turns are not automatically hard. Paragraph and ordinary
+list boundaries remain semantic candidates. A minimum token target discourages
+tiny similarity splits, while a maximum token ceiling bounds every chunk. This
+works for both sparse journals and single-topic documents, but costs extra
+embedding work during ingestion. The selected strategy persists for later embed
+runs; changing it is index-wide and cannot be combined with `-c`.
+
+One honest MVP limitation: two short, unlabeled atoms can remain merged even when
+their topics differ. Add an explicit marker when that distinction must be hard.
+
+Queries automatically use the exact spans stored during embedding. They do not
+rerun semantic chunking or adapt boundaries to each query. The query command
+accepts `--chunk-strategy` only for legacy fallback chunk selection when an exact
+stored span is unavailable.
 
 > **Note:** Tree-sitter grammars are optional dependencies. If they are not
 > installed, `--chunk-strategy auto` falls back to regex-only chunking
@@ -1170,7 +1188,7 @@ Collection ──► Glob Pattern ──► Markdown Files ──► Parse Title
 
 ### Embedding Flow
 
-Documents are chunked into ~900-token pieces with 15% overlap using smart boundary detection:
+By default, documents are chunked into ~900-token pieces with 15% overlap using smart boundary detection:
 
 ```
 Document ──► Smart Chunk (~900 tokens) ──► Format each chunk ──► node-llama-cpp ──► Store Vectors
@@ -1224,7 +1242,18 @@ For supported code files, QMD also parses the source with [tree-sitter](https://
 | Type alias / enum | 80 | All |
 | Import / use declaration | 60 | All |
 
-Supported for `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, and `.rs` files. Enable with `--chunk-strategy auto`. Markdown and other file types always use regex chunking.
+Supported for `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, and `.rs` files. Enable with `--chunk-strategy auto`. Under `auto`, Markdown and other file types continue to use regex chunking.
+
+**Semantic Chunking (Markdown):**
+
+Enable with `--chunk-strategy semantic`. QMD first respects explicit Markdown
+headings/rules and local typed-fact, timestamp, or session boundaries. It does not
+infer a journal profile from the filename, and speaker turns, paragraphs, and
+ordinary lists remain semantic candidates. Similarity splits aim for a minimum
+size; a maximum token ceiling is the final guardrail. Because this performs
+additional embedding work while ingesting documents, it is opt-in; `regex`
+remains the default. Queries reuse the resulting stored spans; they do not create
+query-adaptive boundaries. Tiny unlabeled two-atom notes may remain one chunk.
 
 ### Query Flow (Hybrid)
 

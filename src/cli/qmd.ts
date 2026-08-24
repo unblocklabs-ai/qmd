@@ -35,6 +35,7 @@ import {
   extractTitle,
   formatDocForEmbedding,
   getEmbeddingFingerprint,
+  getEmbeddingChunkStrategy,
   chunkDocumentByTokens,
   clearCache,
   getCacheKey,
@@ -2096,8 +2097,8 @@ function parseEmbedBatchOption(name: string, value: unknown): number | undefined
 function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
   if (value === undefined) return undefined;
   const s = String(value);
-  if (s === "auto" || s === "regex") return s;
-  throw new Error(`--chunk-strategy must be "auto" or "regex" (got "${s}")`);
+  if (s === "auto" || s === "regex" || s === "semantic") return s;
+  throw new Error(`--chunk-strategy must be "auto", "regex", or "semantic" (got "${s}")`);
 }
 
 // --timeout for `qmd embed`: a cap on the whole embed session, in minutes. Returns
@@ -2314,7 +2315,8 @@ type OutputOptions = {
   candidateLimit?: number;  // Max candidates to rerank (default: 40)
   intent?: string;       // Domain intent for disambiguation
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
-  chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
+  chunkStrategy?: ChunkStrategy;  // "regex" (default), "auto", or "semantic"
+  noExpand?: boolean;       // vsearch: use only the literal query
   fullPath?: boolean;    // Show realpath instead of qmd:// URI (relative to $PWD when subpath)
 };
 
@@ -2852,6 +2854,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       intent: opts.intent,
+      expand: !opts.noExpand,
       hooks: {
         onExpand: (original, expanded) => {
           logExpansionTree(original, expanded);
@@ -2875,6 +2878,8 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       score: r.score,
       context: r.context,
       docid: r.docid,
+      chunkPos: r.chunkPos,
+      chunkLen: r.chunkLen,
     })), query, { ...opts, limit: results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
 }
@@ -3064,10 +3069,11 @@ function parseCLI() {
       // Query options
       "candidate-limit": { type: "string", short: "C" },
       "no-rerank": { type: "boolean", default: false },
+      "no-expand": { type: "boolean", default: false },
       "no-gpu": { type: "boolean", default: false },
       intent: { type: "string" },
       // Chunking options
-      "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
+      "chunk-strategy": { type: "string" },  // "regex" (default), "auto" (AST), or "semantic"
       // MCP HTTP transport options
       http: { type: "boolean" },
       daemon: { type: "boolean" },
@@ -3135,6 +3141,7 @@ function parseCLI() {
     lineNumbers: !!values["line-numbers"],
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
     skipRerank: !!values["no-rerank"],
+    noExpand: !!values["no-expand"],
     explain: !!values.explain,
     intent: values.intent as string | undefined,
     chunkStrategy: parseChunkStrategy(values["chunk-strategy"]),
@@ -3647,6 +3654,7 @@ function showHelp(): void {
   console.log("  --full                     - Output full document instead of snippet");
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
   console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
+  console.log("  --no-expand                - vsearch only: use the literal query without LLM expansion");
   console.log("  --no-gpu                   - Force CPU mode for llama.cpp operations (same as QMD_FORCE_CPU=1)");
   console.log("  --line-numbers             - Include line numbers (search; get/multi-get are on by default)");
   console.log("  --no-line-numbers          - Disable line numbers for get/multi-get");
@@ -3658,7 +3666,8 @@ function showHelp(): void {
   console.log("  -c, --collection <name>    - Filter by one or more collections");
   console.log("");
   console.log("Embed/query options:");
-  console.log("  --chunk-strategy <auto|regex> - Chunking mode (default: regex; auto uses AST for code files)");
+  console.log("  --chunk-strategy <regex|auto|semantic> - Chunking mode (default: regex)");
+  console.log("                                           Query reuses stored chunks");
   console.log("  --timeout <minutes>          - Embed session cap in minutes (0 = no limit; default 30)");
   console.log("");
   console.log("Multi-get options:");
@@ -3935,7 +3944,7 @@ async function checkEmbeddingVectorSamples(db: Database, model: string, fingerpr
   }
 
   const samples = db.prepare(`
-    SELECT cv.hash, cv.seq, c.doc AS body, MIN(d.path) AS path
+    SELECT cv.hash, cv.seq, cv.pos, cv.chunk_len, c.doc AS body, MIN(d.path) AS path
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
     JOIN content c ON c.hash = cv.hash
@@ -3943,7 +3952,7 @@ async function checkEmbeddingVectorSamples(db: Database, model: string, fingerpr
     GROUP BY cv.hash, cv.seq, c.doc
     ORDER BY random()
     LIMIT ?
-  `).all(model, fingerprint, sampleSize) as { hash: string; seq: number; body: string; path: string }[];
+  `).all(model, fingerprint, sampleSize) as { hash: string; seq: number; pos: number; chunk_len: number; body: string; path: string }[];
 
   if (samples.length === 0) {
     return { ok: false, details: "no current embedded chunks to test; please run qmd embed again" };
@@ -3955,15 +3964,22 @@ async function checkEmbeddingVectorSamples(db: Database, model: string, fingerpr
   await withLLMSession(async (session) => {
     for (const sample of samples) {
       const hashSeq = `${sample.hash}_${sample.seq}`;
-      const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
-      const chunk = chunks[sample.seq];
-      if (!chunk) {
+      const storedText = sample.chunk_len > 0
+        ? sample.body.slice(sample.pos, sample.pos + sample.chunk_len)
+        : (await chunkDocumentByTokens(
+          sample.body,
+          undefined, undefined, undefined,
+          sample.path,
+          getEmbeddingChunkStrategy(db),
+          session.signal,
+        ))[sample.seq]?.text;
+      if (!storedText) {
         mismatches.push(`${shortHashSeq(hashSeq)}: chunk no longer exists`);
         continue;
       }
 
       const title = extractTitle(sample.body, sample.path);
-      const result = await session.embed(formatDocForEmbedding(chunk.text, title, model), { model });
+      const result = await session.embed(formatDocForEmbedding(storedText, title, model), { model });
       if (!result) {
         mismatches.push(`${shortHashSeq(hashSeq)}: embedding failed`);
         continue;
@@ -4133,7 +4149,7 @@ async function showDoctor(): Promise<void> {
   const pkg = readPackageJson();
   const activeModels = resolveModelsForCli();
   const embedModel = activeModels.embed;
-  const fingerprint = getEmbeddingFingerprint(embedModel);
+  const fingerprint = getEmbeddingFingerprint(embedModel, getEmbeddingChunkStrategy(db));
   const nextSteps: string[] = [];
 
   console.log(`${c.bold}QMD Doctor${c.reset}\n`);

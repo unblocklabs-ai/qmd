@@ -64,6 +64,9 @@ import {
   type EmbedProgress,
   type EmbedResult,
   type ChunkStrategy,
+  type VectorSearchStage,
+  type VectorSearchTiming,
+  type VectorSearchTrace,
 } from "./store.js";
 import {
   LlamaCpp,
@@ -107,6 +110,9 @@ export type {
   CollectionConfig,
   NamedCollection,
   ContextMap,
+  VectorSearchStage,
+  VectorSearchTiming,
+  VectorSearchTrace,
 };
 
 // Re-export the internal Store type for advanced consumers
@@ -169,7 +175,7 @@ export interface SearchOptions {
   minScore?: number;
   /** Include explain traces */
   explain?: boolean;
-  /** Chunk strategy: "auto" (default, uses AST for code files) or "regex" (legacy) */
+  /** Rerank fallback strategy. Exact stored vector spans take precedence. */
   chunkStrategy?: ChunkStrategy;
 }
 
@@ -187,6 +193,8 @@ export interface LexSearchOptions {
 export interface VectorSearchOptions {
   limit?: number;
   collection?: string | string[];
+  /** Optional coarse wall-clock timings for the vector retrieval stages. */
+  trace?: VectorSearchTrace;
 }
 
 /**
@@ -306,6 +314,7 @@ export interface QMDStore {
     collection?: string;
     maxDocsPerBatch?: number;
     maxBatchBytes?: number;
+    /** Persisted index-wide strategy. Changing it requires an unscoped embed. */
     chunkStrategy?: ChunkStrategy;
     onProgress?: (info: EmbedProgress) => void;
   }): Promise<EmbedResult>;
@@ -433,7 +442,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       });
     },
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
-    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection),
+    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection, undefined, undefined, opts?.trace),
     expandQuery: async (q) => internal.expandQuery(q),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {

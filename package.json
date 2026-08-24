@@ -29,6 +29,7 @@
     "prepare": "node scripts/install-hooks.mjs && node scripts/build.mjs",
     "build": "node scripts/build.mjs",
     "lint": "oxlint",
+    "knip": "knip",
     "test": "node scripts/test-all.mjs",
     "test:types": "node ./node_modules/typescript/bin/tsc -p tsconfig.build.json --noEmit",
     "test:node": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000",
@@ -36,6 +37,7 @@
     "test:unit": "CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000 test/ && CI=true bun test --timeout 60000 --preload ./src/test-preload.ts test/",
     "test:package": "node scripts/package-smoke.mjs",
     "qmd": "tsx src/cli/qmd.ts",
+    "eval:chunking": "tsx scripts/chunking-eval.ts",
     "index": "tsx src/cli/qmd.ts index",
     "vector": "tsx src/cli/qmd.ts vector",
     "search": "tsx src/cli/qmd.ts search",
@@ -81,6 +83,7 @@
   "devDependencies": {
     "@oxlint/plugins": "1.78.0",
     "@types/better-sqlite3": "7.6.13",
+    "knip": "6.32.2",
     "oxlint": "1.78.0",
     "tsx": "4.23.12",
     "vitest": "3.2.7"

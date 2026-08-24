@@ -36,6 +36,9 @@ jobs:
       - name: Lint
         run: npx oxlint
 
+      - name: Dead-code analysis
+        run: npx knip
+
       - name: Tests
         run: npx vitest run --reporter=verbose --testTimeout 60000 test/
         env:

@@ -5,7 +5,18 @@
  * Run: bun test/eval-harness.ts
  */
 
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
+import { fileURLToPath } from "url";
+
+const qmdCliPath = fileURLToPath(new URL("../src/cli/qmd.ts", import.meta.url));
+
+function runQmd(args: string[], timeout: number): string {
+  return execFileSync("bun", [qmdCliPath, ...args], {
+    encoding: "utf-8",
+    timeout,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+}
 
 // Test queries with expected documents and difficulty
 const evalQueries: {
@@ -137,10 +148,7 @@ interface SearchResult {
 
 function runSearch(query: string): SearchResult[] {
   try {
-    const output = execSync(
-      `bun src/cli/qmd.ts search "${query.replace(/"/g, '\\"')}" --json -n 5 2>/dev/null`,
-      { encoding: "utf-8", timeout: 30000 }
-    );
+    const output = runQmd(["search", query, "--json", "-n", "5"], 30000);
     return JSON.parse(output);
   } catch (e) {
     return [];
@@ -149,10 +157,7 @@ function runSearch(query: string): SearchResult[] {
 
 function runQuery(query: string): SearchResult[] {
   try {
-    const output = execSync(
-      `bun src/cli/qmd.ts query "${query.replace(/"/g, '\\"')}" --json -n 5 2>/dev/null`,
-      { encoding: "utf-8", timeout: 60000 }
-    );
+    const output = runQmd(["query", query, "--json", "-n", "5"], 60000);
     return JSON.parse(output);
   } catch (e) {
     return [];
@@ -207,7 +212,7 @@ console.log(`Testing ${evalQueries.length} queries across 6 documents`);
 
 // Check if eval-docs collection exists
 try {
-  const status = execSync("bun src/cli/qmd.ts status --json 2>/dev/null", { encoding: "utf-8" });
+  const status = runQmd(["status", "--json"], 30000);
   if (!status.includes("eval-docs")) {
     console.log("\n⚠️  eval-docs collection not found. Run:");
     console.log("   qmd collection add test/eval-docs --name eval-docs");

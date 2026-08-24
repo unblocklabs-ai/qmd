@@ -6,14 +6,14 @@
  */
 
 import { extractSnippet } from "../store.js";
-import type { SearchResult, MultiGetResult, DocumentResult } from "../store.js";
+import type { SearchResult, DocumentResult } from "../store.js";
 
 // =============================================================================
 // Types
 // =============================================================================
 
 // Re-export store types for convenience
-export type { SearchResult, MultiGetResult, DocumentResult };
+export type { SearchResult, DocumentResult };
 
 // Flattened type for formatter convenience (extracts info from MultiGetResult)
 export type MultiGetFile = {
@@ -53,7 +53,7 @@ export type FormatOptions = {
  * @param text The text to add line numbers to
  * @param startLine Optional starting line number (default: 1)
  */
-export function addLineNumbers(text: string, startLine: number = 1): string {
+function addLineNumbers(text: string, startLine: number = 1): string {
   const lines = text.split('\n');
   return lines.map((line, i) => `${startLine + i}: ${line}`).join('\n');
 }
@@ -61,7 +61,7 @@ export function addLineNumbers(text: string, startLine: number = 1): string {
 /**
  * Extract short docid from a full hash (first 6 characters).
  */
-export function getDocid(hash: string): string {
+function getDocid(hash: string): string {
   return hash.slice(0, 6);
 }
 

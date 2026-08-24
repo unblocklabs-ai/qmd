@@ -261,7 +261,7 @@ export function listCollections(): NamedCollection[] {
 /**
  * Get collections that are included by default in queries
  */
-export function getDefaultCollections(): NamedCollection[] {
+function getDefaultCollections(): NamedCollection[] {
   return listCollections().filter(c => c.includeByDefault !== false);
 }
 
@@ -363,28 +363,12 @@ export function renameCollection(oldName: string, newName: string): boolean {
 // ============================================================================
 
 /**
- * Get global context
- */
-export function getGlobalContext(): string | undefined {
-  const config = loadConfig();
-  return config.global_context;
-}
-
-/**
  * Set global context
  */
 export function setGlobalContext(context: string | undefined): void {
   const config = loadConfig();
   config.global_context = context;
   saveConfig(config);
-}
-
-/**
- * Get all contexts for a collection
- */
-export function getContexts(collectionName: string): ContextMap | undefined {
-  const collection = getCollection(collectionName);
-  return collection?.context;
 }
 
 /**
@@ -472,44 +456,6 @@ export function listAllContexts(): Array<{
   return results;
 }
 
-/**
- * Find best matching context for a given collection and path
- * Returns the most specific matching context (longest path prefix match)
- */
-export function findContextForPath(
-  collectionName: string,
-  filePath: string
-): string | undefined {
-  const config = loadConfig();
-  const collection = config.collections[collectionName];
-
-  if (!collection?.context) {
-    return config.global_context;
-  }
-
-  // Find all matching prefixes
-  const matches: Array<{ prefix: string; context: string }> = [];
-
-  for (const [prefix, context] of Object.entries(collection.context)) {
-    // Normalize paths for comparison
-    const normalizedPath = filePath.startsWith("/") ? filePath : `/${filePath}`;
-    const normalizedPrefix = prefix.startsWith("/") ? prefix : `/${prefix}`;
-
-    if (normalizedPath.startsWith(normalizedPrefix)) {
-      matches.push({ prefix: normalizedPrefix, context });
-    }
-  }
-
-  // Return most specific match (longest prefix)
-  if (matches.length > 0) {
-    matches.sort((a, b) => b.prefix.length - a.prefix.length);
-    return matches[0]!.context;
-  }
-
-  // Fallback to global context
-  return config.global_context;
-}
-
 // ============================================================================
 // Utility functions
 // ============================================================================
@@ -529,13 +475,4 @@ export function configExists(): boolean {
   if (configSource.type === 'inline') return true;
   const path = configSource.path || getConfigFilePath();
   return existsSync(path);
-}
-
-/**
- * Validate a collection name
- * Collection names must be valid and not contain special characters
- */
-export function isValidCollectionName(name: string): boolean {
-  // Allow alphanumeric, hyphens, underscores
-  return /^[a-zA-Z0-9_-]+$/.test(name);
 }

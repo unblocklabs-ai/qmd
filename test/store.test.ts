@@ -67,6 +67,7 @@ import {
   type SearchResult,
   type RankedResult,
   type RankedListMeta,
+  type VectorSearchStage,
 } from "../src/store.js";
 import type { CollectionConfig } from "../src/collections.js";
 
@@ -439,16 +440,18 @@ describe("Store Creation", () => {
     let columns = store.db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
     expect(columns.map(col => col.name)).not.toContain("seq");
     expect(columns.map(col => col.name)).not.toContain("pos");
+    expect(columns.map(col => col.name)).not.toContain("chunk_len");
 
     store.ensureVecTable(3);
-    store.insertEmbedding("hash1", 1, 42, new Float32Array([1, 2, 3]), model, new Date().toISOString(), 2);
+    store.insertEmbedding("hash1", 1, 42, new Float32Array([1, 2, 3]), model, new Date().toISOString(), 2, undefined, 17);
 
     columns = store.db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
     const columnNames = columns.map(col => col.name);
-    expect(columnNames).toEqual(expect.arrayContaining(["seq", "pos", "model", "embed_fingerprint", "total_chunks", "embedded_at"]));
-    expect(store.db.prepare(`SELECT seq, pos, model, total_chunks FROM content_vectors WHERE hash = ?`).get("hash1")).toEqual({
+    expect(columnNames).toEqual(expect.arrayContaining(["seq", "pos", "chunk_len", "model", "embed_fingerprint", "total_chunks", "embedded_at"]));
+    expect(store.db.prepare(`SELECT seq, pos, chunk_len, model, total_chunks FROM content_vectors WHERE hash = ?`).get("hash1")).toEqual({
       seq: 1,
       pos: 42,
+      chunk_len: 17,
       model,
       total_chunks: 2,
     });
@@ -2727,6 +2730,16 @@ describe("Reciprocal Rank Fusion", () => {
     expect(fused.find(r => r.file === "doc3")).toBeDefined();
   });
 
+  test("RRF keeps the highest-scoring vector span for each document", () => {
+    const weaker = { ...makeResult("doc.md", 0.7), chunkPos: 10, chunkLen: 20 };
+    const stronger = { ...makeResult("doc.md", 0.9), chunkPos: 40, chunkLen: 30 };
+
+    expect(reciprocalRankFusion([[weaker], [stronger]])[0]).toMatchObject({
+      chunkPos: 40,
+      chunkLen: 30,
+    });
+  });
+
   test("RRF respects weights", () => {
     const list1 = [makeResult("doc1", 0.9)];
     const list2 = [makeResult("doc2", 0.9)];
@@ -3603,16 +3616,16 @@ describe("Vector Search collection filter", () => {
     const small = await createTestCollection({ name: "small", pwd: "/test/small" });
 
     const dims = 8;
+    const model = "test-model";
+    const fingerprint = getEmbeddingFingerprint(model);
     store.ensureVecTable(dims);
     const now = new Date().toISOString();
     const queryEmbedding = Array(dims).fill(0);
     queryEmbedding[0] = 1;
 
-    // 250 nearer neighbours in the large collection. With limit=3:
-    //   - old global k=limit*3=9 never sees `small`
-    //   - a plain multiplier (limit*30=90) still misses it
-    //   - sqlite-vec also caps k at 4096, so multipliers cannot fix tiny
-    //     collections in huge indexes. Collection-scoped exact scan does.
+    // 250 nearer neighbours in the large collection. A global KNN followed by
+    // collection post-filtering never sees `small`; native primary-key IN
+    // filtering must constrain KNN before ranking.
     for (let i = 0; i < 250; i++) {
       const hash = `largehash${String(i).padStart(3, "0")}`;
       await insertTestDocument(store.db, large, {
@@ -3623,7 +3636,7 @@ describe("Vector Search collection filter", () => {
       });
       const embedding = new Float32Array(dims);
       embedding[0] = 1;
-      store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, now);
+      store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, ?, ?, ?)`).run(hash, model, fingerprint, now);
       store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, embedding);
     }
 
@@ -3638,32 +3651,38 @@ describe("Vector Search collection filter", () => {
     const targetEmbedding = new Float32Array(dims);
     targetEmbedding[0] = 0.6;
     targetEmbedding[1] = 0.8;
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(targetHash, now);
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, ?, ?, ?)`).run(targetHash, model, fingerprint, now);
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${targetHash}_0`, targetEmbedding);
 
+    const filteredStages: VectorSearchStage[] = [];
     const filtered = await store.searchVec(
       "ignored — embedding precomputed",
-      "test-model",
+      model,
       3,
       small,
       undefined,
       queryEmbedding,
+      timing => filteredStages.push(timing.stage),
     );
     expect(filtered).toHaveLength(1);
     expect(filtered[0]!.collectionName).toBe(small);
     expect(filtered[0]!.displayPath).toBe(`${small}/target.md`);
+    expect(filteredStages).toContain("vector_scan_knn");
 
     // Unfiltered search still ranks the closer large-collection docs first.
+    const unfilteredStages: VectorSearchStage[] = [];
     const unfiltered = await store.searchVec(
       "ignored — embedding precomputed",
-      "test-model",
+      model,
       3,
       undefined,
       undefined,
       queryEmbedding,
+      timing => unfilteredStages.push(timing.stage),
     );
     expect(unfiltered).toHaveLength(3);
     expect(unfiltered.every((r) => r.collectionName === large)).toBe(true);
+    expect(unfilteredStages).toContain("vector_scan_knn");
 
     await cleanupTestDb(store);
   });
@@ -3675,6 +3694,8 @@ describe("Vector Search collection filter", () => {
     const notes = await createTestCollection({ name: "project-notes", pwd: "/test/notes" });
 
     const dims = 8;
+    const model = "test-model";
+    const fingerprint = getEmbeddingFingerprint(model);
     store.ensureVecTable(dims);
     const now = new Date().toISOString();
     const queryEmbedding = Array(dims).fill(0);
@@ -3690,7 +3711,7 @@ describe("Vector Search collection filter", () => {
       });
       const embedding = new Float32Array(dims);
       embedding[0] = 1;
-      store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, now);
+      store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, ?, ?, ?)`).run(hash, model, fingerprint, now);
       store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, embedding);
     }
 
@@ -3704,7 +3725,7 @@ describe("Vector Search collection filter", () => {
     const kbEmbedding = new Float32Array(dims);
     kbEmbedding[0] = 0.55;
     kbEmbedding[1] = 0.84;
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(kbHash, now);
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, ?, ?, ?)`).run(kbHash, model, fingerprint, now);
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${kbHash}_0`, kbEmbedding);
 
     const notesHash = "noteshash001";
@@ -3717,12 +3738,12 @@ describe("Vector Search collection filter", () => {
     const notesEmbedding = new Float32Array(dims);
     notesEmbedding[0] = 0.5;
     notesEmbedding[1] = 0.87;
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(notesHash, now);
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, ?, ?, ?)`).run(notesHash, model, fingerprint, now);
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${notesHash}_0`, notesEmbedding);
 
     const global = await store.searchVec(
       "ignored — embedding precomputed",
-      "test-model",
+      model,
       3,
       undefined,
       undefined,
@@ -3731,16 +3752,186 @@ describe("Vector Search collection filter", () => {
     expect(global).toHaveLength(3);
     expect(global.every((r) => r.collectionName === large)).toBe(true);
 
+    const unionStages: VectorSearchStage[] = [];
     const union = await store.searchVec(
       "ignored — embedding precomputed",
-      "test-model",
+      model,
       3,
       [knowledge, notes],
       undefined,
       queryEmbedding,
+      timing => unionStages.push(timing.stage),
     );
     expect(union.map(r => r.collectionName).sort()).toEqual([knowledge, notes].sort());
     expect(union.every((r) => r.collectionName !== large)).toBe(true);
+    expect(unionStages.filter(stage => stage === "vector_scan_knn")).toHaveLength(1);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec deduplicates canonical content and preserves path aliases", async () => {
+    const store = await createTestStore();
+    const journals = await createTestCollection({ name: "journals", pwd: "/test/journals" });
+    const sessions = await createTestCollection({ name: "sessions", pwd: "/test/sessions" });
+    const dims = 8;
+    const model = "test-model";
+    const fingerprint = getEmbeddingFingerprint(model);
+    const now = new Date().toISOString();
+    const sharedHash = "shared-content-hash";
+    const uniqueHash = "unique-content-hash";
+    store.ensureVecTable(dims);
+
+    for (const [collection, name] of [[journals, "journal-copy"], [sessions, "session-copy"]] as const) {
+      await insertTestDocument(store.db, collection, {
+        name,
+        hash: sharedHash,
+        body: "The same canonical memory in two sources",
+        displayPath: `${name}.md`,
+      });
+    }
+    await insertTestDocument(store.db, journals, {
+      name: "unique",
+      hash: uniqueHash,
+      body: "A second unique memory",
+      displayPath: "unique.md",
+    });
+
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, ?, ?, ?)`)
+      .run(sharedHash, model, fingerprint, now);
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, ?, ?, ?)`)
+      .run(uniqueHash, model, fingerprint, now);
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`)
+      .run(`${sharedHash}_0`, new Float32Array([1, 0, 0, 0, 0, 0, 0, 0]));
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`)
+      .run(`${uniqueHash}_0`, new Float32Array([0.8, 0.6, 0, 0, 0, 0, 0, 0]));
+
+    const results = await store.searchVec(
+      "ignored — embedding precomputed",
+      model,
+      2,
+      [journals, sessions],
+      undefined,
+      [1, 0, 0, 0, 0, 0, 0, 0],
+    );
+
+    expect(results.map(result => result.hash)).toEqual([sharedHash, uniqueHash]);
+    expect(results[0]!.collectionName).toBe(journals);
+    expect(results[0]!.aliases).toEqual([expect.objectContaining({
+      collectionName: sessions,
+      displayPath: `${sessions}/session-copy.md`,
+    })]);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec adaptively retries until it has the requested unique content", async () => {
+    const store = await createTestStore();
+    const collection = await createTestCollection({ name: "memory", pwd: "/test/memory" });
+    const dims = 8;
+    const model = "test-model";
+    const fingerprint = getEmbeddingFingerprint(model);
+    const now = new Date().toISOString();
+    const repeatedHash = "many-nearby-chunks";
+    store.ensureVecTable(dims);
+
+    await insertTestDocument(store.db, collection, {
+      name: "long-journal",
+      hash: repeatedHash,
+      body: "One document represented by many nearby chunks",
+      displayPath: "long-journal.md",
+    });
+    const insertChunk = store.db.prepare(`
+      INSERT INTO content_vectors
+        (hash, seq, pos, chunk_len, model, embed_fingerprint, total_chunks, embedded_at)
+      VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+    `);
+    const insertVector = store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
+    for (let seq = 0; seq < 25; seq++) {
+      insertChunk.run(repeatedHash, seq, seq, model, fingerprint, 25, now);
+      insertVector.run(`${repeatedHash}_${seq}`, new Float32Array([1, 0, 0, 0, 0, 0, 0, 0]));
+    }
+
+    for (const [hash, x, y] of [["unique-a", 0.9, 0.1], ["unique-b", 0.8, 0.2]] as const) {
+      await insertTestDocument(store.db, collection, {
+        name: hash,
+        hash,
+        body: hash,
+        displayPath: `${hash}.md`,
+      });
+      insertChunk.run(hash, 0, 0, model, fingerprint, 1, now);
+      insertVector.run(`${hash}_0`, new Float32Array([x, y, 0, 0, 0, 0, 0, 0]));
+    }
+
+    const timings: Array<{ stage: VectorSearchStage; attempt?: number; candidateK?: number }> = [];
+    const results = await store.searchVec(
+      "ignored — embedding precomputed",
+      model,
+      3,
+      collection,
+      undefined,
+      [1, 0, 0, 0, 0, 0, 0, 0],
+      timing => timings.push(timing),
+    );
+
+    expect(results.map(result => result.hash)).toEqual([repeatedHash, "unique-a", "unique-b"]);
+    expect(timings.filter(timing => timing.stage === "vector_scan_knn")).toEqual([
+      expect.objectContaining({ attempt: 1, candidateK: 20 }),
+      expect.objectContaining({ attempt: 2, candidateK: 40 }),
+    ]);
+    expect(timings.filter(timing => timing.stage === "hydration")).toHaveLength(2);
+    expect(timings.filter(timing => timing.stage === "result_mapping")).toHaveLength(2);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec keeps inactive and unauthorized documents outside native KNN", async () => {
+    const store = await createTestStore();
+    const allowed = await createTestCollection({ name: "allowed", pwd: "/test/allowed" });
+    const denied = await createTestCollection({ name: "denied", pwd: "/test/denied" });
+    const dims = 8;
+    const model = "test-model";
+    const fingerprint = getEmbeddingFingerprint(model);
+    const now = new Date().toISOString();
+    store.ensureVecTable(dims);
+
+    const fixtures = [
+      { collection: allowed, name: "visible", hash: "visible-hash", vector: [0.7, 0.7] },
+      { collection: allowed, name: "inactive", hash: "inactive-hash", vector: [1, 0] },
+      { collection: denied, name: "private", hash: "private-hash", vector: [1, 0] },
+    ] as const;
+    for (const fixture of fixtures) {
+      await insertTestDocument(store.db, fixture.collection, {
+        name: fixture.name,
+        hash: fixture.hash,
+        body: fixture.name,
+        displayPath: `${fixture.name}.md`,
+      });
+      store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, ?, ?, ?)`)
+        .run(fixture.hash, model, fingerprint, now);
+      store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`)
+        .run(`${fixture.hash}_0`, new Float32Array([...fixture.vector, 0, 0, 0, 0, 0, 0]));
+    }
+    store.deactivateDocument(allowed, "inactive.md");
+
+    for (let repetition = 0; repetition < 3; repetition++) {
+      const results = await store.searchVec(
+        "ignored — embedding precomputed",
+        model,
+        5,
+        [allowed],
+        undefined,
+        [1, 0, 0, 0, 0, 0, 0, 0],
+      );
+      expect(results.map(result => result.hash)).toEqual(["visible-hash"]);
+    }
+    expect(await store.searchVec(
+      "ignored — embedding precomputed",
+      model,
+      5,
+      [],
+      undefined,
+      [1, 0, 0, 0, 0, 0, 0, 0],
+    )).toEqual([]);
 
     await cleanupTestDb(store);
   });
@@ -3779,13 +3970,15 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       displayPath: "doc1.md",
     });
 
-    // Create vector table and insert a vector
+    // Create vector table and insert a current-model vector
     store.ensureVecTable(768);
+    const model = "embeddinggemma";
+    const fingerprint = getEmbeddingFingerprint(model);
     const embedding = Array(768).fill(0).map(() => Math.random());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, ?, ?, ?)`).run(hash, model, fingerprint, new Date().toISOString());
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, new Float32Array(embedding));
 
-    const results = await store.searchVec("test query", "embeddinggemma", 10);
+    const results = await store.searchVec("test query", model, 10);
     expect(results).toHaveLength(1);
     expect(results[0]!.displayPath).toBe(`${collectionName}/doc1.md`);
     expect(results[0]!.filepath).toBe(`qmd://${collectionName}/doc1.md`);
@@ -3816,19 +4009,21 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
 
     // Create vectors_vec table with correct dimensions (768 for embeddinggemma)
     store.ensureVecTable(768);
+    const model = "embeddinggemma";
+    const fingerprint = getEmbeddingFingerprint(model);
     const embedding1 = Array(768).fill(0).map(() => Math.random());
     const embedding2 = Array(768).fill(0).map(() => Math.random());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash1, new Date().toISOString());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash2, new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, ?, ?, ?)`).run(hash1, model, fingerprint, new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, ?, ?, ?)`).run(hash2, model, fingerprint, new Date().toISOString());
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash1}_0`, new Float32Array(embedding1));
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash2}_0`, new Float32Array(embedding2));
 
     // Search without filter - should return both
-    const allResults = await store.searchVec("content", "embeddinggemma", 10);
+    const allResults = await store.searchVec("content", model, 10);
     expect(allResults).toHaveLength(2);
 
     // Search with collection filter - should return only from collection1
-    const filtered = await store.searchVec("content", "embeddinggemma", 10, collection1);
+    const filtered = await store.searchVec("content", model, 10, collection1);
     expect(filtered).toHaveLength(1);
     expect(filtered[0]!.collectionName).toBe(collection1);
 
@@ -3853,14 +4048,16 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
 
     // Create vector table and insert a test vector
     store.ensureVecTable(768);
+    const model = "embeddinggemma";
+    const fingerprint = getEmbeddingFingerprint(model);
     const embedding = Array(768).fill(0).map(() => Math.random());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, ?, ?, ?)`).run(hash, model, fingerprint, new Date().toISOString());
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, new Float32Array(embedding));
 
     // This should complete quickly (not hang) due to the two-step fix
     // The old code with JOINs in the sqlite-vec query would hang indefinitely
     const startTime = Date.now();
-    const results = await store.searchVec("test content", "embeddinggemma", 5);
+    const results = await store.searchVec("test content", model, 5);
     const elapsed = Date.now() - startTime;
 
     // If the query took more than 5 seconds, something is wrong
@@ -4090,6 +4287,9 @@ describe("Embedding batching", () => {
       embedBatchCalls,
       embedCalls,
       embedBatchModelCalls,
+      async tokenize(text: string) {
+        return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
+      },
       async embed(text: string, options?: { model?: string }) {
         embedCalls.push({ text, options });
         return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
@@ -4249,6 +4449,49 @@ describe("Embedding batching", () => {
       expect(fakeLlm.embedCalls[0]?.options?.model).toBe(model);
       expect(fakeLlm.embedBatchModelCalls).toEqual([{ model }]);
       expect(db.prepare(`SELECT DISTINCT model FROM content_vectors`).all()).toEqual([{ model }]);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings persists semantic chunking and reuses its fingerprint", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+    const model = "hf:test/semantic-embed-model.gguf";
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = { ...fakeLlm, embedModelName: model } as any;
+
+    try {
+      await insertTestDocument(db, "docs", { name: "first", body: "# First\n\nA compact semantic note." });
+      await generateEmbeddings(store, { model, chunkStrategy: "semantic" });
+
+      const semanticFingerprint = getEmbeddingFingerprint(model, "semantic");
+      expect(semanticFingerprint).not.toBe(getEmbeddingFingerprint(model, "regex"));
+      expect(db.prepare(`SELECT value FROM store_config WHERE key = 'embedding_chunk_strategy'`).get()).toEqual({ value: "semantic" });
+      expect(db.prepare(`SELECT DISTINCT embed_fingerprint FROM content_vectors`).all()).toEqual([
+        { embed_fingerprint: semanticFingerprint },
+      ]);
+
+      await expect(generateEmbeddings(store, {
+        model,
+        collection: "docs",
+        chunkStrategy: "regex",
+      })).rejects.toThrow("Changing chunk strategy requires embedding the full index");
+      expect(db.prepare(`SELECT value FROM store_config WHERE key = 'embedding_chunk_strategy'`).get()).toEqual({ value: "semantic" });
+
+      await insertTestDocument(db, "docs", { name: "second", body: "# Second\n\nAnother compact semantic note." });
+      const resumed = await generateEmbeddings(store, { model });
+
+      expect(resumed.docsProcessed).toBe(1);
+      expect(db.prepare(`SELECT DISTINCT embed_fingerprint FROM content_vectors`).all()).toEqual([
+        { embed_fingerprint: semanticFingerprint },
+      ]);
+      const lengths = db.prepare(`SELECT chunk_len FROM content_vectors ORDER BY hash`).all() as { chunk_len: number }[];
+      expect(lengths).toHaveLength(2);
+      expect(lengths.every(row => row.chunk_len > 0)).toBe(true);
     } finally {
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);
@@ -4422,12 +4665,96 @@ describe("Embedding batching", () => {
     store.expandQuery = vi.fn(async () => []) as any;
 
     try {
-      await vectorSearchQuery(store, "custom query", { limit: 7, minScore: 0 });
+      const trace = vi.fn();
+      await vectorSearchQuery(store, "custom query", { limit: 7, minScore: 0, trace });
 
       expect(searchVecSpy).toHaveBeenCalledTimes(1);
       expect(searchVecSpy.mock.calls[0]?.[0]).toBe("custom query");
       expect(searchVecSpy.mock.calls[0]?.[1]).toBe(model);
       expect(searchVecSpy.mock.calls[0]?.[2]).toBe(7);
+      expect(searchVecSpy.mock.calls[0]?.[6]).toBe(trace);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("vectorSearchQuery can skip expansion and returns the exact matched span", async () => {
+    const store = await createTestStore();
+    const body = "intro\nexact useful chunk\ntrailing";
+    const chunkPos = body.indexOf("exact useful chunk");
+    const chunkLen = "exact useful chunk".length;
+    const result: SearchResult = {
+      filepath: "qmd://docs/note.md",
+      displayPath: "docs/note.md",
+      title: "Note",
+      hash: "abcdef123456",
+      docid: "abcdef",
+      collectionName: "docs",
+      modifiedAt: "",
+      bodyLength: body.length,
+      body,
+      context: null,
+      score: 0.9,
+      source: "vec",
+      chunkPos,
+      chunkLen,
+    };
+    const expandSpy = vi.fn(async () => []);
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = { embedModelName: "test-model" } as any;
+    store.expandQuery = expandSpy;
+    store.searchVec = vi.fn(async () => [result]);
+
+    try {
+      const results = await vectorSearchQuery(store, "literal query", { expand: false, minScore: 0 });
+
+      expect(expandSpy).not.toHaveBeenCalled();
+      expect(results[0]).toMatchObject({
+        bestChunk: "exact useful chunk",
+        chunkPos,
+        chunkLen,
+      });
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("vectorSearchQuery preserves the strongest expanded-query chunk during file deduplication", async () => {
+    const store = await createTestStore();
+    const body = "weaker chunk\nstronger exact chunk";
+    const makeVectorResult = (score: number, text: string): SearchResult => ({
+      filepath: "qmd://docs/note.md",
+      displayPath: "docs/note.md",
+      title: "Note",
+      hash: "abcdef123456",
+      docid: "abcdef",
+      collectionName: "docs",
+      modifiedAt: "",
+      bodyLength: body.length,
+      body,
+      context: null,
+      score,
+      source: "vec",
+      chunkPos: body.indexOf(text),
+      chunkLen: text.length,
+    });
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = { embedModelName: "test-model" } as any;
+    store.expandQuery = vi.fn(async () => [{ type: "vec" as const, query: "expanded" }]);
+    store.searchVec = vi.fn(async query => [
+      query === "expanded"
+        ? makeVectorResult(0.9, "stronger exact chunk")
+        : makeVectorResult(0.5, "weaker chunk"),
+    ]);
+
+    try {
+      const results = await vectorSearchQuery(store, "original", { minScore: 0 });
+
+      expect(results[0]).toMatchObject({
+        bestChunk: "stronger exact chunk",
+        chunkPos: body.indexOf("stronger exact chunk"),
+        chunkLen: "stronger exact chunk".length,
+      });
     } finally {
       await cleanupTestDb(store);
     }
@@ -4532,6 +4859,72 @@ describe("Embedding batching", () => {
       expect(searchVecSpy.mock.calls[0]?.[0]).toBe("structured query");
       expect(searchVecSpy.mock.calls[0]?.[1]).toBe(model);
       expect(searchVecSpy.mock.calls[0]?.[5]).toEqual([1, 2, 3]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("hybrid and structured reranking use the exact vector chunk span", async () => {
+    const store = await createTestStore();
+    const model = "hf:test/vector-span-model.gguf";
+    const prefix = "Lexical query terms appear here, outside the embedded span. ";
+    const exactChunk = "Exact semantic memory.";
+    const body = `${prefix}${exactChunk} Trailing context.`;
+    const filepath = "qmd://docs/memory.md";
+    const vectorResult: SearchResult = {
+      filepath,
+      displayPath: "docs/memory.md",
+      title: "Memory",
+      context: null,
+      hash: "spanhash",
+      docid: "spanha",
+      collectionName: "docs",
+      modifiedAt: "",
+      bodyLength: body.length,
+      body,
+      score: 0.9,
+      source: "vec",
+      chunkPos: prefix.length,
+      chunkLen: exactChunk.length,
+    };
+    const rerankSpy = vi.fn(async (_query: string, documents: { file: string; text: string }[]) =>
+      documents.map(document => ({ file: document.file, score: 0.8 }))
+    );
+
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = {
+      embedModelName: model,
+      async embedBatch(texts: string[]) {
+        return texts.map(() => ({ embedding: [1, 2, 3], model }));
+      },
+    } as any;
+    store.searchFTS = vi.fn(() => []) as any;
+    store.searchVec = vi.fn(async () => [vectorResult]) as any;
+    store.expandQuery = vi.fn(async () => []) as any;
+    store.rerank = rerankSpy as any;
+
+    try {
+      const hybrid = await hybridQuery(store, "lexical query", { limit: 1, minScore: 0 });
+      expect(rerankSpy).toHaveBeenLastCalledWith(
+        "lexical query",
+        [{ file: filepath, text: exactChunk }],
+        undefined,
+        undefined,
+      );
+      expect(hybrid[0]).toMatchObject({ bestChunk: exactChunk, bestChunkPos: prefix.length });
+
+      rerankSpy.mockClear();
+      const structured = await structuredSearch(store, [{ type: "vec", query: "lexical query" }], {
+        limit: 1,
+        minScore: 0,
+      });
+      expect(rerankSpy).toHaveBeenLastCalledWith(
+        "lexical query",
+        [{ file: filepath, text: exactChunk }],
+        undefined,
+        undefined,
+      );
+      expect(structured[0]).toMatchObject({ bestChunk: exactChunk, bestChunkPos: prefix.length });
     } finally {
       await cleanupTestDb(store);
     }

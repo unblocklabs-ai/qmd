@@ -31,7 +31,7 @@ export function looksLikeQmdMcpCommand(cmdline: string): boolean {
 }
 
 /** Read process cmdline (Linux /proc preferred; ps fallback for macOS). */
-export function readProcessCmdline(pid: number): string | null {
+function readProcessCmdline(pid: number): string | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
 
   const procPath = `/proc/${pid}/cmdline`;

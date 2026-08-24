@@ -20,7 +20,7 @@ import { join } from "node:path";
 /** Written next to the compiled CLI (dist/cli/) by scripts/build.mjs. */
 export const BUILD_INFO_FILENAME = "build-info.json";
 
-export type BuildInfo = {
+type BuildInfo = {
   commit: string;
   builtAt?: string;
 };

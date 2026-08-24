@@ -649,7 +649,7 @@ export function createInflightGate(): InflightGate {
 }
 
 /** Minimal stdin surface consumed by registerStdioEofShutdown, injectable for tests. */
-export type StdioShutdownStdin = {
+type StdioShutdownStdin = {
   once(event: "end" | "close", listener: () => void): unknown;
   off(event: "end" | "close", listener: () => void): unknown;
   readableEnded?: boolean;
