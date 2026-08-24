@@ -2,7 +2,7 @@
  * QMD SDK - Library mode for programmatic access to QMD search and indexing.
  *
  * Usage:
- *   import { createStore } from '@tobilu/qmd'
+ *   import { createStore } from '@unblocklabs/qmd'
  *
  *   const store = await createStore({
  *     dbPath: './my-index.sqlite',
@@ -20,6 +20,7 @@
 import {
   createStore as createStoreInternal,
   hybridQuery,
+  vectorSearchQuery,
   structuredSearch,
   extractSnippet,
   addLineNumbers,
@@ -67,6 +68,8 @@ import {
   type VectorSearchStage,
   type VectorSearchTiming,
   type VectorSearchTrace,
+  type VectorSearchOptions as InternalVSearchOptions,
+  type VectorSearchResult,
 } from "./store.js";
 import {
   LlamaCpp,
@@ -113,7 +116,11 @@ export type {
   VectorSearchStage,
   VectorSearchTiming,
   VectorSearchTrace,
+  VectorSearchResult,
 };
+
+/** Options for vsearch() — expanded vector-only semantic search. */
+export type VSearchOptions = InternalVSearchOptions;
 
 // Re-export the internal Store type for advanced consumers
 export type { InternalStore };
@@ -249,6 +256,9 @@ export interface QMDStore {
 
   /** Vector similarity search (embedding model, no reranking) */
   searchVector(query: string, options?: VectorSearchOptions): Promise<SearchResult[]>;
+
+  /** Expanded vector-only semantic search with exact winning chunk spans. */
+  vsearch(query: string, options?: VSearchOptions): Promise<VectorSearchResult[]>;
 
   /** Expand a query into typed sub-searches (lex/vec/hyde) for manual control */
   expandQuery(query: string, options?: ExpandQueryOptions): Promise<ExpandedQuery[]>;
@@ -443,6 +453,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     },
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
     searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection, undefined, undefined, opts?.trace),
+    vsearch: async (q, opts) => vectorSearchQuery(internal, q, opts),
     expandQuery: async (q) => internal.expandQuery(q),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {

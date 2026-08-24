@@ -360,7 +360,7 @@ async function getRemoteEtag(ref: HfRef): Promise<string | null> {
   }
 }
 
-const GGUF_MAGIC = Buffer.from("GGUF");
+const GGUF_MAGIC = [0x47, 0x47, 0x55, 0x46] as const;
 
 export type GgufFileInspection = {
   exists: boolean;
@@ -375,9 +375,10 @@ function formatModelFileSize(sizeBytes: number): string {
   return `${(sizeBytes / 1024).toFixed(0)} KB`;
 }
 
-function printableMagic(header: Buffer): string {
-  const text = header.toString("utf-8");
-  return /^[\x20-\x7e]{1,4}$/.test(text) ? text : `0x${header.toString("hex")}`;
+function printableMagic(header: Uint8Array): string {
+  const text = new TextDecoder().decode(header);
+  const hex = Array.from(header, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return /^[\x20-\x7e]{1,4}$/.test(text) ? text : `0x${hex}`;
 }
 
 /**
@@ -393,7 +394,7 @@ export function inspectGgufFile(filePath: string): GgufFileInspection {
   try {
     sizeBytes = statSync(filePath).size;
     const fd = openSync(filePath, "r");
-    const sniff = Buffer.alloc(512);
+    const sniff = new Uint8Array(512);
     try {
       readSync(fd, sniff, 0, 512, 0);
     } finally {
@@ -401,7 +402,7 @@ export function inspectGgufFile(filePath: string): GgufFileInspection {
     }
 
     const header = sniff.subarray(0, 4);
-    if (header.equals(GGUF_MAGIC)) {
+    if (GGUF_MAGIC.every((byte, index) => header[index] === byte)) {
       return {
         exists: true,
         valid: true,
@@ -413,7 +414,7 @@ export function inspectGgufFile(filePath: string): GgufFileInspection {
     }
 
     const magic = printableMagic(header);
-    const text = sniff.toString("utf-8").toLowerCase();
+    const text = new TextDecoder().decode(sniff).toLowerCase();
     const isHtml = text.includes("<!doctype") || text.includes("<html");
     if (isHtml) {
       return {

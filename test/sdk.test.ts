@@ -1,7 +1,7 @@
 /**
  * sdk.test.ts - Unit tests for the QMD SDK (library mode)
  *
- * Tests the public API exposed via `@tobilu/qmd` (src/index.ts).
+ * Tests the public API exposed via `@unblocklabs/qmd` (src/index.ts).
  * Uses inline config (no YAML files) to verify the SDK works self-contained.
  */
 
@@ -20,6 +20,8 @@ import {
   type SearchOptions,
   type LexSearchOptions,
   type VectorSearchOptions,
+  type VSearchOptions,
+  type VectorSearchResult,
   type ExpandQueryOptions,
 } from "../src/index.js";
 import { setDefaultLlamaCpp } from "../src/llm.js";
@@ -1276,6 +1278,13 @@ describe("type exports", () => {
     expect(config.collections).toHaveProperty("test");
   });
 
+  test("vsearch types are usable", () => {
+    const opts: VSearchOptions = { expand: false, collection: "memory", limit: 5 };
+    const results: VectorSearchResult[] = [];
+    expect(opts.collection).toBe("memory");
+    expect(results).toEqual([]);
+  });
+
   test("QMDStore type exposes expected methods", async () => {
     const store = await createStore({
       dbPath: freshDbPath(),
@@ -1286,6 +1295,7 @@ describe("type exports", () => {
     expect(typeof store.search).toBe("function");
     expect(typeof store.searchLex).toBe("function");
     expect(typeof store.searchVector).toBe("function");
+    expect(typeof store.vsearch).toBe("function");
     expect(typeof store.expandQuery).toBe("function");
     expect(typeof store.get).toBe("function");
     expect(typeof store.multiGet).toBe("function");
@@ -1303,6 +1313,17 @@ describe("type exports", () => {
     expect(typeof store.update).toBe("function");
     expect(typeof store.embed).toBe("function");
     expect(typeof store.close).toBe("function");
+
+    await store.close();
+  });
+
+  test("vsearch delegates safely when no vector index exists", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: { collections: {} },
+    });
+
+    await expect(store.vsearch("remember this", { expand: false })).resolves.toEqual([]);
 
     await store.close();
   });

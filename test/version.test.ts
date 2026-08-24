@@ -56,7 +56,7 @@ function initRepo(dir: string): string {
 async function makePackage(root: string): Promise<{ packageRoot: string; scriptDir: string }> {
   const scriptDir = join(root, "dist", "cli");
   await mkdir(scriptDir, { recursive: true });
-  await writeFile(join(root, "package.json"), JSON.stringify({ name: "@tobilu/qmd", version: "9.9.9" }));
+  await writeFile(join(root, "package.json"), JSON.stringify({ name: "@unblocklabs/qmd", version: "9.9.9" }));
   return { packageRoot: root, scriptDir };
 }
 

@@ -186,7 +186,7 @@ run_node_scenario() {
   run_runtime_matrix "node" "$bin" "export PATH=$NODE_BIN:\$PATH"
   smoke_test "node sqlite-vec loads" \
     "export PATH=$NODE_BIN:\$PATH; NPM_GLOBAL=\$(npm root -g); node -e \"
-      const {openDatabase, loadSqliteVec} = await import('\\$NPM_GLOBAL/@tobilu/qmd/dist/db.js');
+      const {openDatabase, loadSqliteVec} = await import('\\$NPM_GLOBAL/@unblocklabs/qmd/dist/db.js');
       const db = openDatabase(':memory:');
       loadSqliteVec(db);
       const r = db.prepare('SELECT vec_version() as v').get();
@@ -212,7 +212,7 @@ run_bun_scenario() {
   run_runtime_matrix "bun" "$bin" "export PATH=$BUN_BIN:$NODE_BIN:\$PATH"
   smoke_test "bun sqlite-vec loads" \
     "export PATH=$BUN_BIN:\$PATH; bun -e \"
-      const {openDatabase, loadSqliteVec} = await import('\\$HOME/.bun/install/global/node_modules/@tobilu/qmd/dist/db.js');
+      const {openDatabase, loadSqliteVec} = await import('\\$HOME/.bun/install/global/node_modules/@unblocklabs/qmd/dist/db.js');
       const db = openDatabase(':memory:');
       loadSqliteVec(db);
       const r = db.prepare('SELECT vec_version() as v').get();

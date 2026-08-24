@@ -68,7 +68,7 @@ function hasBun() {
 // Critical: source-mode detection must NOT trigger when a package manager
 // installed us. `pnpm install -g .` (and `npm install -g .`) copy the entire
 // working tree — including .git/, bun.lock, package-lock.json, src/, and even
-// node_modules/ — into <prefix>/node_modules/@tobilu/qmd/, so .git and a
+// node_modules/ — into <prefix>/node_modules/@unblocklabs/qmd/, so .git and a
 // lockfile being present is not a reliable "this is a working tree" signal.
 // What IS reliable: a package-manager install always lands the package
 // directory inside a `node_modules/` segment; a bare working-tree checkout
@@ -133,7 +133,7 @@ if (!useSourceMode && !existsSync(jsEntry)) {
 // Package-manager installs keep their lockfile at the install root, above
 // node_modules/ — never inside the package directory itself. A bun global
 // install writes $BUN_INSTALL/install/global/bun.lock while the package
-// lands in .../install/global/node_modules/@tobilu/qmd/, so the package-dir
+// lands in .../install/global/node_modules/@unblocklabs/qmd/, so the package-dir
 // checks below can't match and qmd would run under whatever node is first
 // on PATH. The native modules were built by the installing runtime; after
 // the next Node major upgrade they fail to load (ERR_DLOPEN_FAILED,

@@ -134,7 +134,7 @@ afterEach(() => {
 describe("bin/qmd package wrapper", () => {
   test("direct package invocation resolves dist/cli/qmd.js from the package root", () => {
     const { root, runtimeBin, capturePath } = makeTempFixture();
-    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd");
+    const packageRoot = makePackage(root, "node_modules/@unblocklabs/qmd");
 
     const result = runWrapper(join(packageRoot, "bin", "qmd"), runtimeBin, capturePath);
 
@@ -145,7 +145,7 @@ describe("bin/qmd package wrapper", () => {
 
   test("npm/Homebrew global bin symlink resolves scoped package path", () => {
     const { root, runtimeBin, capturePath } = makeTempFixture();
-    const packageRoot = makePackage(root, "opt/homebrew/lib/node_modules/@tobilu/qmd");
+    const packageRoot = makePackage(root, "opt/homebrew/lib/node_modules/@unblocklabs/qmd");
     const globalBin = join(root, "opt", "homebrew", "bin", "qmd");
     symlinkRelative(join(packageRoot, "bin", "qmd"), globalBin);
 
@@ -157,7 +157,7 @@ describe("bin/qmd package wrapper", () => {
 
   test("multi-hop global bin symlink chain resolves to the real package root", () => {
     const { root, runtimeBin, capturePath } = makeTempFixture();
-    const packageRoot = makePackage(root, "opt/homebrew/lib/node_modules/@tobilu/qmd");
+    const packageRoot = makePackage(root, "opt/homebrew/lib/node_modules/@unblocklabs/qmd");
     const globalBin = join(root, "opt", "homebrew", "bin", "qmd");
     const shim = join(root, "opt", "homebrew", "Cellar", "qmd", "current", "bin", "qmd");
     symlinkRelative(join(packageRoot, "bin", "qmd"), shim);
@@ -171,7 +171,7 @@ describe("bin/qmd package wrapper", () => {
 
   test("linuxbrew global bin symlink resolves lib/node_modules scoped package path", () => {
     const { root, runtimeBin, capturePath } = makeTempFixture();
-    const packageRoot = makePackage(root, "home/linuxbrew/.linuxbrew/lib/node_modules/@tobilu/qmd");
+    const packageRoot = makePackage(root, "home/linuxbrew/.linuxbrew/lib/node_modules/@unblocklabs/qmd");
     const globalBin = join(root, "home", "linuxbrew", ".linuxbrew", "bin", "qmd");
     symlinkRelative(join(packageRoot, "bin", "qmd"), globalBin);
 
@@ -181,9 +181,9 @@ describe("bin/qmd package wrapper", () => {
     expect(result.scriptPath).toBe(realpathSync(join(packageRoot, "dist", "cli", "qmd.js")));
   });
 
-  test("npx scoped package .bin symlink resolves @tobilu/qmd package path", () => {
+  test("npx scoped package .bin symlink resolves @unblocklabs/qmd package path", () => {
     const { root, runtimeBin, capturePath } = makeTempFixture();
-    const packageRoot = makePackage(root, "npm/_npx/abc123/node_modules/@tobilu/qmd");
+    const packageRoot = makePackage(root, "npm/_npx/abc123/node_modules/@unblocklabs/qmd");
     const npxBin = join(root, "npm", "_npx", "abc123", "node_modules", ".bin", "qmd");
     symlinkRelative(join(packageRoot, "bin", "qmd"), npxBin);
 
@@ -195,7 +195,7 @@ describe("bin/qmd package wrapper", () => {
 
   test("bun global symlink uses bun when package-local bun lockfile exists", () => {
     const { root, runtimeBin, capturePath } = makeTempFixture();
-    const packageRoot = makePackage(root, "home/user/.bun/install/global/node_modules/@tobilu/qmd", ["bun.lock"]);
+    const packageRoot = makePackage(root, "home/user/.bun/install/global/node_modules/@unblocklabs/qmd", ["bun.lock"]);
     const bunBin = join(root, "home", "user", ".bun", "bin", "qmd");
     symlinkRelative(join(packageRoot, "bin", "qmd"), bunBin);
 
@@ -207,7 +207,7 @@ describe("bin/qmd package wrapper", () => {
 
   test("bun global install with bun.lock at the install root uses bun", () => {
     const { root, runtimeBin, capturePath } = makeTempFixture();
-    const packageRoot = makePackage(root, "home/user/.bun/install/global/node_modules/@tobilu/qmd");
+    const packageRoot = makePackage(root, "home/user/.bun/install/global/node_modules/@unblocklabs/qmd");
     writeFileSync(join(root, "home", "user", ".bun", "install", "global", "bun.lock"), "");
     const bunBin = join(root, "home", "user", ".bun", "bin", "qmd");
     symlinkRelative(join(packageRoot, "bin", "qmd"), bunBin);
@@ -220,7 +220,7 @@ describe("bin/qmd package wrapper", () => {
 
   test("package-lock.json at the install root keeps npm priority", () => {
     const { root, runtimeBin, capturePath } = makeTempFixture();
-    const packageRoot = makePackage(root, "project/node_modules/@tobilu/qmd");
+    const packageRoot = makePackage(root, "project/node_modules/@unblocklabs/qmd");
     writeFileSync(join(root, "project", "package-lock.json"), "");
     writeFileSync(join(root, "project", "bun.lock"), "");
 
@@ -232,7 +232,7 @@ describe("bin/qmd package wrapper", () => {
 
   test("ambient BUN_INSTALL alone does not select bun for an npm-installed package", () => {
     const { root, runtimeBin, capturePath } = makeTempFixture();
-    const packageRoot = makePackage(root, "opt/homebrew/lib/node_modules/@tobilu/qmd");
+    const packageRoot = makePackage(root, "opt/homebrew/lib/node_modules/@unblocklabs/qmd");
     const globalBin = join(root, "opt", "homebrew", "bin", "qmd");
     symlinkRelative(join(packageRoot, "bin", "qmd"), globalBin);
 
@@ -244,7 +244,7 @@ describe("bin/qmd package wrapper", () => {
 
   test("package-lock.json takes priority over bun lockfiles", () => {
     const { root, runtimeBin, capturePath } = makeTempFixture();
-    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd", ["package-lock.json", "bun.lock"]);
+    const packageRoot = makePackage(root, "node_modules/@unblocklabs/qmd", ["package-lock.json", "bun.lock"]);
 
     const result = runWrapper(join(packageRoot, "bin", "qmd"), runtimeBin, capturePath);
 
@@ -254,7 +254,7 @@ describe("bin/qmd package wrapper", () => {
 
   test("packaged tree uses dist even if source files are present", () => {
     const { root, runtimeBin, capturePath } = makeTempFixture();
-    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd", ["bun.lock"], { source: true });
+    const packageRoot = makePackage(root, "node_modules/@unblocklabs/qmd", ["bun.lock"], { source: true });
 
     const result = runWrapper(join(packageRoot, "bin", "qmd"), runtimeBin, capturePath);
 
@@ -301,7 +301,7 @@ describe("bin/qmd package wrapper", () => {
 
   test("node child uses process.execPath, not a different PATH node (#577 leftover)", () => {
     const { root, runtimeBin, capturePath } = makeTempFixture();
-    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd");
+    const packageRoot = makePackage(root, "node_modules/@unblocklabs/qmd");
 
     const result = runWrapper(join(packageRoot, "bin", "qmd"), runtimeBin, capturePath);
 

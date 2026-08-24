@@ -28,14 +28,10 @@ You can read more about QMD's progress in the [CHANGELOG](CHANGELOG.md).
 ## Quick Start
 
 ```sh
-# Install globally (Node or Bun)
-npm install -g @tobilu/qmd
+# Install the Unblock fork globally (Node or Bun)
+npm install -g github:unblocklabs-ai/qmd
 # or
-bun install -g @tobilu/qmd
-
-# Or run directly
-npx @tobilu/qmd ...
-bunx @tobilu/qmd ...
+bun install -g github:unblocklabs-ai/qmd
 
 # Create collections for your notes, docs, and meeting transcripts
 qmd collection add ~/notes --name notes
@@ -112,7 +108,7 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 **Claude Code** — Install the plugin (recommended):
 
 ```bash
-claude plugin marketplace add tobi/qmd
+claude plugin marketplace add unblocklabs-ai/qmd
 claude plugin install qmd@qmd
 ```
 
@@ -212,13 +208,13 @@ Use QMD as a library in your own Node.js or Bun applications.
 #### Installation
 
 ```sh
-npm install @tobilu/qmd
+npm install github:unblocklabs-ai/qmd
 ```
 
 #### Quick Start
 
 ```typescript
-import { createStore } from '@tobilu/qmd'
+import { createStore } from '@unblocklabs/qmd'
 
 const store = await createStore({
   dbPath: './my-index.sqlite',
@@ -240,7 +236,7 @@ await store.close()
 `createStore()` accepts three modes:
 
 ```typescript
-import { createStore } from '@tobilu/qmd'
+import { createStore } from '@unblocklabs/qmd'
 
 // 1. Inline config — no files needed besides the DB
 const store = await createStore({
@@ -270,6 +266,12 @@ The unified `search()` method handles both simple queries and pre-expanded struc
 ```typescript
 // Simple query — auto-expanded via LLM, then BM25 + vector + reranking
 const results = await store.search({ query: "authentication flow" })
+
+// Vector-only search with expansion and exact winning chunk spans
+const memoryResults = await store.vsearch("what did we decide?", {
+  collection: "memory",
+  limit: 5,
+})
 
 // With options
 const results2 = await store.search({
@@ -404,6 +406,8 @@ import type {
   SearchOptions,       // Options for search()
   LexSearchOptions,    // Options for searchLex()
   VectorSearchOptions, // Options for searchVector()
+  VSearchOptions,      // Options for vsearch()
+  VectorSearchResult,  // Exact winning chunks returned by vsearch()
   HybridQueryResult,   // Search result with score, snippet, context
   SearchResult,        // Result from searchLex/searchVector
   ExpandedQuery,       // Typed sub-query { type: 'lex'|'vec'|'hyde', query }
@@ -418,7 +422,7 @@ import type {
   CollectionConfig,    // Inline config shape
   IndexStatus,         // From getStatus()
   IndexHealthInfo,     // From getIndexHealth()
-} from '@tobilu/qmd'
+} from '@unblocklabs/qmd'
 ```
 
 Utility exports:
@@ -429,7 +433,7 @@ import {
   addLineNumbers,              // Add line numbers to text
   DEFAULT_MULTI_GET_MAX_BYTES, // Default max file size for multiGet (64KB)
   Maintenance,                 // Database maintenance operations
-} from '@tobilu/qmd'
+} from '@unblocklabs/qmd'
 ```
 
 #### Lifecycle
@@ -587,15 +591,15 @@ Supported model families:
 ## Installation
 
 ```sh
-npm install -g @tobilu/qmd
+npm install -g github:unblocklabs-ai/qmd
 # or
-bun install -g @tobilu/qmd
+bun install -g github:unblocklabs-ai/qmd
 ```
 
 ### Development
 
 ```sh
-git clone https://github.com/tobi/qmd
+git clone https://github.com/unblocklabs-ai/qmd
 cd qmd
 npm install
 npm link

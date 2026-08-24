@@ -931,9 +931,10 @@ export async function startMcpHttpServer(
 
   // Helper to collect request body
   async function collectBody(req: IncomingMessage): Promise<string> {
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(chunk as Buffer);
-    return Buffer.concat(chunks).toString();
+    req.setEncoding("utf8");
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    return body;
   }
 
   const host = options.host ?? process.env.QMD_HOST ?? "localhost";
