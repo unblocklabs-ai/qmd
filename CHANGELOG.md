@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.9.1] - 2026-08-26
+
 ### Fixed
 
 - Exact path-filtered vector search now materializes one indexed allowlist per

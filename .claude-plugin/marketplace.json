@@ -9,7 +9,7 @@
 			"name": "qmd",
 			"source": "./skills",
 			"description": "Search and retrieve documents from local markdown files.",
-			"version": "2.9.0",
+			"version": "2.9.1",
 			"author": {
 				"name": "tobi",
 				"email": "tobi@lutke.com"
