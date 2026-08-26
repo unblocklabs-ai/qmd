@@ -4018,6 +4018,60 @@ describe("Vector Search collection filter", () => {
       await unlink(dbPath);
     }
   });
+
+  test("searchVec pre-ranks an exact large path allowlist", async () => {
+    const store = await createTestStore();
+    const collection = await createTestCollection({ name: "sessions", pwd: "/test/sessions" });
+    const model = "test-model";
+    const fingerprint = getEmbeddingFingerprint(model);
+    const now = new Date().toISOString();
+    const allowedPaths = Array.from({ length: 800 }, (_, index) => `allowed-${index}.md`);
+    store.ensureVecTable(3);
+    const insertChunk = store.db.prepare(`
+      INSERT INTO content_vectors
+        (hash, seq, pos, chunk_len, model, embed_fingerprint, embedded_at)
+      VALUES (?, 0, 0, 1, ?, ?, ?)
+    `);
+    const insertVector = store.db.prepare(
+      "INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)",
+    );
+    store.db.transaction(() => {
+      for (const [path, vector] of [
+        ...Array.from({ length: 100 }, (_, index) =>
+          [`blocked-${index}.md`, [1, 0, 0]] as const),
+        ...allowedPaths.map(path => [path, [0.8, 0.6, 0]] as const),
+      ]) {
+        const hash = path.slice(0, -3);
+        insertContent(store.db, hash, hash, now);
+        insertDocument(store.db, collection, path, "Session", hash, now, now);
+        insertChunk.run(hash, model, fingerprint, now);
+        insertVector.run(`${hash}_0`, new Float32Array(vector));
+      }
+    })();
+
+    const timings: Array<{ stage: VectorSearchStage; attempt?: number; candidateK?: number }> = [];
+    const results = await store.searchVec(
+      "ignored — embedding precomputed",
+      model,
+      5,
+      collection,
+      undefined,
+      [1, 0, 0],
+      timing => timings.push(timing),
+      { [collection]: [...allowedPaths, allowedPaths[0]!] },
+    );
+
+    expect(results).toHaveLength(5);
+    expect(results.every(result => result.displayPath.startsWith(`${collection}/allowed-`))).toBe(true);
+    expect(timings.filter(timing => timing.stage === "vector_scan_knn")).toEqual([
+      expect.objectContaining({ attempt: 1, candidateK: 20 }),
+    ]);
+    expect(store.db.prepare(`
+      SELECT name FROM sqlite_temp_master WHERE name LIKE 'qmd_allowed_paths_%'
+    `).all()).toEqual([]);
+
+    await cleanupTestDb(store);
+  });
 });
 
 // =============================================================================

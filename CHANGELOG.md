@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Exact path-filtered vector search now materializes one indexed allowlist per
+  query instead of repeatedly scanning JSON inside KNN and hydration, keeping
+  large session filters fast without changing semantic ranking or recall.
+
 ## [2.9.0] - 2026-08-26
 
 ### Added
