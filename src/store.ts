@@ -4178,15 +4178,50 @@ const SQLITE_VEC_MAX_K = 4096;
 
 type VecMatch = { hash_seq: string; distance: number };
 
-const ALLOWED_PATH_FILTER = `AND NOT EXISTS (
-  SELECT 1
-  FROM json_each(?) AS restricted
-  WHERE restricted.key = d.collection
-    AND NOT EXISTS (
-      SELECT 1 FROM json_each(restricted.value) AS allowed
-      WHERE allowed.value = d.path
-    )
-)`;
+let allowedPathScopeSequence = 0;
+
+type AllowedPathScope = {
+  filterSql: string;
+  close: () => void;
+};
+
+function materializeAllowedPaths(
+  db: Database,
+  allowedPaths: AllowedDocumentPaths | undefined,
+): AllowedPathScope | undefined {
+  if (allowedPaths === undefined) return undefined;
+  const table = `qmd_allowed_paths_${++allowedPathScopeSequence}`;
+  db.exec(`CREATE TEMP TABLE ${table} (
+    collection TEXT NOT NULL,
+    path TEXT,
+    UNIQUE (collection, path)
+  )`);
+  try {
+    const insert = db.prepare(`INSERT OR IGNORE INTO ${table} (collection, path) VALUES (?, ?)`);
+    db.transaction(() => {
+      for (const [collection, paths] of Object.entries(allowedPaths)) {
+        insert.run(collection, null);
+        for (const path of paths) insert.run(collection, path);
+      }
+    })();
+  } catch (error) {
+    db.exec(`DROP TABLE ${table}`);
+    throw error;
+  }
+  return {
+    filterSql: `AND NOT EXISTS (
+      SELECT 1 FROM ${table} AS restricted
+      WHERE restricted.collection = d.collection
+        AND restricted.path IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM ${table} AS allowed
+          WHERE allowed.collection = d.collection
+            AND allowed.path = d.path
+        )
+    )`,
+    close: () => db.exec(`DROP TABLE ${table}`),
+  };
+}
 
 /**
  * Exact sqlite-vec KNN constrained to active, current-model document chunks.
@@ -4203,13 +4238,12 @@ function knnVecScan(
   model: string,
   fingerprint: string,
   collectionNames: readonly string[] | undefined,
-  allowedPathsJson: string | undefined,
+  allowedPathFilter: string,
 ): VecMatch[] {
   const vecK = Math.max(1, Math.min(SQLITE_VEC_MAX_K, k));
   const collectionFilter = collectionNames
     ? `AND d.collection IN (${collectionNames.map(() => "?").join(",")})`
     : "";
-  const allowedPathFilter = allowedPathsJson === undefined ? "" : ALLOWED_PATH_FILTER;
   return db.prepare(`
     SELECT hash_seq, distance
     FROM vectors_vec
@@ -4231,7 +4265,6 @@ function knnVecScan(
     model,
     fingerprint,
     ...(collectionNames ?? []),
-    ...(allowedPathsJson === undefined ? [] : [allowedPathsJson]),
   ) as VecMatch[];
 }
 
@@ -4256,154 +4289,157 @@ export async function searchVec(db: Database, query: string, model: string, limi
   if (!embedding) return [];
 
   const fingerprint = getEmbeddingFingerprint(model, getEmbeddingChunkStrategy(db));
-  const allowedPathsJson = allowedPaths === undefined ? undefined : JSON.stringify(allowedPaths);
+  const allowedPathScope = materializeAllowedPaths(db, allowedPaths);
+  const allowedPathFilter = allowedPathScope?.filterSql ?? "";
   let candidateK = Math.min(SQLITE_VEC_MAX_K, Math.max(20, requestedLimit * 4));
   let attempt = 1;
 
-  while (true) {
-    const vectorScanStart = performance.now();
-    const vecResults = knnVecScan(db, embedding, candidateK, model, fingerprint, names, allowedPathsJson);
-    trace?.({
-      stage: "vector_scan_knn",
-      durationMs: performance.now() - vectorScanStart,
-      attempt,
-      candidateK,
-    });
-    if (vecResults.length === 0) return [];
-
-    const hydrationStart = performance.now();
-    const hashSeqs = vecResults.map(result => result.hash_seq);
-    const distanceMap = new Map(vecResults.map(result => [result.hash_seq, result.distance]));
-    const placeholders = hashSeqs.map(() => "?").join(",");
-    const collectionFilter = names
-      ? `AND d.collection IN (${names.map(() => "?").join(",")})`
-      : "";
-    const allowedPathFilter = allowedPathsJson === undefined ? "" : ALLOWED_PATH_FILTER;
-    const docRows = withLazyContentVectorMigration(db, () => db.prepare(`
-      SELECT
-        cv.hash || '_' || cv.seq AS hash_seq,
-        cv.hash,
-        cv.pos,
-        cv.chunk_len,
-        d.collection,
-        'qmd://' || d.collection || '/' || d.path AS filepath,
-        d.collection || '/' || d.path AS display_path,
-        d.title,
-        content.doc AS body
-      FROM content_vectors cv
-      JOIN documents d ON d.hash = cv.hash
-      JOIN content ON content.hash = d.hash
-      WHERE cv.hash || '_' || cv.seq IN (${placeholders})
-        AND d.active = 1
-        AND cv.model = ?
-        AND cv.embed_fingerprint = ?
-        ${collectionFilter}
-        ${allowedPathFilter}
-    `).all(
-      ...hashSeqs,
-      model,
-      fingerprint,
-      ...(names ?? []),
-      ...(allowedPathsJson === undefined ? [] : [allowedPathsJson]),
-    ) as Array<{
-      hash_seq: string;
-      hash: string;
-      pos: number;
-      chunk_len: number;
-      collection: string;
-      filepath: string;
-      display_path: string;
-      title: string;
-      body: string;
-    }>);
-    trace?.({
-      stage: "hydration",
-      durationMs: performance.now() - hydrationStart,
-      attempt,
-      candidateK,
-    });
-
-    const resultMappingStart = performance.now();
-    const collectionPriority = new Map(names?.map((name, index) => [name, index]));
-    const pathOrder = (a: typeof docRows[number], b: typeof docRows[number]): number => {
-      const priorityA = collectionPriority.get(a.collection) ?? Number.MAX_SAFE_INTEGER;
-      const priorityB = collectionPriority.get(b.collection) ?? Number.MAX_SAFE_INTEGER;
-      return priorityA - priorityB || a.filepath.localeCompare(b.filepath);
-    };
-    const byHash = new Map<string, {
-      bestChunk: typeof docRows[number];
-      bestDist: number;
-      paths: Map<string, typeof docRows[number]>;
-    }>();
-
-    for (const row of docRows) {
-      const distance = distanceMap.get(row.hash_seq);
-      if (distance === undefined) continue;
-      const existing = byHash.get(row.hash);
-      if (!existing) {
-        byHash.set(row.hash, {
-          bestChunk: row,
-          bestDist: distance,
-          paths: new Map([[row.filepath, row]]),
-        });
-        continue;
-      }
-      existing.paths.set(row.filepath, row);
-      if (
-        distance < existing.bestDist
-        || (distance === existing.bestDist && pathOrder(row, existing.bestChunk) < 0)
-      ) {
-        existing.bestChunk = row;
-        existing.bestDist = distance;
-      }
-    }
-
-    const results = Array.from(byHash.values())
-      .sort((a, b) => a.bestDist - b.bestDist || a.bestChunk.hash.localeCompare(b.bestChunk.hash))
-      .map(({ bestChunk, bestDist, paths }) => {
-        const orderedPaths = Array.from(paths.values()).sort(pathOrder);
-        const primary = orderedPaths[0] ?? bestChunk;
-        const aliases = orderedPaths.slice(1).map(row => ({
-          filepath: row.filepath,
-          displayPath: row.display_path,
-          title: row.title,
-          collectionName: row.collection,
-        }));
-        return {
-          filepath: primary.filepath,
-          displayPath: primary.display_path,
-          title: primary.title,
-          hash: bestChunk.hash,
-          docid: getDocid(bestChunk.hash),
-          collectionName: primary.collection,
-          modifiedAt: "",  // Not available in vec query
-          bodyLength: bestChunk.body.length,
-          body: bestChunk.body,
-          context: getContextForFile(db, primary.filepath),
-          score: 1 - bestDist,
-          source: "vec" as const,
-          chunkPos: bestChunk.pos,
-          chunkLen: bestChunk.chunk_len,
-          ...(aliases.length > 0 ? { aliases } : {}),
-        } satisfies SearchResult;
+  try {
+    while (true) {
+      const vectorScanStart = performance.now();
+      const vecResults = knnVecScan(db, embedding, candidateK, model, fingerprint, names, allowedPathFilter);
+      trace?.({
+        stage: "vector_scan_knn",
+        durationMs: performance.now() - vectorScanStart,
+        attempt,
+        candidateK,
       });
-    trace?.({
-      stage: "result_mapping",
-      durationMs: performance.now() - resultMappingStart,
-      attempt,
-      candidateK,
-    });
+      if (vecResults.length === 0) return [];
 
-    if (
-      results.length >= requestedLimit
-      || vecResults.length < candidateK
-      || candidateK === SQLITE_VEC_MAX_K
-    ) {
-      return results.slice(0, requestedLimit);
+      const hydrationStart = performance.now();
+      const hashSeqs = vecResults.map(result => result.hash_seq);
+      const distanceMap = new Map(vecResults.map(result => [result.hash_seq, result.distance]));
+      const placeholders = hashSeqs.map(() => "?").join(",");
+      const collectionFilter = names
+        ? `AND d.collection IN (${names.map(() => "?").join(",")})`
+        : "";
+      const docRows = withLazyContentVectorMigration(db, () => db.prepare(`
+        SELECT
+          cv.hash || '_' || cv.seq AS hash_seq,
+          cv.hash,
+          cv.pos,
+          cv.chunk_len,
+          d.collection,
+          'qmd://' || d.collection || '/' || d.path AS filepath,
+          d.collection || '/' || d.path AS display_path,
+          d.title,
+          content.doc AS body
+        FROM content_vectors cv
+        JOIN documents d ON d.hash = cv.hash
+        JOIN content ON content.hash = d.hash
+        WHERE cv.hash || '_' || cv.seq IN (${placeholders})
+          AND d.active = 1
+          AND cv.model = ?
+          AND cv.embed_fingerprint = ?
+          ${collectionFilter}
+          ${allowedPathFilter}
+      `).all(
+        ...hashSeqs,
+        model,
+        fingerprint,
+        ...(names ?? []),
+      ) as Array<{
+        hash_seq: string;
+        hash: string;
+        pos: number;
+        chunk_len: number;
+        collection: string;
+        filepath: string;
+        display_path: string;
+        title: string;
+        body: string;
+      }>);
+      trace?.({
+        stage: "hydration",
+        durationMs: performance.now() - hydrationStart,
+        attempt,
+        candidateK,
+      });
+
+      const resultMappingStart = performance.now();
+      const collectionPriority = new Map(names?.map((name, index) => [name, index]));
+      const pathOrder = (a: typeof docRows[number], b: typeof docRows[number]): number => {
+        const priorityA = collectionPriority.get(a.collection) ?? Number.MAX_SAFE_INTEGER;
+        const priorityB = collectionPriority.get(b.collection) ?? Number.MAX_SAFE_INTEGER;
+        return priorityA - priorityB || a.filepath.localeCompare(b.filepath);
+      };
+      const byHash = new Map<string, {
+        bestChunk: typeof docRows[number];
+        bestDist: number;
+        paths: Map<string, typeof docRows[number]>;
+      }>();
+
+      for (const row of docRows) {
+        const distance = distanceMap.get(row.hash_seq);
+        if (distance === undefined) continue;
+        const existing = byHash.get(row.hash);
+        if (!existing) {
+          byHash.set(row.hash, {
+            bestChunk: row,
+            bestDist: distance,
+            paths: new Map([[row.filepath, row]]),
+          });
+          continue;
+        }
+        existing.paths.set(row.filepath, row);
+        if (
+          distance < existing.bestDist
+          || (distance === existing.bestDist && pathOrder(row, existing.bestChunk) < 0)
+        ) {
+          existing.bestChunk = row;
+          existing.bestDist = distance;
+        }
+      }
+
+      const results = Array.from(byHash.values())
+        .sort((a, b) => a.bestDist - b.bestDist || a.bestChunk.hash.localeCompare(b.bestChunk.hash))
+        .map(({ bestChunk, bestDist, paths }) => {
+          const orderedPaths = Array.from(paths.values()).sort(pathOrder);
+          const primary = orderedPaths[0] ?? bestChunk;
+          const aliases = orderedPaths.slice(1).map(row => ({
+            filepath: row.filepath,
+            displayPath: row.display_path,
+            title: row.title,
+            collectionName: row.collection,
+          }));
+          return {
+            filepath: primary.filepath,
+            displayPath: primary.display_path,
+            title: primary.title,
+            hash: bestChunk.hash,
+            docid: getDocid(bestChunk.hash),
+            collectionName: primary.collection,
+            modifiedAt: "",  // Not available in vec query
+            bodyLength: bestChunk.body.length,
+            body: bestChunk.body,
+            context: getContextForFile(db, primary.filepath),
+            score: 1 - bestDist,
+            source: "vec" as const,
+            chunkPos: bestChunk.pos,
+            chunkLen: bestChunk.chunk_len,
+            ...(aliases.length > 0 ? { aliases } : {}),
+          } satisfies SearchResult;
+        });
+      trace?.({
+        stage: "result_mapping",
+        durationMs: performance.now() - resultMappingStart,
+        attempt,
+        candidateK,
+      });
+
+      if (
+        results.length >= requestedLimit
+        || vecResults.length < candidateK
+        || candidateK === SQLITE_VEC_MAX_K
+      ) {
+        return results.slice(0, requestedLimit);
+      }
+
+      candidateK = Math.min(SQLITE_VEC_MAX_K, candidateK * 2);
+      attempt++;
     }
-
-    candidateK = Math.min(SQLITE_VEC_MAX_K, candidateK * 2);
-    attempt++;
+  } finally {
+    allowedPathScope?.close();
   }
 }
 
