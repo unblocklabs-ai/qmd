@@ -282,6 +282,9 @@ const store2 = await createStore({
 const store3 = await createStore({ dbPath: './index.sqlite' })
 ```
 
+Set `keepModelsWarm: true` to retain loaded model contexts until `store.close()`.
+By default, QMD unloads them after five minutes without a model operation.
+
 #### Search
 
 The unified `search()` method handles both simple queries and pre-expanded structured queries:

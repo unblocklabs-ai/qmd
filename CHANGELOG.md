@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- The SDK can keep lazily loaded model contexts resident for a store's lifetime
+  with `keepModelsWarm: true`; the existing five-minute idle unload remains the
+  default for other consumers.
+
 ## [2.9.1] - 2026-08-26
 
 ### Fixed

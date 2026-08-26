@@ -81,6 +81,19 @@ describe("createStore", () => {
     expect(store).toBeDefined();
     expect(store.dbPath).toBeTruthy();
     expect(store.internal).toBeDefined();
+    expect((store.internal.llm as { inactivityTimeoutMs: number }).inactivityTimeoutMs).toBe(5 * 60 * 1000);
+    await store.close();
+  });
+
+  test("can keep models warm for the store lifetime", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: { collections: {} },
+      keepModelsWarm: true,
+    });
+
+    const llm = store.internal.llm as { inactivityTimeoutMs: number };
+    expect(llm.inactivityTimeoutMs).toBe(0);
     await store.close();
   });
 

@@ -233,6 +233,8 @@ export interface StoreOptions {
   configPath?: string;
   /** Inline collection config (mutually exclusive with `configPath`) */
   config?: CollectionConfig;
+  /** Keep loaded model contexts resident until the store closes. Default: false. */
+  keepModelsWarm?: boolean;
 }
 
 /**
@@ -400,13 +402,13 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
+  // Create a per-store LlamaCpp instance — lazy-loads models on first use and,
+  // unless explicitly kept warm, unloads them after 5 min inactivity.
   const llm = new LlamaCpp({
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,
-    inactivityTimeoutMs: 5 * 60 * 1000,
+    inactivityTimeoutMs: options.keepModelsWarm ? 0 : 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });
   internal.llm = llm;
