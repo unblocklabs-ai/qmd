@@ -68,6 +68,7 @@ import {
   type VectorSearchStage,
   type VectorSearchTiming,
   type VectorSearchTrace,
+  type AllowedDocumentPaths,
   type VectorSearchOptions as InternalVSearchOptions,
   type VectorSearchResult,
 } from "./store.js";
@@ -116,6 +117,7 @@ export type {
   VectorSearchStage,
   VectorSearchTiming,
   VectorSearchTrace,
+  AllowedDocumentPaths,
   VectorSearchResult,
 };
 

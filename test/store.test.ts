@@ -17,6 +17,7 @@ import * as llmModule from "../src/llm.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
+  DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
   verifySqliteVecLoaded,
@@ -69,6 +70,7 @@ import {
   type RankedListMeta,
   type VectorSearchStage,
 } from "../src/store.js";
+import { createStore as createSdkStore } from "../src/index.js";
 import type { CollectionConfig } from "../src/collections.js";
 
 // =============================================================================
@@ -3934,6 +3936,87 @@ describe("Vector Search collection filter", () => {
     )).toEqual([]);
 
     await cleanupTestDb(store);
+  });
+
+  test("vsearch restricts exact paths before vector top-k without leaking shared-hash aliases", async () => {
+    const dbPath = join(testDir, `sdk-filter-${Date.now()}.sqlite`);
+    const sdkStore = await createSdkStore({ dbPath });
+    const store = sdkStore.internal;
+    const model = DEFAULT_EMBED_MODEL;
+    const fingerprint = getEmbeddingFingerprint(model);
+    const documents = [
+      ...Array.from({ length: 25 }, (_, index) => ({
+        collection: "sessions",
+        path: `blocked-${index}.md`,
+        hash: `blocked-${index}`,
+        vector: [1, 0, 0],
+      })),
+      { collection: "sessions", path: "a-blocked-alias.md", hash: "shared", vector: [0.8, 0.6, 0] },
+      { collection: "sessions", path: "z-allowed.md", hash: "shared", vector: [0.8, 0.6, 0] },
+      { collection: "memory", path: "file.md", hash: "file", vector: [0.9, 0.435, 0] },
+    ];
+
+    store.ensureVecTable(3);
+    const insertedVectors = new Set<string>();
+    for (const document of documents) {
+      await insertTestDocument(store.db, document.collection, {
+        displayPath: document.path,
+        hash: document.hash,
+        body: document.hash,
+      });
+      if (insertedVectors.has(document.hash)) continue;
+      insertedVectors.add(document.hash);
+      store.db.prepare(`
+        INSERT INTO content_vectors
+          (hash, seq, pos, chunk_len, model, embed_fingerprint, embedded_at)
+        VALUES (?, 0, 0, ?, ?, ?, ?)
+      `).run(document.hash, document.hash.length, model, fingerprint, new Date().toISOString());
+      store.db.prepare(
+        "INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)",
+      ).run(`${document.hash}_0`, new Float32Array(document.vector));
+    }
+
+    const searchVec = store.searchVec.bind(store);
+    store.searchVec = (query, embedModel, limit, collection, session, _embedding, trace, allowedPaths) =>
+      searchVec(query, embedModel, limit, collection, session, [1, 0, 0], trace, allowedPaths);
+
+    try {
+      const allowed = await sdkStore.vsearch("query", {
+        collection: ["memory", "sessions"],
+        allowedPaths: { sessions: ["z-allowed.md"] },
+        expand: false,
+        limit: 5,
+        minScore: 0,
+      });
+      expect(allowed.map(result => result.file)).toEqual([
+        "qmd://memory/file.md",
+        "qmd://sessions/z-allowed.md",
+      ]);
+
+      const shared = await store.searchVec(
+        "query",
+        model,
+        5,
+        "sessions",
+        undefined,
+        [1, 0, 0],
+        undefined,
+        { sessions: ["z-allowed.md"] },
+      );
+      expect(shared[0]?.filepath).toBe("qmd://sessions/z-allowed.md");
+      expect(shared[0]?.aliases ?? []).toEqual([]);
+
+      expect(await sdkStore.vsearch("query", {
+        collection: ["memory", "sessions"],
+        allowedPaths: { sessions: [] },
+        expand: false,
+        limit: 5,
+        minScore: 0,
+      })).toMatchObject([{ file: "qmd://memory/file.md" }]);
+    } finally {
+      await sdkStore.close();
+      await unlink(dbPath);
+    }
   });
 });
 

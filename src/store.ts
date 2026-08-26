@@ -1579,7 +1579,7 @@ export type Store = {
 
   // Search
   searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[]) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], trace?: VectorSearchTrace) => Promise<SearchResult[]>;
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], trace?: VectorSearchTrace, allowedPaths?: AllowedDocumentPaths) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
@@ -2363,7 +2363,7 @@ export function createStore(dbPath?: string): Store {
 
     // Search
     searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[]) => searchFTS(db, query, limit, collectionName),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], trace?: VectorSearchTrace) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, getLlm(store), trace),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], trace?: VectorSearchTrace, allowedPaths?: AllowedDocumentPaths) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, getLlm(store), trace, allowedPaths),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, store.llm),
@@ -4067,6 +4067,8 @@ export function validateLexQuery(query: string): string | null {
 /** One collection, several (OR), or all (undefined). */
 type CollectionScope = string | readonly string[] | undefined;
 
+export type AllowedDocumentPaths = Readonly<Record<string, readonly string[]>>;
+
 function scopedCollectionNames(scope: CollectionScope): string[] | undefined {
   if (scope == null) return undefined;
   const names = (typeof scope === "string" ? [scope] : Array.from(scope))
@@ -4176,6 +4178,16 @@ const SQLITE_VEC_MAX_K = 4096;
 
 type VecMatch = { hash_seq: string; distance: number };
 
+const ALLOWED_PATH_FILTER = `AND NOT EXISTS (
+  SELECT 1
+  FROM json_each(?) AS restricted
+  WHERE restricted.key = d.collection
+    AND NOT EXISTS (
+      SELECT 1 FROM json_each(restricted.value) AS allowed
+      WHERE allowed.value = d.path
+    )
+)`;
+
 /**
  * Exact sqlite-vec KNN constrained to active, current-model document chunks.
  *
@@ -4191,11 +4203,13 @@ function knnVecScan(
   model: string,
   fingerprint: string,
   collectionNames: readonly string[] | undefined,
+  allowedPathsJson: string | undefined,
 ): VecMatch[] {
   const vecK = Math.max(1, Math.min(SQLITE_VEC_MAX_K, k));
   const collectionFilter = collectionNames
     ? `AND d.collection IN (${collectionNames.map(() => "?").join(",")})`
     : "";
+  const allowedPathFilter = allowedPathsJson === undefined ? "" : ALLOWED_PATH_FILTER;
   return db.prepare(`
     SELECT hash_seq, distance
     FROM vectors_vec
@@ -4209,6 +4223,7 @@ function knnVecScan(
           AND cv.model = ?
           AND cv.embed_fingerprint = ?
           ${collectionFilter}
+          ${allowedPathFilter}
       )
   `).all(
     new Float32Array(embedding),
@@ -4216,10 +4231,11 @@ function knnVecScan(
     model,
     fingerprint,
     ...(collectionNames ?? []),
+    ...(allowedPathsJson === undefined ? [] : [allowedPathsJson]),
   ) as VecMatch[];
 }
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, trace?: VectorSearchTrace): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, trace?: VectorSearchTrace, allowedPaths?: AllowedDocumentPaths): Promise<SearchResult[]> {
   const indexCheckStart = performance.now();
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   trace?.({ stage: "index_check", durationMs: performance.now() - indexCheckStart });
@@ -4240,12 +4256,13 @@ export async function searchVec(db: Database, query: string, model: string, limi
   if (!embedding) return [];
 
   const fingerprint = getEmbeddingFingerprint(model, getEmbeddingChunkStrategy(db));
+  const allowedPathsJson = allowedPaths === undefined ? undefined : JSON.stringify(allowedPaths);
   let candidateK = Math.min(SQLITE_VEC_MAX_K, Math.max(20, requestedLimit * 4));
   let attempt = 1;
 
   while (true) {
     const vectorScanStart = performance.now();
-    const vecResults = knnVecScan(db, embedding, candidateK, model, fingerprint, names);
+    const vecResults = knnVecScan(db, embedding, candidateK, model, fingerprint, names, allowedPathsJson);
     trace?.({
       stage: "vector_scan_knn",
       durationMs: performance.now() - vectorScanStart,
@@ -4261,6 +4278,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
     const collectionFilter = names
       ? `AND d.collection IN (${names.map(() => "?").join(",")})`
       : "";
+    const allowedPathFilter = allowedPathsJson === undefined ? "" : ALLOWED_PATH_FILTER;
     const docRows = withLazyContentVectorMigration(db, () => db.prepare(`
       SELECT
         cv.hash || '_' || cv.seq AS hash_seq,
@@ -4280,7 +4298,14 @@ export async function searchVec(db: Database, query: string, model: string, limi
         AND cv.model = ?
         AND cv.embed_fingerprint = ?
         ${collectionFilter}
-    `).all(...hashSeqs, model, fingerprint, ...(names ?? [])) as Array<{
+        ${allowedPathFilter}
+    `).all(
+      ...hashSeqs,
+      model,
+      fingerprint,
+      ...(names ?? []),
+      ...(allowedPathsJson === undefined ? [] : [allowedPathsJson]),
+    ) as Array<{
       hash_seq: string;
       hash: string;
       pos: number;
@@ -5872,6 +5897,8 @@ export async function hybridQuery(
 
 export interface VectorSearchOptions {
   collection?: string | readonly string[];
+  /** Restrict only the listed collections to exact relative document paths. */
+  allowedPaths?: AllowedDocumentPaths;
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
   intent?: string;          // domain intent hint for disambiguation
@@ -5910,6 +5937,7 @@ export async function vectorSearchQuery(
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0.3;
   const collection = options?.collection;
+  const allowedPaths = options?.allowedPaths;
   const intent = options?.intent;
 
   const hasVectors = !!store.db.prepare(
@@ -5928,7 +5956,7 @@ export async function vectorSearchQuery(
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, embedModel, limit, collection, undefined, undefined, options?.trace);
+    const vecResults = await store.searchVec(q, embedModel, limit, collection, undefined, undefined, options?.trace, allowedPaths);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {

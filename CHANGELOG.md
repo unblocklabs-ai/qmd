@@ -5,6 +5,16 @@
 ### Added
 
 - Added Oxlint lint fence.
+- Added opt-in semantic Markdown chunking with an index-wide persisted strategy.
+- Added the SDK `vsearch()` API for expanded vector search with exact stored
+  chunk spans.
+- Added exact per-collection path allowlists for vector search, applied before
+  sqlite-vec top-K selection.
+
+### Changed
+
+- Updated the README for the canonical Unblock Labs package, current retrieval
+  behavior, and the companion OpenClaw memory plugin.
 
 ## [2.8.3] - 2026-08-16
 

@@ -1,12 +1,14 @@
-# QMD - Query Markup Documents
+# QMD — Query Markup Documents
 
-An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
+QMD is Unblock Labs' on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for agentic workflows.
+
+This repository, [`unblocklabs-ai/qmd`](https://github.com/unblocklabs-ai/qmd), is the canonical home of the Unblock Labs project and the source of the `@unblocklabs/qmd` package.
 
 QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
 
 ```mermaid
 flowchart LR
-  Q[User Query] --> X[Query Expansion]
+  Q[User Query] -. weak BM25 signal .-> X[Optional Query Expansion]
   Q --> FTS[BM25 Search]
   Q --> VS[Vector Search]
   X --> HYDE[HyDE]
@@ -21,14 +23,14 @@ flowchart LR
   RR --> OUT[Final ranked results]
 ```
 
-Typed expansions are routed exclusively: `lex` → BM25/FTS, `vec` and `hyde` → vector search. The original query is sent to both backends, then fused with RRF and reranked.
+Typed expansions are routed exclusively: `lex` → BM25/FTS, `vec` and `hyde` → vector search. Strong initial BM25 results skip expansion. The original query is sent to both backends, then fused with RRF and reranked.
 
 You can read more about QMD's progress in the [CHANGELOG](CHANGELOG.md).
 
 ## Quick Start
 
 ```sh
-# Install the Unblock fork globally (Node or Bun)
+# Install QMD globally (Node or Bun)
 npm install -g github:unblocklabs-ai/qmd
 # or
 bun install -g github:unblocklabs-ai/qmd
@@ -63,7 +65,7 @@ qmd multi-get "journals/2025-05*.md"
 # Search within a specific collection
 qmd search "API" -c notes
 
-# Export all matches for an agent
+# Export a larger result set for an agent
 qmd search "API" --all --files --min-score 0.3
 ```
 
@@ -75,19 +77,34 @@ QMD's `--json` and `--files` output formats are designed for agentic workflows:
 # Get structured results for an LLM
 qmd search "authentication" --json -n 10
 
-# List all relevant files above a threshold
+# List a larger set of relevant files above a threshold
 qmd query "error handling" --all --files --min-score 0.4
 
 # Retrieve full document content
 qmd get "docs/api-reference.md" --full
 ```
 
+### OpenClaw Memory Plugin
+
+[`unblocklabs-ai/unblock-memory`](https://github.com/unblocklabs-ai/unblock-memory) is
+the companion OpenClaw memory plugin built on `@unblocklabs/qmd`. It keeps a
+warm QMD store for each agent, indexes configured Markdown sources with semantic
+chunking, and provides OpenClaw's standard `memory_search` and `memory_get`
+tools.
+
+```sh
+openclaw plugins install @unblocklabs/unblock-memory
+```
+
+See the [plugin README](https://github.com/unblocklabs-ai/unblock-memory#readme)
+for configuration and supported source paths.
+
 ### MCP Server
 
 Although the tool works perfectly fine when you just tell your agent to use it on the command line, it also exposes an MCP (Model Context Protocol) server for tighter integration.
 
 **Tools exposed:**
-- `query` — Search with typed sub-queries (`lex`/`vec`/`hyde`), combined via RRF + reranking
+- `query` — Search a plain query with automatic expansion or provide typed sub-queries (`lex`/`vec`/`hyde`), then combine them via RRF + reranking
 - `get` — Retrieve a document by path or docid (with fuzzy matching suggestions)
 - `multi_get` — Batch retrieve by glob pattern, comma-separated list, or docids
 - `status` — Index health and collection info
@@ -145,7 +162,7 @@ The server binds to `localhost` by default. Pass `--host` (or set the `QMD_HOST`
 environment variable) to override — `--host 0.0.0.0` is useful when the server
 runs in a container and a liveness probe connects from a non-loopback address.
 
-The HTTP server exposes two endpoints:
+The HTTP server exposes these endpoints:
 - `POST /mcp` — MCP Streamable HTTP (JSON responses, stateless)
 - `POST /query` (alias `/search`) — structured search without the MCP protocol
 - `GET /health` — liveness check with uptime
@@ -160,8 +177,8 @@ what stops a web page you visit from reading your index through DNS rebinding �
 loopback binding alone does not, since the browser makes the request from your
 own machine.
 
-Requests without an `Origin` header — curl, MCP clients, editors — are
-unaffected, which covers every normal local client.
+Requests without an `Origin` header — curl, MCP clients, editors — skip origin
+validation but still undergo host validation.
 
 | Variable | Effect |
 |----------|--------|
@@ -173,7 +190,8 @@ host check and warns at startup. Set `QMD_ALLOWED_HOSTS` to re-enable it, and
 remember the endpoints are unauthenticated — put your own auth in front of a
 server that is reachable off-host.
 
-LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and transparently recreated on the next request (~1s penalty, models remain loaded).
+LLM models and their embedding/reranking contexts are disposed after 5 minutes
+idle and transparently recreated on the next request.
 
 Point any MCP client at `http://localhost:8181/mcp` to connect.
 
@@ -181,7 +199,8 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
 
 | Tool | Parameter | Type | Notes |
 |------|-----------|------|-------|
-| `query` | `searches` | array | Typed sub-queries (`lex`/`vec`/`hyde`), 1–10. **Required.** First gets 2x weight. |
+| `query` | `query` | string | Plain query to expand automatically. Mutually exclusive with `searches`. |
+| `query` | `searches` | array | Typed sub-queries (`lex`/`vec`/`hyde`), 1–10. Mutually exclusive with `query`. |
 | `query` | `collections` | string[] | Filter by collection names (OR). **Array only** — singular `collection` is silently ignored. |
 | `query` | `intent` | string | Disambiguation context (does not search on its own) |
 | `query` | `limit` | number | Max results (default 10) |
@@ -193,13 +212,14 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
 | `get` | `maxLines` | number | Limit returned lines |
 | `get` | `lineNumbers` | boolean | Prefix lines with numbers (default **true**) |
 | `multi_get` | `pattern` | string | Glob pattern or comma-separated list |
-| `multi_get` | `maxBytes` | number | Skip files larger than N (default 10240) |
+| `multi_get` | `maxBytes` | number | Skip files larger than N (default 65536 / 64 KiB) |
 | `multi_get` | `maxLines` | number | Limit lines per file |
 | `multi_get` | `lineNumbers` | boolean | Prefix lines with numbers (default **true**) |
 
 Unknown parameters are silently ignored (not rejected) — double-check names if
 results seem unscoped. The HTTP `/query` and `/search` endpoints return
-`qmd://collection/path` URIs in the `file` field, matching the CLI and MCP output.
+`qmd://collection/path` URIs in the `file` field; the MCP tool returns display
+paths.
 
 ### SDK / Library Usage
 
@@ -224,6 +244,9 @@ const store = await createStore({
     },
   },
 })
+
+await store.update()
+await store.embed()
 
 const results = await store.search({ query: "authentication flow" })
 console.log(results.map(r => `${r.title} (${Math.round(r.score * 100)}%)`))
@@ -269,7 +292,12 @@ const results = await store.search({ query: "authentication flow" })
 
 // Vector-only search with expansion and exact winning chunk spans
 const memoryResults = await store.vsearch("what did we decide?", {
-  collection: "memory",
+  collection: ["memory", "sessions"],
+  allowedPaths: {
+    // Exact paths relative to the named collection. Collections not listed
+    // here remain unrestricted; an empty array excludes that collection.
+    sessions: ["slack/channel/workspace/C123/session.md"],
+  },
   limit: 5,
 })
 
@@ -306,8 +334,11 @@ const lexResults = await store.searchLex("auth middleware", { limit: 10 })
 const vecResults = await store.searchVector("how users log in", { limit: 10 })
 
 // Manual query expansion for full control
-const expanded = await store.expandQuery("auth flow", { intent: "user login" })
-const results4 = await store.search({ queries: expanded })
+const expanded = await store.expandQuery("auth flow")
+const results4 = await store.search({
+  queries: expanded,
+  intent: "user login",
+})
 ```
 
 #### Retrieval
@@ -389,9 +420,12 @@ const result = await store.update({
 
 // Generate vector embeddings
 const embedResult = await store.embed({
-  force: false, // true to re-embed everything; chunkStrategy defaults to "regex"
-  onProgress: ({ current, total, collection }) => {
-    console.log(`Embedding ${current}/${total}`)
+  // Fresh indexes default to "regex". Later runs reuse the index's persisted strategy.
+  force: false,
+  onProgress: ({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes }) => {
+    console.log(
+      `Embedding ${chunksEmbedded}/${totalChunks} chunks (${bytesProcessed}/${totalBytes} bytes)`,
+    )
   },
 })
 ```
@@ -407,6 +441,7 @@ import type {
   LexSearchOptions,    // Options for searchLex()
   VectorSearchOptions, // Options for searchVector()
   VSearchOptions,      // Options for vsearch()
+  AllowedDocumentPaths,// Exact per-collection path allowlists for vsearch()
   VectorSearchResult,  // Exact winning chunks returned by vsearch()
   HybridQueryResult,   // Search result with score, snippet, context
   SearchResult,        // Result from searchLex/searchVector
@@ -447,65 +482,12 @@ The SDK requires explicit `dbPath` — no defaults are assumed. This makes it sa
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         QMD Hybrid Search Pipeline                          │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-                              ┌─────────────────┐
-                              │   User Query    │
-                              └────────┬────────┘
-                                       │
-                        ┌──────────────┴──────────────┐
-                        ▼                             ▼
-               ┌────────────────┐            ┌────────────────┐
-               │ Query Expansion│            │  Original Query│
-               │  (fine-tuned)  │            │   (×2 weight)  │
-               └───────┬────────┘            └───────┬────────┘
-                       │                             │
-                       │ 2 alternative queries       │
-                       └──────────────┬──────────────┘
-                                      │
-              ┌───────────────────────┼───────────────────────┐
-              ▼                       ▼                       ▼
-     ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-     │ Original Query  │     │ Expanded Query 1│     │ Expanded Query 2│
-     └────────┬────────┘     └────────┬────────┘     └────────┬────────┘
-              │                       │                       │
-      ┌───────┴───────┐       ┌───────┴───────┐       ┌───────┴───────┐
-      ▼               ▼       ▼               ▼       ▼               ▼
-  ┌───────┐       ┌───────┐ ┌───────┐     ┌───────┐ ┌───────┐     ┌───────┐
-  │ BM25  │       │Vector │ │ BM25  │     │Vector │ │ BM25  │     │Vector │
-  │(FTS5) │       │Search │ │(FTS5) │     │Search │ │(FTS5) │     │Search │
-  └───┬───┘       └───┬───┘ └───┬───┘     └───┬───┘ └───┬───┘     └───┬───┘
-      │               │         │             │         │             │
-      └───────┬───────┘         └──────┬──────┘         └──────┬──────┘
-              │                        │                       │
-              └────────────────────────┼───────────────────────┘
-                                       │
-                                       ▼
-                          ┌───────────────────────┐
-                          │   RRF Fusion + Bonus  │
-                          │  Original query: ×2   │
-                          │  Top-rank bonus: +0.05│
-                          │     Top 30 Kept       │
-                          └───────────┬───────────┘
-                                      │
-                                      ▼
-                          ┌───────────────────────┐
-                          │    LLM Re-ranking     │
-                          │  (qwen3-reranker)     │
-                          │  Yes/No + logprobs    │
-                          └───────────┬───────────┘
-                                      │
-                                      ▼
-                          ┌───────────────────────┐
-                          │  Position-Aware Blend │
-                          │  Top 1-3:  75% RRF    │
-                          │  Top 4-10: 60% RRF    │
-                          │  Top 11+:  40% RRF    │
-                          └───────────────────────┘
-```
+QMD probes BM25 first and can skip query expansion when that signal is already
+strong. Otherwise, the local expansion model produces typed variants: `lex`
+queries go only to BM25, while `vec` and `hyde` queries go only to vector
+search. The original query goes to both backends. RRF fuses those ranked lists,
+the top candidates are reranked, and a position-aware blend protects strong
+retrieval matches from reranker disagreement.
 
 ## Score Normalization & Fusion
 
@@ -513,26 +495,26 @@ The SDK requires explicit `dbPath` — no defaults are assumed. This makes it sa
 
 | Backend | Raw Score | Conversion | Range |
 |---------|-----------|------------|-------|
-| **FTS (BM25)** | SQLite FTS5 BM25 | `Math.abs(score)` | 0 to ~25+ |
-| **Vector** | Cosine distance | `1 / (1 + distance)` | 0.0 to 1.0 |
-| **Reranker** | LLM 0-10 rating | `score / 10` | 0.0 to 1.0 |
+| **FTS (BM25)** | SQLite FTS5 BM25 | `abs(score) / (1 + abs(score))` | 0.0 to <1.0 |
+| **Vector** | sqlite-vec distance | `1 - distance` | Higher is better |
+| **Reranker** | `rankAll()` relevance | None | 0.0 to 1.0 |
 
 ### Fusion Strategy
 
 The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware blending:
 
-1. **Query Expansion**: Original query (×2 for weighting) + 1 LLM variation
-2. **Parallel Retrieval**: Each query searches both FTS and vector indexes
-3. **RRF Fusion**: Combine all result lists using `score = Σ(1/(k+rank+1))` where k=60
+1. **Query Expansion**: Keep the original query and generate typed `lex`, `vec`, and `hyde` variants unless the initial BM25 signal is already strong
+2. **Routed Retrieval**: Send the original query to both backends, `lex` variants to BM25, and `vec`/`hyde` variants to vector search
+3. **RRF Fusion**: Combine all result lists using `score = Σ(weight/(k+rank+1))` where k=60; original-query lists get 2x weight
 4. **Top-Rank Bonus**: Documents ranking #1 in any list get +0.05, #2-3 get +0.02
-5. **Top-K Selection**: Take top 30 candidates for reranking
-6. **Re-ranking**: LLM scores each document (yes/no with logprobs confidence)
+5. **Top-K Selection**: Take the top 40 candidates by default (configurable with `--candidate-limit`)
+6. **Re-ranking**: Reuse an exact stored vector span when available; otherwise select a fallback chunk for the local reranker
 7. **Position-Aware Blending**:
    - RRF rank 1-3: 75% retrieval, 25% reranker (preserves exact matches)
    - RRF rank 4-10: 60% retrieval, 40% reranker
    - RRF rank 11+: 40% retrieval, 60% reranker (trust reranker more)
 
-**Why this approach**: Pure RRF can dilute exact matches when expanded queries don't match. The top-rank bonus preserves documents that score #1 for the original query. Position-aware blending prevents the reranker from destroying high-confidence retrieval results.
+**Why this approach**: Pure RRF can dilute exact matches when expanded queries don't match. The top-rank bonus preserves documents that rank first in any retrieval list. Position-aware blending prevents the reranker from destroying high-confidence retrieval results.
 
 ### Score Interpretation
 
@@ -549,7 +531,7 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
 
 - **Node.js** >= 22
 - **Bun** >= 1.0.0
-- **macOS**: Homebrew SQLite (for extension support)
+- **Bun on macOS**: Homebrew SQLite (for extension support)
   ```sh
   brew install sqlite
   ```
@@ -687,13 +669,13 @@ runs; changing it is index-wide and cannot be combined with `-c`.
 One honest MVP limitation: two short, unlabeled atoms can remain merged even when
 their topics differ. Add an explicit marker when that distinction must be hard.
 
-Queries automatically use the exact spans stored during embedding. They do not
-rerun semantic chunking or adapt boundaries to each query. The query command
-accepts `--chunk-strategy` only for legacy fallback chunk selection when an exact
-stored span is unavailable.
+Vector search uses the exact spans stored during embedding and does not rerun
+semantic chunking at query time. Hybrid search reuses those spans for vector
+candidates; BM25-only candidates still need fallback chunk selection. The query
+command accepts `--chunk-strategy` only for that fallback path.
 
-> **Note:** Tree-sitter grammars are optional dependencies. If they are not
-> installed, `--chunk-strategy auto` falls back to regex-only chunking
+> **Note:** QMD packages its supported tree-sitter grammars. If a grammar cannot
+> be loaded, `--chunk-strategy auto` falls back to regex-only chunking
 > automatically. Tested on both Node.js and Bun.
 
 ### Context Management
@@ -877,8 +859,8 @@ and `deep-search` (→ `query`).
 # Search options
 -n <num>           # Number of results (default: 5, or 20 for --files/--json)
 -c, --collection   # Restrict search to a specific collection
---all              # Return all matches (use with --min-score to filter)
---min-score <num>  # Minimum score threshold (default: 0)
+--all              # Raise the command-specific result cap (use with --min-score)
+--min-score <num>  # Minimum score (default: 0 for search/query, 0.3 for vsearch)
 --full             # Show full document content
 --line-numbers     # Add line numbers to output
 --explain          # Include retrieval score traces (query, JSON/CLI output)
@@ -920,10 +902,6 @@ qmd search "auth" -c notes -c docs   # multiple collections (OR)
 With no `-c` flag, all default-included collections are searched. Collections
 marked excluded (`qmd collection exclude <name>`) are skipped unless named
 explicitly with `-c`.
-
-> **Note:** With multiple `-c` flags, results come from a global top-K pool and are
-> then filtered. If one collection dominates the rankings, matches from smaller
-> collections may not appear at the default limit — raise `-n` or use `--all`.
 
 ### Output Format
 
@@ -1148,7 +1126,9 @@ grouping — it does not change search behavior.
 
 ## Data Storage
 
-Index stored in: `~/.cache/qmd/index.sqlite`
+The default global index is stored at `~/.cache/qmd/index.sqlite` (or under
+`XDG_CACHE_HOME`). Named indexes use a matching filename in that directory.
+Project-local indexes store both config and data under `.qmd/`.
 
 ### Schema
 
@@ -1258,44 +1238,6 @@ size; a maximum token ceiling is the final guardrail. Because this performs
 additional embedding work while ingesting documents, it is opt-in; `regex`
 remains the default. Queries reuse the resulting stored spans; they do not create
 query-adaptive boundaries. Tiny unlabeled two-atom notes may remain one chunk.
-
-### Query Flow (Hybrid)
-
-```
-Query ──► LLM Expansion ──► [Original, Variant 1, Variant 2]
-                │
-      ┌─────────┴─────────┐
-      ▼                   ▼
-   For each query:     FTS (BM25)
-      │                   │
-      ▼                   ▼
-   Vector Search      Ranked List
-      │
-      ▼
-   Ranked List
-      │
-      └─────────┬─────────┘
-                ▼
-         RRF Fusion (k=60)
-         Original query ×2 weight
-         Top-rank bonus: +0.05/#1, +0.02/#2-3
-                │
-                ▼
-         Top 30 candidates
-                │
-                ▼
-         LLM Re-ranking
-         (yes/no + logprob confidence)
-                │
-                ▼
-         Position-Aware Blend
-         Rank 1-3:  75% RRF / 25% reranker
-         Rank 4-10: 60% RRF / 40% reranker
-         Rank 11+:  40% RRF / 60% reranker
-                │
-                ▼
-         Final Results
-```
 
 ## Model Configuration
 
