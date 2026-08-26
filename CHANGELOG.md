@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.9.2] - 2026-08-26
+
 ### Added
 
 - The SDK can keep lazily loaded model contexts resident for a store's lifetime
