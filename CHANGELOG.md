@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.9.3] - 2026-08-26
+
 ### Fixed
 
 - SDK stores using `keepModelsWarm: true` now retain one idle embedding context
