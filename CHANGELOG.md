@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.9.0] - 2026-08-26
+
 ### Added
 
 - Added Oxlint lint fence.
