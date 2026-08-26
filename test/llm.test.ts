@@ -20,6 +20,7 @@ import {
   setLlamaDirWritableForTest,
   canWriteLlamaDir,
   withNativeStdoutRedirectedToStderr,
+  prepareNodeLlamaCppEnvironment,
   resolveParallelismOverride,
   resolveSafeParallelism,
   computeGpuContextPoolSize,
@@ -37,6 +38,28 @@ import {
   type RerankDocument,
   type ILLMSession,
 } from "../src/llm.js";
+
+describe("node-llama-cpp environment", () => {
+  test("disables Metal residency before library-mode native loading", () => {
+    const env: NodeJS.ProcessEnv = {};
+    prepareNodeLlamaCppEnvironment("darwin", env);
+    expect(env.GGML_METAL_NO_RESIDENCY).toBe("1");
+  });
+
+  test("preserves explicit residency settings and does nothing off Darwin", () => {
+    const optedOut: NodeJS.ProcessEnv = { QMD_METAL_KEEP_RESIDENCY: "1" };
+    prepareNodeLlamaCppEnvironment("darwin", optedOut);
+    expect(optedOut.GGML_METAL_NO_RESIDENCY).toBeUndefined();
+
+    const explicit: NodeJS.ProcessEnv = { GGML_METAL_NO_RESIDENCY: "0" };
+    prepareNodeLlamaCppEnvironment("darwin", explicit);
+    expect(explicit.GGML_METAL_NO_RESIDENCY).toBe("0");
+
+    const linux: NodeJS.ProcessEnv = {};
+    prepareNodeLlamaCppEnvironment("linux", linux);
+    expect(linux.GGML_METAL_NO_RESIDENCY).toBeUndefined();
+  });
+});
 
 describe("canWriteLlamaDir", () => {
   test("returns true when llama/ exists and is writable", () => {
@@ -553,6 +576,157 @@ describe("embedding context VRAM pool (#799)", () => {
       perContextMB: 150,
       reserveMB: EMBED_POOL_RERANK_RESERVE_MB,
     })).toBe(8);
+  });
+});
+
+describe("warm embedding context lifecycle", () => {
+  type FakeContext = {
+    getEmbeddingFor: ReturnType<typeof vi.fn>;
+    dispose: ReturnType<typeof vi.fn>;
+  };
+
+  function installFakeEmbeddingRuntime() {
+    const contexts: FakeContext[] = [];
+    const modelDispose = vi.fn(async () => {});
+    const runtimeDispose = vi.fn(async () => {});
+    const createEmbeddingContext = vi.fn(async () => {
+      const context: FakeContext = {
+        getEmbeddingFor: vi.fn(async (text: string) => {
+          if (text === "fail") throw new Error("embedding failed");
+          return { vector: new Float32Array([contexts.length, text.length]) };
+        }),
+        dispose: vi.fn(async () => {}),
+      };
+      contexts.push(context);
+      return context;
+    });
+
+    setNodeLlamaCppModuleForTest({
+      LlamaLogLevel: { error: "error" },
+      resolveModelFile: vi.fn(async () => "/tmp/nonexistent-model.gguf"),
+      LlamaChatSession: vi.fn() as never,
+      getLlama: vi.fn(async () => ({
+        gpu: false,
+        cpuMathCores: 12,
+        loadModel: vi.fn(async () => ({
+          trainContextSize: 2048,
+          tokenize: (text: string) => Array.from(text),
+          detokenize: (tokens: string[]) => tokens.join(""),
+          createEmbeddingContext,
+          dispose: modelDispose,
+        })),
+        dispose: runtimeDispose,
+      })),
+    });
+
+    return { contexts, createEmbeddingContext, modelDispose, runtimeDispose };
+  }
+
+  function createFakeLlm(config: ConstructorParameters<typeof LlamaCpp>[0]): LlamaCpp {
+    const previousCi = process.env.CI;
+    delete process.env.CI;
+    try {
+      return new LlamaCpp(config);
+    } finally {
+      if (previousCi === undefined) delete process.env.CI;
+      else process.env.CI = previousCi;
+    }
+  }
+
+  test("grows, trims, regrows, trims after errors, and closes the retained context", async () => {
+    const previousParallelism = process.env.QMD_EMBED_PARALLELISM;
+    process.env.QMD_EMBED_PARALLELISM = "3";
+    const fake = installFakeEmbeddingRuntime();
+    const llm = createFakeLlm({ inactivityTimeoutMs: 0, idleEmbeddingContexts: 1 });
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      await llm.embed("query");
+      expect(fake.createEmbeddingContext).toHaveBeenCalledTimes(1);
+
+      await llm.embedBatch(["one", "two", "three"]);
+      expect(fake.createEmbeddingContext).toHaveBeenCalledTimes(3);
+      expect(fake.contexts.filter(context => context.dispose.mock.calls.length > 0)).toHaveLength(2);
+
+      const failed = await llm.embedBatch(["four", "fail", "six"]);
+      expect(failed).toContain(null);
+      expect(fake.createEmbeddingContext).toHaveBeenCalledTimes(5);
+      expect(fake.contexts.filter(context => context.dispose.mock.calls.length > 0)).toHaveLength(4);
+
+      await llm.dispose();
+      expect(fake.contexts[0]!.dispose).toHaveBeenCalledTimes(1);
+      expect(fake.modelDispose).toHaveBeenCalledTimes(1);
+      expect(fake.runtimeDispose).toHaveBeenCalledTimes(1);
+    } finally {
+      await llm.dispose();
+      stderrSpy.mockRestore();
+      setNodeLlamaCppModuleForTest(null);
+      if (previousParallelism === undefined) delete process.env.QMD_EMBED_PARALLELISM;
+      else process.env.QMD_EMBED_PARALLELISM = previousParallelism;
+    }
+  });
+
+  test("keeps the full pool by default for non-warm consumers", async () => {
+    const previousParallelism = process.env.QMD_EMBED_PARALLELISM;
+    process.env.QMD_EMBED_PARALLELISM = "3";
+    const fake = installFakeEmbeddingRuntime();
+    const llm = createFakeLlm({ inactivityTimeoutMs: 0 });
+
+    try {
+      await llm.embedBatch(["one", "two", "three"]);
+      expect(fake.createEmbeddingContext).toHaveBeenCalledTimes(3);
+      expect(fake.contexts.every(context => context.dispose.mock.calls.length === 0)).toBe(true);
+    } finally {
+      await llm.dispose();
+      setNodeLlamaCppModuleForTest(null);
+      if (previousParallelism === undefined) delete process.env.QMD_EMBED_PARALLELISM;
+      else process.env.QMD_EMBED_PARALLELISM = previousParallelism;
+    }
+  });
+
+  test("does not trim contexts while another batch is active", async () => {
+    const previousParallelism = process.env.QMD_EMBED_PARALLELISM;
+    process.env.QMD_EMBED_PARALLELISM = "3";
+    const fake = installFakeEmbeddingRuntime();
+    let releaseSlow: (() => void) | undefined;
+    const slow = new Promise<void>(resolve => { releaseSlow = resolve; });
+    let slowStartedResolve: (() => void) | undefined;
+    const slowStarted = new Promise<void>(resolve => { slowStartedResolve = resolve; });
+    const llm = createFakeLlm({ inactivityTimeoutMs: 0, idleEmbeddingContexts: 1 });
+
+    try {
+      await llm.embed("query");
+      const retained = fake.contexts[0]!;
+      retained.getEmbeddingFor.mockImplementation(async (text: string) => {
+        if (text === "slow") {
+          slowStartedResolve?.();
+          await slow;
+        }
+        return { vector: new Float32Array([1, text.length]) };
+      });
+
+      const activeBatch = llm.embedBatch(["slow"]);
+      await slowStarted;
+      await llm.embedBatch(["fast"]);
+      expect(fake.createEmbeddingContext).toHaveBeenCalledTimes(3);
+      expect(fake.contexts.every(context => context.dispose.mock.calls.length === 0)).toBe(true);
+
+      releaseSlow?.();
+      await activeBatch;
+      expect(fake.contexts.filter(context => context.dispose.mock.calls.length > 0)).toHaveLength(2);
+    } finally {
+      releaseSlow?.();
+      await llm.dispose();
+      setNodeLlamaCppModuleForTest(null);
+      if (previousParallelism === undefined) delete process.env.QMD_EMBED_PARALLELISM;
+      else process.env.QMD_EMBED_PARALLELISM = previousParallelism;
+    }
+  });
+
+  test("rejects invalid idle context counts", () => {
+    expect(() => new LlamaCpp({ idleEmbeddingContexts: 0 })).toThrow("positive integer");
+    expect(() => new LlamaCpp({ idleEmbeddingContexts: -1 })).toThrow("positive integer");
+    expect(() => new LlamaCpp({ idleEmbeddingContexts: 1.5 })).toThrow("positive integer");
   });
 });
 

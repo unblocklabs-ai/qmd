@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- SDK stores using `keepModelsWarm: true` now retain one idle embedding context
+  after batch embedding instead of retaining the entire parallel context pool.
+  Later batches regrow the pool automatically, and library-mode macOS consumers
+  apply the Metal no-residency setting before loading the native binding.
+
 ## [2.9.2] - 2026-08-26
 
 ### Added

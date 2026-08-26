@@ -235,6 +235,11 @@ export interface StoreOptions {
   config?: CollectionConfig;
   /** Keep loaded model contexts resident until the store closes. Default: false. */
   keepModelsWarm?: boolean;
+  /**
+   * Positive number of embedding contexts retained after each batch. Defaults to 1 when
+   * `keepModelsWarm` is true; otherwise QMD keeps the batch pool until idle unload.
+   */
+  idleEmbeddingContexts?: number;
 }
 
 /**
@@ -410,6 +415,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     rerankModel: config?.models?.rerank,
     inactivityTimeoutMs: options.keepModelsWarm ? 0 : 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
+    idleEmbeddingContexts: options.idleEmbeddingContexts ?? (options.keepModelsWarm ? 1 : undefined),
   });
   internal.llm = llm;
 

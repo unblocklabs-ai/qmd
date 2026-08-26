@@ -282,8 +282,12 @@ const store2 = await createStore({
 const store3 = await createStore({ dbPath: './index.sqlite' })
 ```
 
-Set `keepModelsWarm: true` to retain loaded model contexts until `store.close()`.
-By default, QMD unloads them after five minutes without a model operation.
+Set `keepModelsWarm: true` to retain the embedding model and one query context
+until `store.close()`. Batch embedding still uses an automatically sized
+parallel context pool, then trims back to one context when the batch finishes.
+Set `idleEmbeddingContexts` to choose a different positive retained count. By
+default, QMD keeps the batch pool until unloading it after five minutes without
+a model operation.
 
 #### Search
 

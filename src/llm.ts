@@ -28,7 +28,22 @@ type NodeLlamaCppModule = {
 };
 
 let nodeLlamaCppImport: Promise<NodeLlamaCppModule> | null = null;
+
+/**
+ * Disable Metal residency sets before node-llama-cpp loads. The CLI launcher
+ * already does this; library consumers enter through the dynamic import below.
+ */
+export function prepareNodeLlamaCppEnvironment(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  if (platform === "darwin" && env.QMD_METAL_KEEP_RESIDENCY !== "1") {
+    env.GGML_METAL_NO_RESIDENCY ||= "1";
+  }
+}
+
 async function loadNodeLlamaCpp(): Promise<NodeLlamaCppModule> {
+  prepareNodeLlamaCppEnvironment();
   nodeLlamaCppImport ??= withNativeStdoutRedirectedToStderr(
     () => import("node-llama-cpp") as Promise<NodeLlamaCppModule>
   );
@@ -623,6 +638,11 @@ export type LlamaCppConfig = {
    * memory reclaim.
    */
   disposeModelsOnInactivity?: boolean;
+  /**
+   * Positive number of embedding contexts to retain after a batch completes.
+   * Undefined keeps the full automatically sized pool until idle unload.
+   */
+  idleEmbeddingContexts?: number;
 };
 
 /**
@@ -832,19 +852,14 @@ export class LlamaCpp implements LLM {
   private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
   private inactivityTimeoutMs: number;
   private disposeModelsOnInactivity: boolean;
+  private idleEmbeddingContexts: number | undefined;
+  private activeEmbedBatches = 0;
 
   // Track disposal state to prevent double-dispose
   private disposed = false;
 
 
   constructor(config: LlamaCppConfig = {}) {
-    // STRUCTURAL INVARIANT: the launcher (bin/qmd) and the Nix flake wrapper
-    // set GGML_METAL_NO_RESIDENCY=1 on darwin BEFORE the native binding loads,
-    // which prevents the libggml-metal static destructor assertion at process
-    // exit (ggml-org/llama.cpp#22593). Nix installs skip bin/qmd (#723).
-    // See isDarwinMetalMitigationActive() for the runtime check exposed to
-    // diagnostics. No constructor-time guard installation is needed.
-
     this.embedModelUri = resolveEmbedModel({ embed: config.embedModel });
     this.generateModelUri = resolveGenerateModel({ generate: config.generateModel });
     this.rerankModelUri = resolveRerankModel({ rerank: config.rerankModel });
@@ -852,6 +867,11 @@ export class LlamaCpp implements LLM {
     this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
+    if (config.idleEmbeddingContexts !== undefined
+      && (!Number.isInteger(config.idleEmbeddingContexts) || config.idleEmbeddingContexts < 1)) {
+      throw new Error("idleEmbeddingContexts must be a positive integer");
+    }
+    this.idleEmbeddingContexts = config.idleEmbeddingContexts;
   }
 
   get embedModelName(): string {
@@ -1182,52 +1202,75 @@ export class LlamaCpp implements LLM {
   private embedContextsCreatePromise: Promise<LlamaEmbeddingContext[]> | null = null;
 
   private async ensureEmbedContexts(): Promise<LlamaEmbeddingContext[]> {
-    if (this.embedContexts.length > 0) {
+    // Preserve the existing non-warm lifecycle: once the pool is loaded, reuse
+    // it until the normal inactivity timer unloads it.
+    if (this.idleEmbeddingContexts === undefined && this.embedContexts.length > 0) {
+      this.touchActivity();
+      return this.embedContexts;
+    }
+
+    const model = await this.ensureEmbedModel();
+    // Per-context cost depends on the loaded GGUF. The old hardcoded 150 MB
+    // figure was measured for nomic-embed; Qwen3-Embedding-0.6B is ~1190 MB
+    // and opening 8 of those exhausted VRAM so the reranker could not load (#799).
+    let perContextMB = BASELINE_EMBED_CONTEXT_MB;
+    if (this.embedModelPath) {
+      try {
+        perContextMB = estimateEmbedContextMB({
+          modelBytes: statSync(this.embedModelPath).size,
+          contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
+        });
+      } catch {
+        // Keep the baseline if the file cannot be stat'd.
+      }
+    }
+    const target = await this.computeParallelism(perContextMB, EMBED_POOL_RERANK_RESERVE_MB);
+    if (this.embedContexts.length >= target) {
       this.touchActivity();
       return this.embedContexts;
     }
 
     if (this.embedContextsCreatePromise) {
-      return await this.embedContextsCreatePromise;
+      const creation = this.embedContextsCreatePromise;
+      try {
+        await creation;
+      } finally {
+        if (this.embedContextsCreatePromise === creation) {
+          this.embedContextsCreatePromise = null;
+        }
+      }
+      if (this.embedContexts.length >= target) {
+        this.touchActivity();
+        return this.embedContexts;
+      }
     }
 
-    this.embedContextsCreatePromise = (async () => {
-      const model = await this.ensureEmbedModel();
-      // Per-context cost depends on the loaded GGUF. The old hardcoded 150 MB
-      // figure was measured for nomic-embed; Qwen3-Embedding-0.6B is ~1190 MB
-      // and opening 8 of those exhausted VRAM so the reranker could not load (#799).
-      let perContextMB = BASELINE_EMBED_CONTEXT_MB;
-      if (this.embedModelPath) {
-        try {
-          perContextMB = estimateEmbedContextMB({
-            modelBytes: statSync(this.embedModelPath).size,
-            contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
-          });
-        } catch {
-          // Keep the baseline if the file cannot be stat'd.
+    if (!this.embedContextsCreatePromise) {
+      this.embedContextsCreatePromise = (async () => {
+        const threads = await this.threadsPerContext(target);
+        while (this.embedContexts.length < target) {
+          try {
+            this.embedContexts.push(await model.createEmbeddingContext({
+              contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
+              ...(threads > 0 ? { threads } : {}),
+            }));
+          } catch {
+            if (this.embedContexts.length === 0) throw new Error("Failed to create any embedding context");
+            break;
+          }
         }
-      }
-      const n = await this.computeParallelism(perContextMB, EMBED_POOL_RERANK_RESERVE_MB);
-      const threads = await this.threadsPerContext(n);
-      for (let i = 0; i < n; i++) {
-        try {
-          this.embedContexts.push(await model.createEmbeddingContext({
-            contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
-            ...(threads > 0 ? { threads } : {}),
-          }));
-        } catch {
-          if (this.embedContexts.length === 0) throw new Error("Failed to create any embedding context");
-          break;
-        }
-      }
-      this.touchActivity();
-      return this.embedContexts;
-    })();
+        this.touchActivity();
+        return this.embedContexts;
+      })();
+    }
 
+    const creation = this.embedContextsCreatePromise;
     try {
-      return await this.embedContextsCreatePromise;
+      return await creation;
     } finally {
-      this.embedContextsCreatePromise = null;
+      if (this.embedContextsCreatePromise === creation) {
+        this.embedContextsCreatePromise = null;
+      }
     }
   }
 
@@ -1235,8 +1278,48 @@ export class LlamaCpp implements LLM {
    * Get a single embed context (for single-embed calls). Uses first from pool.
    */
   private async ensureEmbedContext(): Promise<LlamaEmbeddingContext> {
-    const contexts = await this.ensureEmbedContexts();
-    return contexts[0]!;
+    if (this.embedContexts[0]) {
+      this.touchActivity();
+      return this.embedContexts[0];
+    }
+
+    const model = await this.ensureEmbedModel();
+    if (!this.embedContextsCreatePromise) {
+      this.embedContextsCreatePromise = (async () => {
+        if (this.embedContexts.length === 0) {
+          const threads = await this.threadsPerContext(1);
+          this.embedContexts.push(await model.createEmbeddingContext({
+            contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
+            ...(threads > 0 ? { threads } : {}),
+          }));
+        }
+        this.touchActivity();
+        return this.embedContexts;
+      })();
+    }
+
+    const creation = this.embedContextsCreatePromise;
+    try {
+      const contexts = await creation;
+      return contexts[0]!;
+    } finally {
+      if (this.embedContextsCreatePromise === creation) {
+        this.embedContextsCreatePromise = null;
+      }
+    }
+  }
+
+  private async trimIdleEmbeddingContexts(): Promise<void> {
+    if (this.idleEmbeddingContexts === undefined
+      || this.activeEmbedBatches > 0
+      || this.embedContexts.length <= this.idleEmbeddingContexts) {
+      return;
+    }
+
+    const idleContexts = this.embedContexts.splice(this.idleEmbeddingContexts);
+    for (const context of idleContexts) {
+      await disposeWithTimeout("idle embedding context", () => context.dispose());
+    }
   }
 
   /**
@@ -1479,6 +1562,7 @@ export class LlamaCpp implements LLM {
 
     if (texts.length === 0) return [];
 
+    this.activeEmbedBatches++;
     try {
       const contexts = await this.ensureEmbedContexts();
       const n = contexts.length;
@@ -1536,6 +1620,9 @@ export class LlamaCpp implements LLM {
     } catch (error) {
       console.error("Batch embedding error:", error);
       return texts.map(() => null);
+    } finally {
+      this.activeEmbedBatches--;
+      await this.trimIdleEmbeddingContexts();
     }
   }
 
@@ -2154,7 +2241,7 @@ export function canUnloadLLM(): boolean {
 // node/src/api/environment.cc).
 //
 // The actual fix is to disable residency sets via `GGML_METAL_NO_RESIDENCY=1`,
-// which we set from `bin/qmd` before Node loads the native binding. For QMD's
+// which the CLI launcher and library loader set before Node loads the native binding. For QMD's
 // short-lived CLI workflow this has no measurable cost (subsequent calls
 // don't reuse the warm mapping). The functions below report whether that
 // mitigation is in effect — kept here, in the module that depends on the

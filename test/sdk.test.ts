@@ -92,8 +92,25 @@ describe("createStore", () => {
       keepModelsWarm: true,
     });
 
-    const llm = store.internal.llm as { inactivityTimeoutMs: number };
+    const llm = store.internal.llm as {
+      inactivityTimeoutMs: number;
+      idleEmbeddingContexts: number;
+    };
     expect(llm.inactivityTimeoutMs).toBe(0);
+    expect(llm.idleEmbeddingContexts).toBe(1);
+    await store.close();
+  });
+
+  test("allows the warm embedding context count to be configured", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: { collections: {} },
+      keepModelsWarm: true,
+      idleEmbeddingContexts: 2,
+    });
+
+    const llm = store.internal.llm as { idleEmbeddingContexts: number };
+    expect(llm.idleEmbeddingContexts).toBe(2);
     await store.close();
   });
 
