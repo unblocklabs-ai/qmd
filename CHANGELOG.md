@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.9.4] - 2026-08-31
+
 ### Fixed
 
 - Semantic Markdown chunking now recognizes transcript timestamps that include
