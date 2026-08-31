@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Semantic Markdown chunking now recognizes transcript timestamps that include
+  seconds, keeping projected user and assistant messages on hard event
+  boundaries instead of splitting them as ordinary prose.
+- Markdown indexing now replaces embedded base64 data URI payloads with a small
+  marker before hashing and chunking, preventing image blobs from overwhelming
+  indexes while leaving source files unchanged.
+
 ## [2.9.3] - 2026-08-26
 
 ### Fixed
