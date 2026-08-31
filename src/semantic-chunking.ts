@@ -1,4 +1,4 @@
-export const SEMANTIC_CHUNKING_VERSION = 2;
+export const SEMANTIC_CHUNKING_VERSION = 3;
 
 const DEFAULT_MIN_TOKENS = 100;
 const DEFAULT_MAX_TOKENS = 300;
@@ -61,7 +61,7 @@ const TABLE_DELIMITER_RE = /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/
 const FENCE_RE = /^ {0,3}(`{3,}|~{3,})/;
 const TYPED_FACT_RE = /^\s*(?:[-+*]\s+)?(?:Decision|Preference|Task|Outcome|Observation)\s*:/i;
 const SESSION_RE = /^\s*(?:[-+*]\s+)?(?:Session|Conversation)(?:\s+(?:ID|#))?\s*[:#]/i;
-const TIMESTAMP_RE = /^\s*(?:[-+*]\s+)?(?:\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}|\[?\d{1,2}:\d{2}(?::\d{2})?\]?)(?:\s|$)/;
+const TIMESTAMP_RE = /^\s*(?:[-+*]\s+)?(?:\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}(?::\d{2})?|\[?\d{1,2}:\d{2}(?::\d{2})?\]?)(?:\s|$)/;
 
 /**
  * The local-window similarity and dynamic-threshold algorithm is adapted from

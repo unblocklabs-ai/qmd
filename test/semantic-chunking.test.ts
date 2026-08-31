@@ -94,6 +94,17 @@ describe("Markdown and journal boundaries", () => {
     expect(atoms.map(atom => atom.boundaryBefore)).toEqual(["event", "event"]);
   });
 
+  test("treats projected transcript timestamps with seconds as hard events", async () => {
+    const content = [
+      "2026-08-25 14:32:09 UTC — Rico: Can you review memory?\n\n",
+      "2026-08-25 14:33:02 UTC — Bill: Yes, I can review it.\n",
+    ].join("");
+    const atoms = await scanMarkdownAtoms(content, "session.md", countWords);
+
+    expect(atoms).toHaveLength(2);
+    expect(atoms.map(atom => atom.boundaryBefore)).toEqual(["event", "event"]);
+  });
+
   test("does not change ordinary list boundaries based on a date-shaped filename", async () => {
     const content = [
       "- Cats sleep beside warm windows and chase toys.\n",
