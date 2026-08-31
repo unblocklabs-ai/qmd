@@ -77,6 +77,7 @@ import {
   DEFAULT_QUERY_MODEL,
   DEFAULT_GLOB,
   splitGlobMask,
+  normalizeContentForIndex,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
@@ -1976,6 +1977,8 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
       progress.set((processed / total) * 100);
       continue;
     }
+
+    content = normalizeContentForIndex(content, relativeFile);
 
     // Skip empty files - nothing useful to index
     if (!content.trim()) {

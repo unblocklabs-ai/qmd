@@ -477,6 +477,31 @@ describe("CLI Add Command", () => {
     expect(stdout).toContain("Collection 'fixtures' created successfully");
   });
 
+  test("stores Markdown without embedded base64 payloads", async () => {
+    const env = await createIsolatedTestEnv("base64-ingestion");
+    const collectionDir = join(testDir, `base64-ingestion-${testCounter}`);
+    const payload = "A".repeat(20_000);
+    await mkdir(collectionDir, { recursive: true });
+    await writeFile(
+      join(collectionDir, "report.md"),
+      `# Report\n\n[diagram]: data:image/png;base64,${payload}\n`,
+    );
+
+    const add = await runQmd(
+      ["collection", "add", collectionDir, "--name", "base64-ingestion"],
+      { dbPath: env.dbPath, configDir: env.configDir },
+    );
+    expect(add.exitCode).toBe(0);
+
+    const get = await runQmd(
+      ["get", "qmd://base64-ingestion/report.md"],
+      { dbPath: env.dbPath, configDir: env.configDir },
+    );
+    expect(get.exitCode).toBe(0);
+    expect(get.stdout).toContain("data:image/png;base64,[omitted]");
+    expect(get.stdout).not.toContain(payload);
+  });
+
   test("requires a path argument instead of silently indexing CWD (#684)", async () => {
     const env = await createIsolatedTestEnv("collection-add-no-path");
     const { stdout, stderr, exitCode } = await runQmd(["collection", "add"], {

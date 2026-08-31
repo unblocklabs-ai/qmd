@@ -115,6 +115,96 @@ export function splitGlobMask(mask: string): string[] {
   return parts.length > 0 ? parts : [mask];
 }
 
+function isAsciiAlphaNumeric(code: number): boolean {
+  return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+function isHex(code: number): boolean {
+  return isAsciiAlphaNumeric(code) && (code <= 57 || (code >= 65 && code <= 70) || code >= 97 && code <= 102);
+}
+
+function isDataUriDelimiter(content: string, index: number, unquotedHtmlAttribute: boolean): boolean {
+  const character = content[index];
+  return character === undefined
+    || character === "\""
+    || character === "'"
+    || character === "("
+    || character === ")"
+    || character === "<"
+    || character === ">"
+    || character === "]"
+    || /\s/.test(character)
+    || (unquotedHtmlAttribute && character === "/" && content[index + 1] === ">");
+}
+
+/** Replace embedded base64 data URI payloads in Markdown before indexing. */
+export function normalizeContentForIndex(content: string, filename: string): string {
+  const lowerFilename = filename.toLowerCase();
+  if (!lowerFilename.endsWith(".md") && !lowerFilename.endsWith(".markdown")) {
+    return content;
+  }
+
+  const dataUriMarker = /data:/gi;
+  const output: string[] = [];
+  let copiedThrough = 0;
+
+  for (let match = dataUriMarker.exec(content); match; match = dataUriMarker.exec(content)) {
+    const start = match.index;
+
+    const previous = content.charCodeAt(start - 1);
+    if (isAsciiAlphaNumeric(previous) || previous === 36 || previous === 45 || previous === 47 || previous === 92 || previous === 95) {
+      continue;
+    }
+
+    const unquotedHtmlAttribute = previous === 61;
+    let tokenEnd = start + 5;
+    let comma = -1;
+    while (!isDataUriDelimiter(content, tokenEnd, unquotedHtmlAttribute)) {
+      if (comma === -1 && content[tokenEnd] === ",") comma = tokenEnd;
+      tokenEnd++;
+    }
+
+    if (comma < start + 12 || content.slice(comma - 7, comma).toLowerCase() !== ";base64") {
+      dataUriMarker.lastIndex = tokenEnd;
+      continue;
+    }
+
+    const payloadStart = comma + 1;
+    let payloadEnd = payloadStart;
+    while (payloadEnd < tokenEnd) {
+      const code = content.charCodeAt(payloadEnd);
+      if (code === 35) break; // Preserve URI fragments.
+      if (isAsciiAlphaNumeric(code) || code === 43 || code === 47 || code === 61) {
+        payloadEnd++;
+        continue;
+      }
+      if (code === 37 && isHex(content.charCodeAt(payloadEnd + 1)) && isHex(content.charCodeAt(payloadEnd + 2))) {
+        payloadEnd += 3;
+        continue;
+      }
+      break;
+    }
+
+    const validEnd = payloadEnd === tokenEnd || content[payloadEnd] === "#";
+    if (payloadEnd === payloadStart || !validEnd) {
+      dataUriMarker.lastIndex = tokenEnd;
+      continue;
+    }
+
+    output.push(
+      content.slice(copiedThrough, payloadStart),
+      "[omitted]",
+      content.slice(payloadEnd, tokenEnd),
+    );
+    copiedThrough = tokenEnd;
+    dataUriMarker.lastIndex = tokenEnd;
+  }
+
+  if (output.length === 0) return content;
+  output.push(content.slice(copiedThrough));
+  return output.join("");
+}
+
 export const DEFAULT_MULTI_GET_MAX_BYTES = 64 * 1024; // 64KB
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
@@ -1718,6 +1808,8 @@ export async function reindexCollection(
       options?.onProgress?.({ file: relativeFile, current: processed, total });
       continue;
     }
+
+    content = normalizeContentForIndex(content, relativeFile);
 
     if (!content.trim()) {
       processed++;
