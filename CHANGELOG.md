@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [2.9.5] - 2026-09-17
+
+### Fixed
+
+- Treat quoted speaker blocks as soft semantic atoms: group short exchanges and
+  retain speaker context in embeddings for split monologues without changing
+  source chunk offsets.
+- Exclude standalone generated backfill markers, separators and whitespace from
+  semantic chunks. Track successfully processed zero-chunk documents so repeated
+  embedding runs do not retry them indefinitely.
+
 ## [2.9.4] - 2026-08-31
 
 ### Fixed

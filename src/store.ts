@@ -41,6 +41,7 @@ import type {
 import {
   chunkMarkdownSemantically,
   SEMANTIC_CHUNKING_VERSION,
+  withSpeakerContext,
 } from "./semantic-chunking.js";
 
 // =============================================================================
@@ -1374,6 +1375,8 @@ function initializeDatabase(db: Database): void {
 
   ensureContentVectorsStatusIndex(db);
 
+  ensureEmptyEmbeddingTable(db);
+
   // Store collections — makes the DB self-contained (no external config needed)
   db.exec(`
     CREATE TABLE IF NOT EXISTS store_collections (
@@ -2009,12 +2012,28 @@ function runContentVectorColumnRepairs(db: Database): void {
   ensureContentVectorsStatusIndex(db);
 }
 
+function ensureEmptyEmbeddingTable(db: Database): void {
+  // A successful semantic pass can intentionally produce no searchable chunks.
+  db.exec(`CREATE TABLE IF NOT EXISTS content_embedding_empty (
+    hash TEXT NOT NULL REFERENCES content(hash) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    embed_fingerprint TEXT NOT NULL,
+    PRIMARY KEY (hash, model, embed_fingerprint)
+  )`);
+}
+
 function withLazyContentVectorMigration<T>(db: Database, operation: () => T): T {
   let repaired = false;
+  let repairedEmpty = false;
   while (true) {
     try {
       return operation();
     } catch (error) {
+      if (!repairedEmpty && error instanceof Error && /no such table: (?:main\.)?content_embedding_empty/u.test(error.message)) {
+        ensureEmptyEmbeddingTable(db);
+        repairedEmpty = true;
+        continue;
+      }
       if (repaired || !isContentVectorColumnError(error)) {
         throw error;
       }
@@ -2043,13 +2062,15 @@ function getPendingEmbeddingDocs(
         WHERE model = ? AND embed_fingerprint = ?
         GROUP BY hash, model, embed_fingerprint
       ) v ON d.hash = v.hash
+      LEFT JOIN content_embedding_empty e ON e.hash = d.hash AND e.model = ? AND e.embed_fingerprint = ?
       WHERE d.active = 1
+        AND e.hash IS NULL
         AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
         ${collectionFilter}
       GROUP BY d.hash
       ORDER BY MIN(d.path)
     `);
-    return (collection ? stmt.all(model, fingerprint, collection) : stmt.all(model, fingerprint)) as PendingEmbeddingDoc[];
+    return (collection ? stmt.all(model, fingerprint, model, fingerprint, collection) : stmt.all(model, fingerprint, model, fingerprint)) as PendingEmbeddingDoc[];
   });
 }
 
@@ -2233,8 +2254,6 @@ export async function generateEmbeddings(
       const batchBytes = batchMeta.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
 
       for (const doc of batchDocs) {
-        if (!doc.body.trim()) continue;
-
         const title = extractTitle(doc.body, doc.path);
         let chunks: { text: string; pos: number; tokens: number }[];
         if (chunkStrategy === "semantic") {
@@ -2272,13 +2291,17 @@ export async function generateEmbeddings(
         }
 
         removeStaleEmbeddingChunks(db, doc.hash, model, fingerprint);
+        db.prepare("DELETE FROM content_embedding_empty WHERE hash = ? AND model = ?").run(doc.hash, model);
+        if (chunks.length === 0) {
+          db.prepare("INSERT INTO content_embedding_empty (hash, model, embed_fingerprint) VALUES (?, ?, ?)").run(doc.hash, model, fingerprint);
+        }
 
         for (let seq = 0; seq < chunks.length; seq++) {
           batchChunks.push({
             hash: doc.hash,
             path: doc.path,
             title,
-            text: chunks[seq]!.text,
+            text: chunkStrategy === "semantic" ? withSpeakerContext(doc.body, chunks[seq]!.pos, chunks[seq]!.text) : chunks[seq]!.text,
             seq,
             pos: chunks[seq]!.pos,
             chunkLen: chunks[seq]!.text.length,
@@ -2723,11 +2746,13 @@ export function getHashesNeedingEmbedding(db: Database, collection?: string, mod
         WHERE model = ? AND embed_fingerprint = ?
         GROUP BY hash, model, embed_fingerprint
       ) v ON d.hash = v.hash
+      LEFT JOIN content_embedding_empty e ON e.hash = d.hash AND e.model = ? AND e.embed_fingerprint = ?
       WHERE d.active = 1
+        AND e.hash IS NULL
         AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
         ${collectionFilter}
     `);
-    const result = (collection ? stmt.get(model, fingerprint, collection) : stmt.get(model, fingerprint)) as { count: number };
+    const result = (collection ? stmt.get(model, fingerprint, model, fingerprint, collection) : stmt.get(model, fingerprint, model, fingerprint)) as { count: number };
     return result.count;
   });
 }
@@ -4564,10 +4589,12 @@ function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBED_MODEL
       WHERE model = ? AND embed_fingerprint = ?
       GROUP BY hash, model, embed_fingerprint
     ) v ON d.hash = v.hash
+    LEFT JOIN content_embedding_empty e ON e.hash = d.hash AND e.model = ? AND e.embed_fingerprint = ?
     WHERE d.active = 1
+      AND e.hash IS NULL
       AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
     GROUP BY d.hash
-  `).all(model, fingerprint) as { hash: string; body: string; path: string }[]);
+  `).all(model, fingerprint, model, fingerprint) as { hash: string; body: string; path: string }[]);
 }
 
 /**
@@ -4587,8 +4614,10 @@ function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBED_MODEL
  * next embed can recreate the table with the current dimensions.
  */
 export function clearAllEmbeddings(db: Database, collection?: string): void {
+  ensureEmptyEmbeddingTable(db);
   if (!collection) {
     db.exec(`DELETE FROM content_vectors`);
+    db.exec(`DELETE FROM content_embedding_empty`);
     db.exec(`DROP TABLE IF EXISTS vectors_vec`);
     return;
   }
@@ -4627,6 +4656,7 @@ export function clearAllEmbeddings(db: Database, collection?: string): void {
       DELETE FROM content_vectors
       WHERE hash IN (${exclusiveHashesQuery})
     `).run(collection);
+    db.prepare(`DELETE FROM content_embedding_empty WHERE hash IN (${exclusiveHashesQuery})`).run(collection);
 
     const remaining = db
       .prepare(`SELECT COUNT(*) AS n FROM content_vectors`)

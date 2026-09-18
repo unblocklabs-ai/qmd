@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
 import * as llmModule from "../src/llm.js";
+import type { LlamaCpp } from "../src/llm.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
@@ -58,6 +59,8 @@ import {
   insertDocument,
   cleanupOrphanedVectors,
   generateEmbeddings,
+  getHashesNeedingEmbedding,
+  clearAllEmbeddings,
   getHybridRrfWeights,
   _resetProductionModeForTesting,
   hybridQuery,
@@ -4633,6 +4636,23 @@ describe("Embedding batching", () => {
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);
     }
+  });
+
+  test("zero-chunk semantic documents finish once and scoped clearing makes them pending again", async () => {
+    const store = await createTestStore();
+    const fakeLlm = createFakeEmbedLlm();
+    const model = "hf:test/empty-semantic-model.gguf";
+    setDefaultLlamaCpp(createFakeTokenizer() as LlamaCpp);
+    store.llm = fakeLlm as LlamaCpp;
+    try {
+      await insertTestDocument(store.db, "docs", { name: "empty", body: "<!-- lcm-memory-backfill:test -->\n\n---\n" });
+      const first = await generateEmbeddings(store, { model, chunkStrategy: "semantic" });
+      expect(first.chunksEmbedded).toBe(0);
+      expect(getHashesNeedingEmbedding(store.db, "docs", model)).toBe(0);
+      expect((await generateEmbeddings(store, { model })).docsProcessed).toBe(0);
+      clearAllEmbeddings(store.db, "docs");
+      expect(getHashesNeedingEmbedding(store.db, "docs", model)).toBe(1);
+    } finally { setDefaultLlamaCpp(null); await cleanupTestDb(store); }
   });
 
   test("generateEmbeddings does not mark a partially embedded multi-chunk document complete", async () => {

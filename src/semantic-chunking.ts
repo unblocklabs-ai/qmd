@@ -1,4 +1,4 @@
-export const SEMANTIC_CHUNKING_VERSION = 3;
+export const SEMANTIC_CHUNKING_VERSION = 6;
 
 const DEFAULT_MIN_TOKENS = 100;
 const DEFAULT_MAX_TOKENS = 300;
@@ -39,7 +39,7 @@ type ResolvedOptions = Required<
   Omit<SemanticChunkOptions, "embedBatch" | "countTokens" | "signal">
 > & Pick<SemanticChunkOptions, "embedBatch" | "countTokens" | "signal">;
 
-type AtomKind = "prose" | "heading" | "rule" | "fence" | "table" | "list";
+type AtomKind = "prose" | "speaker" | "heading" | "rule" | "marker" | "fence" | "table" | "list";
 
 type ScannedAtom = TextAtom & { kind: AtomKind };
 
@@ -59,6 +59,25 @@ const RULE_RE = /^ {0,3}(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})\s*$/;
 const LIST_RE = /^(\s*)(?:[-+*]|\d+[.)])\s+/;
 const TABLE_DELIMITER_RE = /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/;
 const FENCE_RE = /^ {0,3}(`{3,}|~{3,})/;
+const SPEAKER_RE = /^\*\*Speaker: ("(?:[^"\\\r\n]|\\.)*")\*\*$/u;
+
+/** Add attribution for embeddings only; indexed chunks keep exact source offsets. */
+export function withSpeakerContext(content: string, position: number, text: string): string {
+  const before = content.slice(0, position);
+  const start = before.lastIndexOf("\n**Speaker: ") + 1;
+  if (start === 0 && !content.startsWith("**Speaker: ")) return text;
+  const end = content.indexOf("\n", start);
+  if (end < 0 || position <= end) return text;
+  const header = content.slice(start, end);
+  if (header.length > 512) return text;
+  const match = SPEAKER_RE.exec(header);
+  if (!match) return text;
+  try { if (typeof JSON.parse(match[1]!) !== "string") return text; } catch { return text; }
+  if (!/^(?:>[^\n]*(?:\n|$))*$/u.test(content.slice(end + 1, position))) return text;
+  return `${header}\n${text}`;
+}
+// Generated provenance, not arbitrary HTML comments (which can contain useful text).
+const BACKFILL_MARKER_RE = /^ {0,3}<!--\s*lcm-memory-backfill:[^<>\r\n]*-->\s*$/;
 const TYPED_FACT_RE = /^\s*(?:[-+*]\s+)?(?:Decision|Preference|Task|Outcome|Observation)\s*:/i;
 const SESSION_RE = /^\s*(?:[-+*]\s+)?(?:Session|Conversation)(?:\s+(?:ID|#))?\s*[:#]/i;
 const TIMESTAMP_RE = /^\s*(?:[-+*]\s+)?(?:\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}(?::\d{2})?|\[?\d{1,2}:\d{2}(?::\d{2})?\]?)(?:\s|$)/;
@@ -179,6 +198,8 @@ function topLevelListIndent(line: string): number | null {
 }
 
 function blockKind(line: string): AtomKind {
+  if (SPEAKER_RE.test(line)) return "speaker";
+  if (BACKFILL_MARKER_RE.test(line)) return "marker";
   if (HEADING_RE.test(line)) return "heading";
   if (RULE_RE.test(line)) return "rule";
   if (topLevelListIndent(line) !== null) return "list";
@@ -249,15 +270,18 @@ function scanMarkdownBlocks(content: string): ScannedAtom[] {
     } else if (table !== null) {
       kind = "table";
       endLine = table;
-    } else if (kind === "heading" || kind === "rule") {
+    } else if (kind === "heading" || kind === "rule" || kind === "marker") {
       endLine = lineIndex + 1;
+    } else if (kind === "speaker") {
+      endLine = lineIndex + 1;
+      while (endLine < lines.length && lineBody(lines[endLine]!).startsWith(">")) endLine++;
     } else if (kind === "list") {
       endLine = listEntryEnd(lines, lineIndex);
     } else {
       endLine = lineIndex + 1;
       while (endLine < lines.length && !isBlank(lines[endLine]!)) {
         const candidate = lineBody(lines[endLine]!);
-        if (FENCE_RE.test(candidate) || startsHardBoundary(candidate) !== "none") break;
+        if (FENCE_RE.test(candidate) || BACKFILL_MARKER_RE.test(candidate) || startsHardBoundary(candidate) !== "none") break;
         if (tableEnd(lines, endLine) !== null) break;
         if (topLevelListIndent(candidate) !== null) break;
         endLine++;
@@ -563,13 +587,13 @@ async function attachStructuralContext(
   const result: ScannedAtom[] = [];
   for (let index = 0; index < atoms.length; index++) {
     const atom = atoms[index]!;
-    if (atom.kind !== "heading" && atom.kind !== "rule") {
+    if (atom.kind !== "heading" && atom.kind !== "rule" && atom.kind !== "marker") {
       result.push(atom);
       continue;
     }
 
     let contentIndex = index + 1;
-    while (atoms[contentIndex]?.kind === "heading" || atoms[contentIndex]?.kind === "rule") contentIndex++;
+    while (atoms[contentIndex]?.kind === "heading" || atoms[contentIndex]?.kind === "rule" || atoms[contentIndex]?.kind === "marker") contentIndex++;
     const next = atoms[contentIndex];
     if (!next) {
       result.push(...atoms.slice(index));
@@ -596,12 +620,12 @@ async function attachStructuralContext(
   return result;
 }
 
-async function embedAll(atoms: readonly TextAtom[], options: ResolvedOptions): Promise<readonly (readonly number[])[]> {
+async function embedAll(atoms: readonly TextAtom[], options: ResolvedOptions, content: string): Promise<readonly (readonly number[])[]> {
   const vectors: Array<readonly number[]> = [];
   for (let start = 0; start < atoms.length; start += options.embeddingBatchSize) {
     options.signal?.throwIfAborted();
     const batch = atoms.slice(start, start + options.embeddingBatchSize);
-    const embedded = await options.embedBatch(batch.map(atom => atom.text));
+    const embedded = await options.embedBatch(batch.map(atom => withSpeakerContext(content, atom.start, atom.text)));
     if (embedded.length !== batch.length) {
       throw new Error(`Embedding callback returned ${embedded.length} vectors for ${batch.length} atoms`);
     }
@@ -656,6 +680,7 @@ async function chunkRegion(
   atoms: readonly ScannedAtom[],
   options: ResolvedOptions,
 ): Promise<SemanticChunk[]> {
+  if (atoms.every(atom => atom.kind === "marker" || atom.kind === "rule")) return [];
   const preparedAtoms = (await Promise.all(atoms.map(atom => prepareAtom(content, atom, options)))).flat();
   const prepared = await attachStructuralContext(content, preparedAtoms, options);
   if (prepared.length === 1) {
@@ -671,7 +696,7 @@ async function chunkRegion(
     return [{ text: completeText, pos: completeStart, tokens: completeTokens }];
   }
 
-  const vectors = await embedAll(prepared, options);
+  const vectors = await embedAll(prepared, options, content);
   const scores = localSimilarityScores(vectors, options.similarityWindow);
   const threshold = findSemanticThreshold(scores, prepared.map(atom => atom.tokens), options);
   return assembleSemanticChunks(content, prepared, scores, threshold, options);
@@ -693,7 +718,7 @@ export async function chunkMarkdownSemantically(
   const regions: ScannedAtom[][] = [];
   let current: ScannedAtom[] = [];
   for (const atom of scanned) {
-    const currentIsOnlyContext = current.every(item => item.kind === "heading" || item.kind === "rule");
+    const currentIsOnlyContext = current.every(item => item.kind === "heading" || item.kind === "rule" || item.kind === "marker");
     if (atom.boundaryBefore !== "none" && current.length > 0 && !currentIsOnlyContext) {
       regions.push(current);
       current = [];
@@ -707,5 +732,10 @@ export async function chunkMarkdownSemantically(
     resolved.signal?.throwIfAborted();
     chunks.push(...await chunkRegion(content, region, resolved));
   }
-  return chunks;
+  // Check the original Markdown structure, so literal markers/rules in code
+  // fences remain searchable. Never rewrite text: positions stay source-exact.
+  return chunks.filter(chunk => chunk.text.trim().length > 0 && scanned.some(
+    atom => atom.kind !== "marker" && atom.kind !== "rule"
+      && atom.start < chunk.pos + chunk.text.length && atom.end > chunk.pos,
+  ));
 }
