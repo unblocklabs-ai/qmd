@@ -673,6 +673,14 @@ works for both sparse journals and single-topic documents, but costs extra
 embedding work during ingestion. The selected strategy persists for later embed
 runs; changing it is index-wide and cannot be combined with `-c`.
 
+Semantic chunking excludes source-confirmed structural-only spans: the exact
+OpenClaw `## REM Sleep` heading plus opening REM marker, and a standalone closing
+code fence with a matching opener and substantive preceding code. It never drops
+the surrounding REM reflections or rewrites Markdown. Unknown markers, useful
+comments, literal fenced examples, and incomplete fences remain intact. Retained
+chunks keep exact source offsets. Chunking-version changes invalidate the semantic
+embedding fingerprint so the next embed pass retires obsolete vectors.
+
 One honest MVP limitation: two short, unlabeled atoms can remain merged even when
 their topics differ. Add an explicit marker when that distinction must be hard.
 

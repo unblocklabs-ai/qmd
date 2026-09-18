@@ -1892,6 +1892,8 @@ export type EmbedResult = {
   errors: number;
   failures?: EmbedFailure[];
   durationMs: number;
+  /** Recognized structural-only chunks omitted during this embedding pass. */
+  structuralChunksOmitted?: number;
 };
 
 export type EmbedOptions = {
@@ -2157,6 +2159,7 @@ export async function generateEmbeddings(
   const totalBytes = docsToEmbed.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
   const totalDocs = docsToEmbed.length;
   const startTime = Date.now();
+  let structuralChunksOmitted = 0;
 
   // Use store's LlamaCpp or global singleton, wrapped in a session
   const embedModelUri = model;
@@ -2268,6 +2271,7 @@ export async function generateEmbeddings(
             )
             : await chunkMarkdownSemantically(doc.body, doc.path, {
               signal: session.signal,
+              onStructuralOmission: () => { structuralChunksOmitted++; },
               countTokens: async (text) => (await llm.tokenize(text)).length,
               embedBatch: async (texts) => {
                 const results = await session.embedBatch(
@@ -2420,6 +2424,7 @@ export async function generateEmbeddings(
   return {
     docsProcessed: totalDocs,
     chunksEmbedded: result.chunksEmbedded,
+    structuralChunksOmitted,
     errors: result.errors,
     failures: result.failures,
     durationMs: Date.now() - startTime,
@@ -2727,6 +2732,7 @@ export type IndexStatus = {
   needsEmbedding: number;
   hasVectorIndex: boolean;
   collections: CollectionInfo[];
+  semanticChunkingVersion?: number;
 };
 
 // =============================================================================
@@ -5484,6 +5490,7 @@ export function getStatus(db: Database, model: string = DEFAULT_EMBED_MODEL): In
 
   return {
     totalDocuments: totalDocs,
+    semanticChunkingVersion: SEMANTIC_CHUNKING_VERSION,
     needsEmbedding,
     hasVectorIndex: hasVectors,
     collections,

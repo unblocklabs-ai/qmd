@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { createStructuralNoiseCheck } from "../src/structural-noise.js";
 import {
   assembleSemanticChunks,
   chunkMarkdownSemantically,
@@ -63,6 +64,34 @@ describe("semantic chunking math", () => {
 });
 
 describe("Markdown and journal boundaries", () => {
+  test("REM eligibility preserves source offsets, reflections, and literal examples", async () => {
+    const marker = "## REM Sleep\n<!-- openclaw:dreaming:rem:start -->\n";
+    let omitted = 0;
+    expect(await chunkMarkdownSemantically(marker, "memory.md", { ...options(), onStructuralOmission: () => { omitted++; } })).toEqual([]);
+    expect(omitted).toBe(1);
+    const reflection = "Decision: Keep the customer's actual preference.\n";
+    const content = marker + reflection + "<!-- openclaw:dreaming:rem:end -->\n";
+    const chunks = await chunkMarkdownSemantically(content, "memory.md", options());
+    expect(chunks.map(c => c.text).join("")).toContain(reflection);
+    for (const c of chunks) expect(content.slice(c.pos, c.pos + c.text.length)).toBe(c.text);
+    for (const text of ["```md\n" + marker + "```\n", "    " + marker.replaceAll("\n", "\n    "),
+      "## REM Sleep\nReal sleep research.\n", "<!-- Useful rationale. -->", "42", "{\"a\":1}"]) {
+      expect(createStructuralNoiseCheck(text)(0, text.length)).toBeUndefined();
+      expect((await chunkMarkdownSemantically(text, "memory.md", options())).map(c => c.text).join("")).toBe(text);
+    }
+  });
+
+  test("only source-confirmed closing fences can disappear after oversized-code splitting", async () => {
+    const text = "```txt\none two three four\nfive six seven eight\n```\n";
+    const chunks = await chunkMarkdownSemantically(text, "memory.md", options({ minTokens: 2, maxTokens: 4 }));
+    expect(chunks.map(c => c.text).join("")).toBe(text.slice(0, text.lastIndexOf("```")));
+    for (const c of chunks) expect(text.slice(c.pos, c.pos + c.text.length)).toBe(c.text);
+    for (const text of ["````txt\none two three four\n```\n", "```txt\none two three four\n~~~\n"]) {
+      const endLine = text.lastIndexOf("\n", text.length - 2) + 1;
+      expect(createStructuralNoiseCheck(text)(endLine, text.length)).toBeUndefined();
+      expect((await chunkMarkdownSemantically(text, "memory.md", options({ minTokens: 2, maxTokens: 4 }))).map(c => c.text).join("")).toBe(text);
+    }
+  });
   test("groups short speaker turns and preserves exact offsets for oversized speech", async () => {
     const dialogue = '**Speaker: "Bek"**\n> Yes.\n\n**Speaker: "Sam"**\n> Tomorrow.\n';
     const grouped = await chunkMarkdownSemantically(dialogue, "meeting.md", options({ maxTokens: 30, minTokens: 25 }));

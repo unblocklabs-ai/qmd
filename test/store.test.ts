@@ -4638,16 +4638,23 @@ describe("Embedding batching", () => {
     }
   });
 
-  test("zero-chunk semantic documents finish once and scoped clearing makes them pending again", async () => {
+  test.each([
+    "<!-- lcm-memory-backfill:test -->\n\n---\n",
+    "## REM Sleep\n<!-- openclaw:dreaming:rem:start -->\n",
+  ])("zero-chunk semantic documents retire old vectors and finish once: %s", async (body) => {
     const store = await createTestStore();
     const fakeLlm = createFakeEmbedLlm();
     const model = "hf:test/empty-semantic-model.gguf";
     setDefaultLlamaCpp(createFakeTokenizer() as LlamaCpp);
     store.llm = fakeLlm as LlamaCpp;
     try {
-      await insertTestDocument(store.db, "docs", { name: "empty", body: "<!-- lcm-memory-backfill:test -->\n\n---\n" });
+      await insertTestDocument(store.db, "docs", { name: "empty", hash: "emptyhash", body });
+      store.ensureVecTable(3);
+      store.insertEmbedding("emptyhash", 0, 0, new Float32Array([1, 2, 3]), model, new Date().toISOString(), 1, "old-version", body.length);
       const first = await generateEmbeddings(store, { model, chunkStrategy: "semantic" });
       expect(first.chunksEmbedded).toBe(0);
+      expect(store.db.prepare("SELECT seq FROM content_vectors WHERE hash = 'emptyhash'").all()).toEqual([]);
+      expect(store.db.prepare("SELECT hash_seq FROM vectors_vec WHERE hash_seq = 'emptyhash_0'").all()).toEqual([]);
       expect(getHashesNeedingEmbedding(store.db, "docs", model)).toBe(0);
       expect((await generateEmbeddings(store, { model })).docsProcessed).toBe(0);
       clearAllEmbeddings(store.db, "docs");

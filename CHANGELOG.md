@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [2.9.6] - 2026-09-18
+
+### Fixed
+
+- Omit source-confirmed REM heading/marker-only spans and isolated closing code
+  fences from semantic chunks while preserving reflections, literal examples,
+  substantive code, and exact source offsets.
+- Invalidate older semantic embeddings so obsolete noise-only vectors are retired.
+
+### Added
+
+- Report semantic chunking version and structural omission counts for index diagnostics.
+
 ## [2.9.5] - 2026-09-17
 
 ### Fixed

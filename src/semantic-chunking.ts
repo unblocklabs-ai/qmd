@@ -1,4 +1,6 @@
-export const SEMANTIC_CHUNKING_VERSION = 6;
+import { createStructuralNoiseCheck } from "./structural-noise.js";
+
+export const SEMANTIC_CHUNKING_VERSION = 7;
 
 const DEFAULT_MIN_TOKENS = 100;
 const DEFAULT_MAX_TOKENS = 300;
@@ -33,10 +35,12 @@ export type SemanticChunkOptions = {
   embedBatch: (texts: string[]) => Promise<readonly (readonly number[])[]>;
   countTokens: (text: string) => Promise<number>;
   signal?: AbortSignal;
+  /** Content-free count of recognized structural-only chunks omitted in this call. */
+  onStructuralOmission?: () => void;
 };
 
 type ResolvedOptions = Required<
-  Omit<SemanticChunkOptions, "embedBatch" | "countTokens" | "signal">
+  Omit<SemanticChunkOptions, "embedBatch" | "countTokens" | "signal" | "onStructuralOmission">
 > & Pick<SemanticChunkOptions, "embedBatch" | "countTokens" | "signal">;
 
 type AtomKind = "prose" | "speaker" | "heading" | "rule" | "marker" | "fence" | "table" | "list";
@@ -734,8 +738,15 @@ export async function chunkMarkdownSemantically(
   }
   // Check the original Markdown structure, so literal markers/rules in code
   // fences remain searchable. Never rewrite text: positions stay source-exact.
-  return chunks.filter(chunk => chunk.text.trim().length > 0 && scanned.some(
+  const noiseReason = createStructuralNoiseCheck(content);
+  return chunks.filter(chunk => {
+    if (noiseReason(chunk.pos, chunk.pos + chunk.text.length)) {
+      options.onStructuralOmission?.();
+      return false;
+    }
+    return chunk.text.trim().length > 0 && scanned.some(
     atom => atom.kind !== "marker" && atom.kind !== "rule"
       && atom.start < chunk.pos + chunk.text.length && atom.end > chunk.pos,
-  ));
+    );
+  });
 }
