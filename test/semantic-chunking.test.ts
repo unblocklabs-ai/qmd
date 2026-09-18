@@ -5,6 +5,7 @@ import {
   cosineSimilarity,
   localSimilarityScores,
   scanMarkdownAtoms,
+  withSpeakerContext,
   type SemanticChunkOptions,
 } from "../src/semantic-chunking.js";
 
@@ -62,6 +63,58 @@ describe("semantic chunking math", () => {
 });
 
 describe("Markdown and journal boundaries", () => {
+  test("groups short speaker turns and preserves exact offsets for oversized speech", async () => {
+    const dialogue = '**Speaker: "Bek"**\n> Yes.\n\n**Speaker: "Sam"**\n> Tomorrow.\n';
+    const grouped = await chunkMarkdownSemantically(dialogue, "meeting.md", options({ maxTokens: 30, minTokens: 25 }));
+    expect(grouped).toHaveLength(1);
+    const monologue = `**Speaker: "Bek"**\n> ${"long spoken sentence. ".repeat(100)}\n`;
+    const chunks = await chunkMarkdownSemantically(monologue, "meeting.md", options());
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(monologue.slice(chunk.pos, chunk.pos + chunk.text.length)).toBe(chunk.text);
+      expect(withSpeakerContext(monologue, chunk.pos, chunk.text)).toContain('**Speaker: "Bek"**');
+      expect(chunk.tokens).toBeLessThanOrEqual(20);
+    }
+    const unrelated = `${dialogue}\n## Summary\n\nNot speech.`;
+    expect(withSpeakerContext(unrelated, unrelated.indexOf("Not speech"), "Not speech.")).toBe("Not speech.");
+  });
+  test("omits standalone provenance and separators while keeping exact source slices", async () => {
+    const marker = "<!-- lcm-memory-backfill:lcm-final:300:chunk:1of1 -->";
+    expect(await chunkMarkdownSemantically(`${marker}\n\n---\n`, "memory.md", options())).toEqual([]);
+    const content = `${marker}\n\n# Incident\n\nDecision: Use SQLite.\n\n---\n\nPreference: Keep updates short.\n\n---\n${marker}\n`;
+    const chunks = await chunkMarkdownSemantically(content, "memory.md", options());
+    expect(chunks.some(chunk => chunk.text.includes("Decision: Use SQLite."))).toBe(true);
+    expect(chunks.some(chunk => chunk.text.includes("Preference: Keep updates short."))).toBe(true);
+    expect(chunks.every(chunk => !(chunk.text.includes("Decision:") && chunk.text.includes("Preference:")))).toBe(true);
+    for (const chunk of chunks) {
+      expect(chunk.text).toBe(content.slice(chunk.pos, chunk.pos + chunk.text.length));
+      expect(chunk.text.replaceAll(marker, "").replaceAll("---", "").trim()).not.toBe("");
+    }
+  });
+
+  test("preserves literal markers in fences and useful or mixed HTML comments", async () => {
+    for (const content of [
+      "```html\n<!-- lcm-memory-backfill:example -->\n---\n```",
+      "<!-- Keep this migration rationale. -->",
+      "<!--\nA useful multiline explanation.\n-->",
+      "<!-- lcm-memory-backfill:example --> actual useful content",
+      "    <!-- lcm-memory-backfill:indented-code -->",
+    ]) {
+      const chunks = await chunkMarkdownSemantically(content, "memory.md", options());
+      expect(chunks.map(chunk => chunk.text).join("")).toBe(content);
+    }
+  });
+
+  test("does not emit whitespace-only tails at the token ceiling", async () => {
+    const content = `${"meaningful ".repeat(30)}\n\n${" ".repeat(100)}`;
+    const chunks = await chunkMarkdownSemantically(content, "memory.md", options({
+      minTokens: 0, maxTokens: 20, countTokens: async text => text.length,
+    }));
+    expect(chunks.length).toBeGreaterThan(0);
+    expect(chunks.every(chunk => chunk.text.trim().length > 0)).toBe(true);
+    for (const chunk of chunks) expect(chunk.text).toBe(content.slice(chunk.pos, chunk.pos + chunk.text.length));
+  });
+
   test("keeps sparse, unrelated journal events independent", async () => {
     const content = [
       "Decision: Use SQLite for the local cache.\n",
