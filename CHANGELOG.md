@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.10.0] - 2026-09-19
+
 ### Fixed
 
 - Select BM25 excerpts using actual FTS matches so prefix, stemmed and CJK hits
