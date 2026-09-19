@@ -75,6 +75,7 @@ import {
 import {
   LlamaCpp,
 } from "./llm.js";
+export type { TypeSafeOptions } from "./typesafe-query.js";
 import {
   setConfigSource,
   loadConfig,
@@ -163,14 +164,14 @@ export type UpdateResult = {
 /**
  * Options for the unified search() method.
  */
-export interface SearchOptions {
-  /** Simple query string — will be auto-expanded via LLM */
+export interface SearchOptions extends Pick<HybridQueryOptions, "typesafe" | "signal" | "allowedPaths" | "trace" | "timeContext"> {
+  /** Simple query string — literal vector + BM25 recall, then TypeSafe ranking */
   query?: string;
   /** Pre-expanded queries (from expandQuery) — skips auto-expansion */
   queries?: ExpandedQuery[];
   /** Domain intent hint — steers reranking and snippet/chunk selection */
   intent?: string;
-  /** Rerank results using LLM (default: true) */
+  /** Rerank with TypeSafe (default: true); false is explicit local-only retrieval */
   rerank?: boolean;
   /** Filter to a specific collection */
   collection?: string;
@@ -178,7 +179,7 @@ export interface SearchOptions {
   collections?: string[];
   /** Max results (default: 10) */
   limit?: number;
-  /** Max candidates to rerank (default: 40) */
+  /** Optional cap on candidates after deduplication */
   candidateLimit?: number;
   /** Minimum score threshold */
   minScore?: number;
@@ -257,7 +258,7 @@ export interface QMDStore {
 
   // ── Search ──────────────────────────────────────────────────────────
 
-  /** Full search: query expansion + multi-signal retrieval + LLM reranking */
+  /** Vector + BM25 retrieval with independent TypeSafe scoring */
   search(options: SearchOptions): Promise<HybridQueryResult[]>;
 
   /** BM25 keyword search (fast, no LLM) */
@@ -446,10 +447,12 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           candidateLimit: opts.candidateLimit,
           skipRerank,
           chunkStrategy: opts.chunkStrategy,
+          typesafe: opts.typesafe, signal: opts.signal, allowedPaths: opts.allowedPaths,
+          trace: opts.trace, timeContext: opts.timeContext,
         });
       }
 
-      // Simple query string — use hybridQuery (expand + search + rerank)
+      // Literal vector + BM25 retrieval, then independent TypeSafe scoring.
       return hybridQuery(internal, opts.query!, {
         collection: collections.length > 0 ? collections : undefined,
         limit: opts.limit,
@@ -459,6 +462,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         candidateLimit: opts.candidateLimit,
         skipRerank,
         chunkStrategy: opts.chunkStrategy,
+        typesafe: opts.typesafe, signal: opts.signal, allowedPaths: opts.allowedPaths,
+        trace: opts.trace, timeContext: opts.timeContext,
       });
     },
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),

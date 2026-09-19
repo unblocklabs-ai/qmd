@@ -2315,9 +2315,9 @@ type OutputOptions = {
   lineNumbers?: boolean; // Add line numbers to output
   explain?: boolean;     // Include retrieval score traces (query only)
   context?: string;      // Optional context for query expansion
-  candidateLimit?: number;  // Max candidates to rerank (default: 40)
+  candidateLimit?: number;  // Optional cap on deduplicated query candidates
   intent?: string;       // Domain intent for disambiguation
-  skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
+  skipRerank?: boolean;  // Explicit local-only reciprocal-rank ordering
   chunkStrategy?: ChunkStrategy;  // "regex" (default), "auto", or "semantic"
   noExpand?: boolean;       // vsearch: use only the literal query
   fullPath?: boolean;    // Show realpath instead of qmd:// URI (relative to $PWD when subpath)
@@ -2591,24 +2591,9 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       console.log(`Score: ${c.bold}${score}${c.reset}`);
       if (opts.explain && row.explain) {
         const explain = row.explain;
-        const ftsScores = explain.ftsScores.length > 0
-          ? explain.ftsScores.map(formatExplainNumber).join(", ")
-          : "none";
-        const vecScores = explain.vectorScores.length > 0
-          ? explain.vectorScores.map(formatExplainNumber).join(", ")
-          : "none";
-        const contribSummary = explain.rrf.contributions
-          .slice()
-          .sort((a, b) => b.rrfContribution - a.rrfContribution)
-          .slice(0, 3)
-          .map(c => `${c.source}/${c.queryType}#${c.rank}:${formatExplainNumber(c.rrfContribution)}`)
-          .join(" | ");
-
-        console.log(`${c.dim}Explain: fts=[${ftsScores}] vec=[${vecScores}]${c.reset}`);
-        console.log(`${c.dim}  RRF: total=${formatExplainNumber(explain.rrf.totalScore)} base=${formatExplainNumber(explain.rrf.baseScore)} bonus=${formatExplainNumber(explain.rrf.topRankBonus)} rank=${explain.rrf.rank}${c.reset}`);
-        console.log(`${c.dim}  Blend: ${Math.round(explain.rrf.weight * 100)}%*${formatExplainNumber(explain.rrf.positionScore)} + ${Math.round((1 - explain.rrf.weight) * 100)}%*${formatExplainNumber(explain.rerankScore)} = ${formatExplainNumber(explain.blendedScore)}${c.reset}`);
-        if (contribSummary.length > 0) {
-          console.log(`${c.dim}  Top RRF contributions: ${contribSummary}${c.reset}`);
+        console.log(`${c.dim}Explain: ${explain.ranking} score=${formatExplainNumber(explain.score)} via=${explain.methods.join("+")} asOf=${explain.asOf}${c.reset}`);
+        if (explain.confidence !== undefined) {
+          console.log(`${c.dim}  Confidence: ${formatExplainNumber(explain.confidence)} policy=${explain.policy}${c.reset}`);
         }
       }
       console.log();
@@ -2708,7 +2693,7 @@ function collectionSearchFilter(names: string[]): string | string[] | undefined 
 /**
  * Parse structured search query syntax.
  * Lines starting with lex:, vec:, or hyde: are routed directly.
- * Plain lines without prefix go through query expansion.
+ * Plain lines without prefix use literal hybrid retrieval and TypeSafe scoring.
  * 
  * Returns null if this is a plain query (single line, no prefix).
  * Returns ExpandedQuery[] if structured syntax detected.
@@ -2898,6 +2883,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 
   // Check for structured query syntax (lex:/vec:/hyde:/intent: prefixes)
   const parsed = parseStructuredQuery(query);
+  if (!parsed) query = query.replace(/^expand:\s*/i, ""); // Legacy spelling, now literal hybrid recall.
   // Intent can come from --intent flag or from intent: line in query document
   const intent = opts.intent || parsed?.intent;
 
@@ -2948,7 +2934,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         },
       });
     } else {
-      // Standard hybrid query with automatic expansion
+      // Literal hybrid retrieval and independent TypeSafe scoring.
       results = await hybridQuery(store, query, {
         collection: collectionSearchFilter(collectionNames),
         limit: opts.all ? 500 : (opts.limit || 10),
@@ -2959,17 +2945,6 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         intent,
         chunkStrategy: opts.chunkStrategy,
         hooks: {
-          onStrongSignal: (score) => {
-            process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
-          },
-          onExpandStart: () => {
-            process.stderr.write(`${c.dim}Expanding query...${c.reset}`);
-          },
-          onExpand: (original, expanded, ms) => {
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
-            logExpansionTree(original, expanded);
-            process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
-          },
           onEmbedStart: (count) => {
             process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
           },
@@ -3576,7 +3551,7 @@ function showHelp(): void {
   console.log("  qmd <command> [options]");
   console.log("");
   console.log("Primary commands:");
-  console.log("  qmd query <query>             - Hybrid search with auto expansion + reranking (recommended)");
+  console.log("  qmd query <query>             - Vector + BM25 search with TypeSafe ranking");
   console.log("  qmd query 'lex:..\\nvec:...'   - Structured query document (you provide lex/vec/hyde lines)");
   console.log("  qmd search <query>            - Full-text BM25 keywords (no LLM)");
   console.log("  qmd vsearch <query>           - Vector similarity only");
@@ -3605,7 +3580,7 @@ function showHelp(): void {
   console.log("  qmd cleanup [--dry-run]       - Drop inactive docs/orphans, compact FTS, vacuum");
   console.log("");
   console.log("Query syntax (qmd query):");
-  console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
+  console.log("  QMD queries are either a literal hybrid query (no prefix) or a multi-line");
   console.log("  document where every line is typed with lex:, vec:, or hyde:. This grammar");
   console.log("  matches the docs in docs/SYNTAX.md and is enforced in the CLI.");
   console.log("");
@@ -3628,7 +3603,7 @@ function showHelp(): void {
   }
   console.log("");
   console.log("  Examples:");
-  console.log("    qmd query \"how does auth work\"                # single-line → implicit expand");
+  console.log("    qmd query \"how does auth work\"                # vector + BM25 → TypeSafe");
   console.log("    qmd query $'lex: CAP theorem\\nvec: consistency'  # typed query document");
   console.log("    qmd query $'lex: \"exact matches\" sports -baseball'  # phrase + negation lex search");
   console.log("    qmd query $'hyde: Hypothetical answer text'       # hyde-only document");
@@ -3655,8 +3630,9 @@ function showHelp(): void {
   console.log("  --all                      - Return all matches (pair with --min-score)");
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
-  console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
-  console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
+  console.log("  -C, --candidate-limit <n>  - Optional cap after deduplication (default: all candidates)");
+  console.log("  --no-rerank                - Local-only reciprocal-rank ordering; no TypeSafe calls");
+  console.log("  TYPESAFE_API_KEY[_FILE]    - Server-side query credential; file may be raw key or dotenv");
   console.log("  --no-expand                - vsearch only: use the literal query without LLM expansion");
   console.log("  --no-gpu                   - Force CPU mode for llama.cpp operations (same as QMD_FORCE_CPU=1)");
   console.log("  --line-numbers             - Include line numbers (search; get/multi-get are on by default)");

@@ -4,26 +4,31 @@ QMD is Unblock Labs' on-device search engine for everything you need to remember
 
 This repository, [`unblocklabs-ai/qmd`](https://github.com/unblocklabs-ai/qmd), is the canonical home of the Unblock Labs project and the source of the `@unblocklabs/qmd` package.
 
-QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
+QMD combines local BM25 and vector retrieval with remote TypeSafe usefulness
+scoring for `query`. `search` remains local BM25; `vsearch` is unchanged.
 
 ```mermaid
 flowchart LR
-  Q[User Query] -. weak BM25 signal .-> X[Optional Query Expansion]
-  Q --> FTS[BM25 Search]
-  Q --> VS[Vector Search]
-  X --> HYDE[HyDE]
-  X --> VEC[Vec dense sentences]
-  X --> LEX[Lex BM25 keywords]
-  HYDE --> VS
-  VEC --> VS
-  LEX --> FTS
-  VS --> RRF[Reciprocal Rank Fusion]
-  FTS --> RRF
-  RRF --> RR[LLM Reranker]
-  RR --> OUT[Final ranked results]
+  Q[Query] --> FTS[BM25: top 1.5k]
+  Q --> VS[Vector: top 1.5k]
+  FTS --> D[Deduplicate excerpts within each source]
+  VS --> D
+  D --> T[TypeSafe: independent usefulness scores]
+  T --> O[Top k results]
 ```
 
-Typed expansions are routed exclusively: `lex` → BM25/FTS, `vec` and `hyde` → vector search. Strong initial BM25 results skip expansion. The original query is sent to both backends, then fused with RRF and reranked.
+Set `TYPESAFE_API_KEY` or `TYPESAFE_API_KEY_FILE` in the CLI/MCP process environment.
+The file may contain a raw key or a dotenv `TYPESAFE_API_KEY` entry; an explicit
+file never falls back to a different credential. Do not check keys into collection
+configuration. SDK calls may instead supply `typesafe: { apiKeyFile: "/private/key" }`.
+
+`query` sends the query, optional intent, selected source excerpts, source paths
+and evaluation time to TypeSafe. Use collection filters to limit that scope.
+Missing credentials or any scoring failure produces an explicit error, not a
+silent fallback. `--no-rerank` (SDK/MCP `rerank:false`) explicitly skips TypeSafe
+and uses local reciprocal-rank ordering. Six judgments run concurrently, with
+a 10-second per-request timeout and a 60-second search deadline checked between
+retrieval operations; a native embedding already in flight cannot be interrupted.
 
 You can read more about QMD's progress in the [CHANGELOG](CHANGELOG.md).
 
@@ -104,7 +109,7 @@ for configuration and supported source paths.
 Although the tool works perfectly fine when you just tell your agent to use it on the command line, it also exposes an MCP (Model Context Protocol) server for tighter integration.
 
 **Tools exposed:**
-- `query` — Search a plain query with automatic expansion or provide typed sub-queries (`lex`/`vec`/`hyde`), then combine them via RRF + reranking
+- `query` — Vector + BM25 retrieval with independent TypeSafe ranking, or explicit typed retrieval variants (`lex`/`vec`/`hyde`)
 - `get` — Retrieve a document by path or docid (with fuzzy matching suggestions)
 - `multi_get` — Batch retrieve by glob pattern, comma-separated list, or docids
 - `status` — Index health and collection info
@@ -205,8 +210,8 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
 | `query` | `intent` | string | Disambiguation context (does not search on its own) |
 | `query` | `limit` | number | Max results (default 10) |
 | `query` | `minScore` | number | Minimum relevance 0–1 (default 0) |
-| `query` | `candidateLimit` | number | Max candidates to rerank (default 40) |
-| `query` | `rerank` | boolean | Run LLM reranking (default **true**); set false for RRF-only |
+| `query` | `candidateLimit` | number | Optional cap on candidates after deduplication |
+| `query` | `rerank` | boolean | TypeSafe scoring (default **true**); false explicitly keeps retrieval local |
 | `get` | `file` | string | Path, docid (`#abc123`), or `path:from:count` (e.g. `#abc123:120:40`) |
 | `get` | `fromLine` | number | Start line (1-indexed); overrides the `:from` suffix |
 | `get` | `maxLines` | number | Limit returned lines |
@@ -294,7 +299,7 @@ a model operation.
 The unified `search()` method handles both simple queries and pre-expanded structured queries:
 
 ```typescript
-// Simple query — auto-expanded via LLM, then BM25 + vector + reranking
+// Simple query — BM25 + literal vector recall, then TypeSafe scoring
 const results = await store.search({ query: "authentication flow" })
 
 // Vector-only search with expansion and exact winning chunk spans
@@ -489,39 +494,31 @@ The SDK requires explicit `dbPath` — no defaults are assumed. This makes it sa
 
 ## Architecture
 
-QMD probes BM25 first and can skip query expansion when that signal is already
-strong. Otherwise, the local expansion model produces typed variants: `lex`
-queries go only to BM25, while `vec` and `hyde` queries go only to vector
-search. The original query goes to both backends. RRF fuses those ranked lists,
-the top candidates are reranked, and a position-aware blend protects strong
-retrieval matches from reranker disagreement.
+Plain `query` retrieves `ceil(1.5 × limit)` candidates from each of vector and
+BM25 search, with no local query expansion. Filters apply before retrieval limits.
+BM25 selects a complete stored chunk using FTS match highlights (including
+prefixes, stemming, phrases and CJK matches); unembedded documents use
+deterministic chunking. Distinct excerpts from the same file remain separate.
+Each deduplicated excerpt is graded independently by TypeSafe and the highest
+usefulness scores are returned. `minScore` filters final usefulness, not cosine
+similarity. `candidateLimit` optionally caps the shortlist before scoring.
 
-## Score Normalization & Fusion
+Explicit typed queries still route `lex` to phrase/negation-aware BM25 and
+`vec`/`hyde` to vector search; each variant has the same retrieval budget.
+All variants share the TypeSafe ranking policy. No local rank blending follows it.
 
-### Search Backends
+Excerpts over 12,000 characters are skipped rather than truncated. Queries and
+intent are each limited to 12,000 characters. One `asOf` clock anchors temporal
+judgments; source dates are not assumed to date every claim. SDK callers with
+session-aware retrieval can supply `timeContext` bounds for grading separately
+from `allowedPaths` retrieval scope. Time context alone does not filter documents.
 
-| Backend | Raw Score | Conversion | Range |
-|---------|-----------|------------|-------|
-| **FTS (BM25)** | SQLite FTS5 BM25 | `abs(score) / (1 + abs(score))` | 0.0 to <1.0 |
-| **Vector** | sqlite-vec distance | `1 - distance` | Higher is better |
-| **Reranker** | `rankAll()` relevance | None | 0.0 to 1.0 |
+## Scores
 
-### Fusion Strategy
-
-The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware blending:
-
-1. **Query Expansion**: Keep the original query and generate typed `lex`, `vec`, and `hyde` variants unless the initial BM25 signal is already strong
-2. **Routed Retrieval**: Send the original query to both backends, `lex` variants to BM25, and `vec`/`hyde` variants to vector search
-3. **RRF Fusion**: Combine all result lists using `score = Σ(weight/(k+rank+1))` where k=60; original-query lists get 2x weight
-4. **Top-Rank Bonus**: Documents ranking #1 in any list get +0.05, #2-3 get +0.02
-5. **Top-K Selection**: Take the top 40 candidates by default (configurable with `--candidate-limit`)
-6. **Re-ranking**: Reuse an exact stored vector span when available; otherwise select a fallback chunk for the local reranker
-7. **Position-Aware Blending**:
-   - RRF rank 1-3: 75% retrieval, 25% reranker (preserves exact matches)
-   - RRF rank 4-10: 60% retrieval, 40% reranker
-   - RRF rank 11+: 40% retrieval, 60% reranker (trust reranker more)
-
-**Why this approach**: Pure RRF can dilute exact matches when expanded queries don't match. The top-rank bonus preserves documents that rank first in any retrieval list. Position-aware blending prevents the reranker from destroying high-confidence retrieval results.
+`query` returns TypeSafe usefulness normalized to 0–1. Confidence in `--explain`
+describes score concentration, not factual correctness. `vsearch` retains its
+vector similarity scores; `search` retains normalized BM25 scores. Without
+reranking, query uses the best reciprocal retrieval rank (1 / rank).
 
 ### Score Interpretation
 
@@ -881,8 +878,8 @@ and `deep-search` (→ `query`).
 --explain          # Include retrieval score traces (query, JSON/CLI output)
 --index <name>     # Use named index
 --intent "<text>"  # Disambiguation context (e.g. "web page load times")
---no-rerank        # Skip LLM reranking (RRF scores only; faster on CPU)
--C, --candidate-limit <n>  # Max candidates to rerank (default: 40)
+--no-rerank        # Local-only reciprocal-rank ordering; no TypeSafe calls
+-C, --candidate-limit <n>  # Optional cap on deduplicated candidates
 --full-path        # Emit on-disk filesystem paths instead of qmd:// URIs
                    # (a result whose file has moved or been deleted since
                    #  indexing keeps its qmd:// URI + docid, and a notice is
@@ -988,36 +985,28 @@ qmd search --md --full "error handling"
 # JSON output for scripting
 qmd query --json "quarterly reports"
 
-# Inspect how each result was scored (RRF + rerank blend)
+# Inspect TypeSafe score, confidence, evaluation time and retrieval methods
 qmd query --json --explain "quarterly reports"
 
 # Use separate index for different knowledge base
 qmd --index work search "quarterly reports"
 ```
 
-The `--explain` flag attaches a score breakdown to each result: the FTS/vector
-backend scores plus the RRF fusion math (rank, weight, top-rank bonus) and every
-sub-query's contribution. Abbreviated:
+The `--explain` flag attaches the scoring method, retrieval methods, evaluation
+time, policy version, confidence and level probabilities to each result:
 
 ```json
 {
-  "docid": "#6c90f0",
-  "score": 0.89,
-  "file": "qmd://qmd/README.md",
+  "score": 0.9,
+  "file": "qmd://docs/note.md",
   "explain": {
-    "ftsScores": [0.892, 0.907],
-    "vectorScores": [0.540, 0.484],
-    "rrf": {
-      "rank": 1,
-      "weight": 0.75,
-      "baseScore": 0.123,
-      "topRankBonus": 0.05,
-      "totalScore": 0.173,
-      "contributions": [
-        { "source": "fts", "queryType": "original", "query": "reranking",
-          "rank": 1, "weight": 2, "backendScore": 0.892, "rrfContribution": 0.0328 }
-      ]
-    }
+    "ranking": "typesafe",
+    "methods": ["vector", "bm25"],
+    "score": 0.9,
+    "asOf": "2026-09-18T12:00:00.000Z",
+    "policy": "jev-1.13.0:query-v1",
+    "confidence": 0.7,
+    "probabilities": { "0": 0, "1": 0, "2": 0.3, "3": 0.7 }
   }
 }
 ```
@@ -1105,7 +1094,7 @@ Each query runs against four backends, reporting precision@k, recall, MRR, and F
 | `bm25` | Keyword search only (FTS5) | No |
 | `vector` | Semantic similarity only | Embedding model |
 | `hybrid` | BM25 + vector fusion (no reranking) | Embedding model |
-| `full` | Full pipeline with LLM reranking | All three models |
+| `full` | Hybrid pipeline with TypeSafe scoring | Embedding model + TypeSafe credentials |
 
 **Score interpretation:** `1.00` = perfect (all expected docs in top results),
 `0.00` = complete miss. The example fixture typically shows bm25 ~0.50, vector

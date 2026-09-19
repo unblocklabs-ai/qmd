@@ -13,6 +13,8 @@
 
 import { openDatabase, loadSqliteVec } from "./db.js";
 import type { Database } from "./db.js";
+import { typesafeQuery } from "./query.js";
+import type { TypeSafeOptions } from "./typesafe-query.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
@@ -534,14 +536,6 @@ export function chunkDocumentWithBreakPoints(
   return chunks;
 }
 
-// Hybrid query: strong BM25 signal detection thresholds
-// Skip expensive LLM expansion when top result is strong AND clearly separated from runner-up
-export const STRONG_SIGNAL_MIN_SCORE = 0.85;
-export const STRONG_SIGNAL_MIN_GAP = 0.15;
-// Max candidates to pass to reranker — balances quality vs latency.
-// 40 keeps rank 31-40 visible to the reranker (matters for recall on broad queries).
-const RERANK_CANDIDATE_LIMIT = 40;
-
 /**
  * A typed query expansion result. Decoupled from llm.ts internal Queryable —
  * same shape, but store.ts owns its own public API type.
@@ -993,7 +987,7 @@ const STORE_SCHEMA_VERSION = 1;
  * Normalize CJK runs by spacing every character so exact CJK queries can be
  * translated into phrase queries while Latin text keeps the default tokenizer.
  */
-function normalizeCjkForFTS(text: string): string {
+export function normalizeCjkForFTS(text: string): string {
   return text.replace(CJK_RUN_PATTERN, run => ` ${Array.from(run).join(' ')} `);
 }
 
@@ -2045,6 +2039,13 @@ function withLazyContentVectorMigration<T>(db: Database, operation: () => T): T 
   }
 }
 
+/** Stored source spans; older indexes repair their columns only when first read. */
+export function getStoredChunkSpans(db: Database, hash: string): { pos: number; chunk_len: number }[] {
+  return withLazyContentVectorMigration(db, () => db.prepare(
+    "SELECT pos, chunk_len FROM content_vectors WHERE hash = ? ORDER BY pos, seq",
+  ).all<{ pos: number; chunk_len: number }>(hash));
+}
+
 function getPendingEmbeddingDocs(
   db: Database,
   collection?: string,
@@ -2673,19 +2674,13 @@ export type RRFScoreTrace = {
 };
 
 export type HybridQueryExplain = {
-  ftsScores: number[];
-  vectorScores: number[];
-  rrf: {
-    rank: number;          // Rank after RRF fusion (1-indexed)
-    positionScore: number; // 1 / rank used in position-aware blending
-    weight: number;        // Position-aware RRF weight (0.75 / 0.60 / 0.40)
-    baseScore: number;
-    topRankBonus: number;
-    totalScore: number;
-    contributions: RRFContributionTrace[];
-  };
-  rerankScore: number;
-  blendedScore: number;
+  ranking: "typesafe" | "retrieval";
+  methods: Array<"vector" | "bm25">;
+  score: number;
+  asOf: string;
+  policy?: string;
+  confidence?: number;
+  probabilities?: Record<"0" | "1" | "2" | "3", number>;
 };
 
 /**
@@ -5512,9 +5507,6 @@ export type SnippetResult = {
 /** Weight for intent terms relative to query terms (1.0) in snippet scoring */
 export const INTENT_WEIGHT_SNIPPET = 0.3;
 
-/** Weight for intent terms relative to query terms (1.0) in chunk selection */
-export const INTENT_WEIGHT_CHUNK = 0.5;
-
 // Common stop words filtered from intent strings before tokenization.
 // Seeded from finetune/reward.py KEY_TERM_STOPWORDS, extended with common
 // 2-3 char function words so the length threshold can drop to >1 and let
@@ -5677,12 +5669,18 @@ export interface SearchHooks {
 
 export interface HybridQueryOptions {
   collection?: string | readonly string[];
+  allowedPaths?: AllowedDocumentPaths;
+  trace?: VectorSearchTrace;
+  signal?: AbortSignal;
+  typesafe?: TypeSafeOptions;
+  /** Optional session-start bounds supplied by a session-aware caller, not claim dates. */
+  timeContext?: { sessionStartedFrom?: string; sessionStartedTo?: string };
   limit?: number;           // default 10
   minScore?: number;        // default 0
-  candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
-  explain?: boolean;        // include backend/RRF/rerank score traces
+  candidateLimit?: number;  // optional cap after deduplication; default all retrieved candidates
+  explain?: boolean;        // include TypeSafe judgment details
   intent?: string;          // domain intent hint for disambiguation
-  skipRerank?: boolean;     // skip LLM reranking, use only RRF scores
+  skipRerank?: boolean;     // explicit local-only reciprocal-rank ordering
   chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
 }
@@ -5694,7 +5692,7 @@ export interface HybridQueryResult {
   body: string;             // full document body (for snippet extraction)
   bestChunk: string;        // best chunk text
   bestChunkPos: number;     // char offset of best chunk in body
-  score: number;            // blended score (full precision)
+  score: number;            // TypeSafe usefulness, or retrieval rank when explicitly skipping scoring
   context: string | null;   // user-set context
   docid: string;            // content hash prefix (6 chars)
   explain?: HybridQueryExplain;
@@ -5706,358 +5704,11 @@ export type RankedListMeta = {
   query: string;
 };
 
-/**
- * RRF list weights for hybridQuery.
- *
- * Original-query retrieval paths are the primary evidence and get 2x weight:
- * - original FTS
- * - original vector search
- *
- * Expansion-derived lists (lex/vec/hyde) stay at 1x regardless of list order,
- * so a lex expansion inserted before original vector search cannot steal the
- * original vector boost.
- */
-export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] {
-  return rankedListMeta.map(meta => meta.queryType === "original" ? 2.0 : 1.0);
-}
-
-type RerankChunkMap = Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>;
-
-async function selectRerankChunks(
-  candidates: RankedResult[],
-  queryTerms: string[],
-  intentTerms: string[],
-  chunkStrategy?: ChunkStrategy,
-): Promise<RerankChunkMap> {
-  const selected: RerankChunkMap = new Map();
-
-  for (const candidate of candidates) {
-    const pos = candidate.chunkPos;
-    const len = candidate.chunkLen;
-    if (pos !== undefined && len !== undefined && pos >= 0 && len > 0 && pos + len <= candidate.body.length) {
-      selected.set(candidate.file, {
-        chunks: [{ text: candidate.body.slice(pos, pos + len), pos }],
-        bestIdx: 0,
-      });
-      continue;
-    }
-
-    const chunks = await chunkDocumentAsync(
-      candidate.body,
-      undefined, undefined, undefined,
-      candidate.file,
-      chunkStrategy === "semantic" ? "regex" : chunkStrategy,
-    );
-    if (chunks.length === 0) continue;
-
-    let bestIdx = 0;
-    let bestScore = -1;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkLower = chunks[i]!.text.toLowerCase();
-      let score = queryTerms.reduce((sum, term) => sum + (chunkLower.includes(term) ? 1 : 0), 0);
-      for (const term of intentTerms) {
-        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
-      }
-      if (score > bestScore) {
-        bestScore = score;
-        bestIdx = i;
-      }
-    }
-
-    selected.set(candidate.file, { chunks, bestIdx });
-  }
-
-  return selected;
-}
-
-/**
- * Hybrid search: BM25 + vector + query expansion + RRF + chunked reranking.
- *
- * Pipeline:
- * 1. BM25 probe → skip expansion if strong signal
- * 2. expandQuery() → typed query variants (lex/vec/hyde)
- * 3. Type-routed search: original→vector, lex→FTS, vec/hyde→vector
- * 4. RRF fusion → slice to candidateLimit
- * 5. chunkDocument() + keyword-best-chunk selection
- * 6. rerank on chunks (NOT full bodies — O(tokens) trap)
- * 7. Position-aware score blending (RRF rank × reranker score)
- * 8. Dedup by file, filter by minScore, slice to limit
- */
+/** BM25 + literal vector recall, deduplication and independent TypeSafe scoring. */
 export async function hybridQuery(
-  store: Store,
-  query: string,
-  options?: HybridQueryOptions
+  store: Store, query: string, options?: HybridQueryOptions,
 ): Promise<HybridQueryResult[]> {
-  const limit = options?.limit ?? 10;
-  const minScore = options?.minScore ?? 0;
-  const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
-  const collection = options?.collection;
-  const explain = options?.explain ?? false;
-  const intent = options?.intent;
-  const skipRerank = options?.skipRerank ?? false;
-  const hooks = options?.hooks;
-
-  const rankedLists: RankedResult[][] = [];
-  const rankedListMeta: RankedListMeta[] = [];
-  const docidMap = new Map<string, string>(); // filepath -> docid
-  const hasVectors = !!store.db.prepare(
-    `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
-  ).get();
-
-  // Step 1: BM25 probe — strong signal skips expensive LLM expansion
-  // When intent is provided, disable strong-signal bypass — the obvious BM25
-  // match may not be what the caller wants (e.g. "performance" with intent
-  // "web page load times" should NOT shortcut to a sports-performance doc).
-  // Pass collection directly into FTS query (filter at SQL level, not post-hoc)
-  const initialFts = store.searchFTS(query, 20, collection);
-  const topScore = initialFts[0]?.score ?? 0;
-  const secondScore = initialFts[1]?.score ?? 0;
-  const hasStrongSignal = !intent && initialFts.length > 0
-    && topScore >= STRONG_SIGNAL_MIN_SCORE
-    && (topScore - secondScore) >= STRONG_SIGNAL_MIN_GAP;
-
-  if (hasStrongSignal) hooks?.onStrongSignal?.(topScore);
-
-  // Step 2: Expand query (or skip if strong signal)
-  hooks?.onExpandStart?.();
-  const expandStart = Date.now();
-  const expanded = hasStrongSignal
-    ? []
-    : await store.expandQuery(query);
-
-  hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
-
-  // Seed with initial FTS results (avoid re-running original query FTS)
-  if (initialFts.length > 0) {
-    for (const r of initialFts) docidMap.set(r.filepath, r.docid);
-    rankedLists.push(initialFts.map(r => ({
-      file: r.filepath, displayPath: r.displayPath,
-      title: r.title, body: r.body || "", score: r.score,
-    })));
-    rankedListMeta.push({ source: "fts", queryType: "original", query });
-  }
-
-  // Step 3: Route searches by query type
-  //
-  // Strategy: run all FTS queries immediately (they're sync/instant), then
-  // batch-embed all vector queries in one embedBatch() call, then run
-  // sqlite-vec lookups with pre-computed embeddings.
-
-  // 3a: Run FTS for all lex expansions right away (no LLM needed)
-  for (const q of expanded) {
-    if (q.type === 'lex') {
-      const ftsResults = store.searchFTS(q.query, 20, collection);
-      if (ftsResults.length > 0) {
-        for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
-        rankedLists.push(ftsResults.map(r => ({
-          file: r.filepath, displayPath: r.displayPath,
-          title: r.title, body: r.body || "", score: r.score,
-        })));
-        rankedListMeta.push({ source: "fts", queryType: "lex", query: q.query });
-      }
-    }
-  }
-
-  // 3b: Collect all texts that need vector search (original query + vec/hyde expansions)
-  if (hasVectors) {
-    const vecQueries: { text: string; queryType: "original" | "vec" | "hyde" }[] = [
-      { text: query, queryType: "original" },
-    ];
-    for (const q of expanded) {
-      if (q.type === 'vec' || q.type === 'hyde') {
-        vecQueries.push({ text: q.query, queryType: q.type });
-      }
-    }
-
-    // Batch embed all vector queries in a single call
-    const llm = getLlm(store);
-    const embedModel = llm.embedModelName;
-    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
-    hooks?.onEmbedStart?.(textsToEmbed.length);
-    const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
-    hooks?.onEmbedDone?.(Date.now() - embedStart);
-
-    // Run sqlite-vec lookups with pre-computed embeddings
-    for (let i = 0; i < vecQueries.length; i++) {
-      const embedding = embeddings[i]?.embedding;
-      if (!embedding) continue;
-
-      const vecResults = await store.searchVec(
-        vecQueries[i]!.text, embedModel, 20, collection,
-        undefined, embedding
-      );
-      if (vecResults.length > 0) {
-        for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-        rankedLists.push(vecResults.map(r => ({
-          file: r.filepath, displayPath: r.displayPath,
-          title: r.title, body: r.body || "", score: r.score,
-          chunkPos: r.chunkPos, chunkLen: r.chunkLen,
-        })));
-        rankedListMeta.push({
-          source: "vec",
-          queryType: vecQueries[i]!.queryType,
-          query: vecQueries[i]!.text,
-        });
-      }
-    }
-  }
-
-  // Step 3c: drop a cached expansion whose sub-queries all came back empty —
-  // the dud is cached per (query, model), so left in place it deterministically
-  // replays the same misses on every warm repeat. Only judge sub-queries the
-  // store could actually run: on FTS-only stores, vec/hyde expansions never
-  // execute and say nothing about the expansion's quality.
-  if (expanded.length > 0) {
-    const runnable = expanded.filter(q => q.type === "lex" || hasVectors);
-    const expansionContributed = rankedListMeta.some(m => m.queryType !== "original");
-    if (runnable.length > 0 && !expansionContributed) {
-      store.invalidateExpansionCache(query);
-    }
-  }
-
-  // Step 4: RRF fusion — original-query FTS and vector lists get 2x weight;
-  // expansion-derived lists stay at 1x independent of insertion order.
-  const weights = getHybridRrfWeights(rankedListMeta);
-  const fused = reciprocalRankFusion(rankedLists, weights);
-  const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
-  const candidates = fused.slice(0, candidateLimit);
-
-  if (candidates.length === 0) return [];
-
-  // Step 5: Chunk documents, pick best chunk per doc for reranking.
-  // Reranking full bodies is O(tokens) — the critical perf lesson that motivated this refactor.
-  const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
-  const intentTerms = intent ? extractIntentTerms(intent) : [];
-  const chunkStrategy = options?.chunkStrategy;
-  const docChunkMap = await selectRerankChunks(candidates, queryTerms, intentTerms, chunkStrategy);
-
-  if (skipRerank) {
-    // Skip LLM reranking — return candidates scored by RRF only
-    const seenFiles = new Set<string>();
-    return candidates
-      .map((cand, i) => {
-        const chunkInfo = docChunkMap.get(cand.file);
-        const bestIdx = chunkInfo?.bestIdx ?? 0;
-        const bestChunk = chunkInfo?.chunks[bestIdx]?.text || cand.body || "";
-        const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
-        const rrfRank = i + 1;
-        const rrfScore = 1 / rrfRank;
-        const trace = rrfTraceByFile?.get(cand.file);
-        const explainData: HybridQueryExplain | undefined = explain ? {
-          ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-          vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
-          rrf: {
-            rank: rrfRank,
-            positionScore: rrfScore,
-            weight: 1.0,
-            baseScore: trace?.baseScore ?? 0,
-            topRankBonus: trace?.topRankBonus ?? 0,
-            totalScore: trace?.totalScore ?? 0,
-            contributions: trace?.contributions ?? [],
-          },
-          rerankScore: 0,
-          blendedScore: rrfScore,
-        } : undefined;
-
-        return {
-          file: cand.file,
-          displayPath: cand.displayPath,
-          title: cand.title,
-          body: cand.body,
-          bestChunk,
-          bestChunkPos,
-          score: rrfScore,
-          context: store.getContextForFile(cand.file),
-          docid: docidMap.get(cand.file) || "",
-          ...(explainData ? { explain: explainData } : {}),
-        };
-      })
-      .filter(r => {
-        if (seenFiles.has(r.file)) return false;
-        seenFiles.add(r.file);
-        return true;
-      })
-      .filter(r => r.score >= minScore)
-      .slice(0, limit);
-  }
-
-  // Step 6: Rerank chunks (NOT full bodies)
-  const chunksToRerank: { file: string; text: string }[] = [];
-  for (const cand of candidates) {
-    const chunkInfo = docChunkMap.get(cand.file);
-    if (chunkInfo) {
-      chunksToRerank.push({ file: cand.file, text: chunkInfo.chunks[chunkInfo.bestIdx]!.text });
-    }
-  }
-
-  hooks?.onRerankStart?.(chunksToRerank.length);
-  const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
-  hooks?.onRerankDone?.(Date.now() - rerankStart);
-
-  // Step 7: Blend RRF position score with reranker score
-  // Position-aware weights: top retrieval results get more protection from reranker disagreement
-  const candidateMap = new Map(candidates.map(c => [c.file, {
-    displayPath: c.displayPath, title: c.title, body: c.body,
-  }]));
-  const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
-
-  const blended = reranked.map(r => {
-    const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
-    let rrfWeight: number;
-    if (rrfRank <= 3) rrfWeight = 0.75;
-    else if (rrfRank <= 10) rrfWeight = 0.60;
-    else rrfWeight = 0.40;
-    const rrfScore = 1 / rrfRank;
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
-
-    const candidate = candidateMap.get(r.file);
-    const chunkInfo = docChunkMap.get(r.file);
-    const bestIdx = chunkInfo?.bestIdx ?? 0;
-    const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
-    const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
-    const trace = rrfTraceByFile?.get(r.file);
-    const explainData: HybridQueryExplain | undefined = explain ? {
-      ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-      vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
-      rrf: {
-        rank: rrfRank,
-        positionScore: rrfScore,
-        weight: rrfWeight,
-        baseScore: trace?.baseScore ?? 0,
-        topRankBonus: trace?.topRankBonus ?? 0,
-        totalScore: trace?.totalScore ?? 0,
-        contributions: trace?.contributions ?? [],
-      },
-      rerankScore: r.score,
-      blendedScore,
-    } : undefined;
-
-    return {
-      file: r.file,
-      displayPath: candidate?.displayPath || "",
-      title: candidate?.title || "",
-      body: candidate?.body || "",
-      bestChunk,
-      bestChunkPos,
-      score: blendedScore,
-      context: store.getContextForFile(r.file),
-      docid: docidMap.get(r.file) || "",
-      ...(explainData ? { explain: explainData } : {}),
-    };
-  }).sort((a, b) => b.score - a.score);
-
-  // Step 8: Dedup by file (safety net — prevents duplicate output)
-  const seenFiles = new Set<string>();
-  return blended
-    .filter(r => {
-      if (seenFiles.has(r.file)) return false;
-      seenFiles.add(r.file);
-      return true;
-    })
-    .filter(r => r.score >= minScore)
-    .slice(0, limit);
+  return typesafeQuery(store, query, options);
 }
 
 export interface VectorSearchOptions {
@@ -6155,57 +5806,19 @@ export async function vectorSearchQuery(
  * A single sub-search in a structured search request.
  * Matches the format used in QMD training data.
  */
-export interface StructuredSearchOptions {
-  collections?: string[];   // Filter to specific collections (OR match)
-  limit?: number;           // default 10
-  minScore?: number;        // default 0
-  candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
-  explain?: boolean;        // include backend/RRF/rerank score traces
-  /** Domain intent hint for disambiguation — steers reranking and chunk selection */
-  intent?: string;
-  /** Skip LLM reranking, use only RRF scores */
-  skipRerank?: boolean;
-  chunkStrategy?: ChunkStrategy;
-  hooks?: SearchHooks;
+export interface StructuredSearchOptions extends Omit<HybridQueryOptions, "collection"> {
+  collections?: string[];
 }
 
-/**
- * Structured search: execute pre-expanded queries without LLM query expansion.
- *
- * Designed for LLM callers (MCP/HTTP) that generate their own query expansions.
- * Skips the internal expandQuery() step — goes directly to:
- *
- * Pipeline:
- * 1. Route searches: lex→FTS, vec/hyde→vector (batch embed)
- * 2. RRF fusion across all result lists
- * 3. Chunk documents + keyword-best-chunk selection
- * 4. Rerank on chunks
- * 5. Position-aware score blending
- * 6. Dedup, filter, slice
- *
- * This is the recommended endpoint for capable LLMs — they can generate
- * better query variations than our small local model, especially for
- * domain-specific or nuanced queries.
- */
+/** Explicit typed retrieval variants, scored by the same TypeSafe query policy. */
 export async function structuredSearch(
-  store: Store,
-  searches: ExpandedQuery[],
-  options?: StructuredSearchOptions
+  store: Store, searches: ExpandedQuery[], options?: StructuredSearchOptions,
 ): Promise<HybridQueryResult[]> {
-  const limit = options?.limit ?? 10;
-  const minScore = options?.minScore ?? 0;
-  const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
-  const explain = options?.explain ?? false;
-  const intent = options?.intent;
-  const skipRerank = options?.skipRerank ?? false;
-  const hooks = options?.hooks;
-
-  const collections = options?.collections;
-
   if (searches.length === 0) return [];
-
+  if (searches.length > 10) throw new Error("query supports at most 10 typed searches");
   // Validate queries before executing
   for (const search of searches) {
+    if (!["lex", "vec", "hyde"].includes(search.type)) throw new Error("Unknown query search type");
     const location = search.line ? `Line ${search.line}` : 'Structured search';
     if (/[\r\n]/.test(search.query)) {
       throw new Error(`${location} (${search.type}): queries must be single-line. Remove newline characters.`);
@@ -6223,224 +5836,7 @@ export async function structuredSearch(
     }
   }
 
-  const rankedLists: RankedResult[][] = [];
-  const rankedListMeta: RankedListMeta[] = [];
-  const docidMap = new Map<string, string>(); // filepath -> docid
-  const hasVectors = !!store.db.prepare(
-    `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
-  ).get();
-
-  // Helper to run search across collections (or all if undefined)
-  const collectionList = collections ?? [undefined]; // undefined = all collections
-
-  // Step 1: Run FTS for all lex searches (sync, instant)
-  for (const search of searches) {
-    if (search.type === 'lex') {
-      for (const coll of collectionList) {
-        const ftsResults = store.searchFTS(search.query, 20, coll);
-        if (ftsResults.length > 0) {
-          for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
-          rankedLists.push(ftsResults.map(r => ({
-            file: r.filepath, displayPath: r.displayPath,
-            title: r.title, body: r.body || "", score: r.score,
-          })));
-          rankedListMeta.push({
-            source: "fts",
-            queryType: "lex",
-            query: search.query,
-          });
-        }
-      }
-    }
-  }
-
-  // Step 2: Batch embed and run vector searches for vec/hyde
-  if (hasVectors) {
-    const vecSearches = searches.filter(
-      (s): s is ExpandedQuery & { type: 'vec' | 'hyde' } =>
-        s.type === 'vec' || s.type === 'hyde'
-    );
-    if (vecSearches.length > 0) {
-      const llm = getLlm(store);
-      const embedModel = llm.embedModelName;
-      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
-      hooks?.onEmbedStart?.(textsToEmbed.length);
-      const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
-      hooks?.onEmbedDone?.(Date.now() - embedStart);
-
-      for (let i = 0; i < vecSearches.length; i++) {
-        const embedding = embeddings[i]?.embedding;
-        if (!embedding) continue;
-
-        for (const coll of collectionList) {
-          const vecResults = await store.searchVec(
-            vecSearches[i]!.query, embedModel, 20, coll,
-            undefined, embedding
-          );
-          if (vecResults.length > 0) {
-            for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-            rankedLists.push(vecResults.map(r => ({
-              file: r.filepath, displayPath: r.displayPath,
-              title: r.title, body: r.body || "", score: r.score,
-              chunkPos: r.chunkPos, chunkLen: r.chunkLen,
-            })));
-            rankedListMeta.push({
-              source: "vec",
-              queryType: vecSearches[i]!.type,
-              query: vecSearches[i]!.query,
-            });
-          }
-        }
-      }
-    }
-  }
-
-  if (rankedLists.length === 0) return [];
-
-  // Step 3: RRF fusion — first list gets 2x weight (assume caller ordered by importance)
-  const weights = rankedLists.map((_, i) => i === 0 ? 2.0 : 1.0);
-  const fused = reciprocalRankFusion(rankedLists, weights);
-  const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
-  const candidates = fused.slice(0, candidateLimit);
-
-  if (candidates.length === 0) return [];
-
-  hooks?.onExpand?.("", [], 0); // Signal no expansion (pre-expanded)
-
-  // Step 4: Chunk documents, pick best chunk per doc for reranking
-  // Use first lex query as the "query" for keyword matching, or first vec if no lex
-  const primaryQuery = searches.find(s => s.type === 'lex')?.query
-    || searches.find(s => s.type === 'vec')?.query
-    || searches[0]?.query || "";
-  const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
-  const intentTerms = intent ? extractIntentTerms(intent) : [];
-  const ssChunkStrategy = options?.chunkStrategy;
-  const docChunkMap = await selectRerankChunks(candidates, queryTerms, intentTerms, ssChunkStrategy);
-
-  if (skipRerank) {
-    // Skip LLM reranking — return candidates scored by RRF only
-    const seenFiles = new Set<string>();
-    return candidates
-      .map((cand, i) => {
-        const chunkInfo = docChunkMap.get(cand.file);
-        const bestIdx = chunkInfo?.bestIdx ?? 0;
-        const bestChunk = chunkInfo?.chunks[bestIdx]?.text || cand.body || "";
-        const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
-        const rrfRank = i + 1;
-        const rrfScore = 1 / rrfRank;
-        const trace = rrfTraceByFile?.get(cand.file);
-        const explainData: HybridQueryExplain | undefined = explain ? {
-          ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-          vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
-          rrf: {
-            rank: rrfRank,
-            positionScore: rrfScore,
-            weight: 1.0,
-            baseScore: trace?.baseScore ?? 0,
-            topRankBonus: trace?.topRankBonus ?? 0,
-            totalScore: trace?.totalScore ?? 0,
-            contributions: trace?.contributions ?? [],
-          },
-          rerankScore: 0,
-          blendedScore: rrfScore,
-        } : undefined;
-
-        return {
-          file: cand.file,
-          displayPath: cand.displayPath,
-          title: cand.title,
-          body: cand.body,
-          bestChunk,
-          bestChunkPos,
-          score: rrfScore,
-          context: store.getContextForFile(cand.file),
-          docid: docidMap.get(cand.file) || "",
-          ...(explainData ? { explain: explainData } : {}),
-        };
-      })
-      .filter(r => {
-        if (seenFiles.has(r.file)) return false;
-        seenFiles.add(r.file);
-        return true;
-      })
-      .filter(r => r.score >= minScore)
-      .slice(0, limit);
-  }
-
-  // Step 5: Rerank chunks
-  const chunksToRerank: { file: string; text: string }[] = [];
-  for (const cand of candidates) {
-    const chunkInfo = docChunkMap.get(cand.file);
-    if (chunkInfo) {
-      chunksToRerank.push({ file: cand.file, text: chunkInfo.chunks[chunkInfo.bestIdx]!.text });
-    }
-  }
-
-  hooks?.onRerankStart?.(chunksToRerank.length);
-  const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
-  hooks?.onRerankDone?.(Date.now() - rerankStart2);
-
-  // Step 6: Blend RRF position score with reranker score
-  const candidateMap = new Map(candidates.map(c => [c.file, {
-    displayPath: c.displayPath, title: c.title, body: c.body,
-  }]));
-  const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
-
-  const blended = reranked.map(r => {
-    const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
-    let rrfWeight: number;
-    if (rrfRank <= 3) rrfWeight = 0.75;
-    else if (rrfRank <= 10) rrfWeight = 0.60;
-    else rrfWeight = 0.40;
-    const rrfScore = 1 / rrfRank;
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
-
-    const candidate = candidateMap.get(r.file);
-    const chunkInfo = docChunkMap.get(r.file);
-    const bestIdx = chunkInfo?.bestIdx ?? 0;
-    const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
-    const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
-    const trace = rrfTraceByFile?.get(r.file);
-    const explainData: HybridQueryExplain | undefined = explain ? {
-      ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-      vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
-      rrf: {
-        rank: rrfRank,
-        positionScore: rrfScore,
-        weight: rrfWeight,
-        baseScore: trace?.baseScore ?? 0,
-        topRankBonus: trace?.topRankBonus ?? 0,
-        totalScore: trace?.totalScore ?? 0,
-        contributions: trace?.contributions ?? [],
-      },
-      rerankScore: r.score,
-      blendedScore,
-    } : undefined;
-
-    return {
-      file: r.file,
-      displayPath: candidate?.displayPath || "",
-      title: candidate?.title || "",
-      body: candidate?.body || "",
-      bestChunk,
-      bestChunkPos,
-      score: blendedScore,
-      context: store.getContextForFile(r.file),
-      docid: docidMap.get(r.file) || "",
-      ...(explainData ? { explain: explainData } : {}),
-    };
-  }).sort((a, b) => b.score - a.score);
-
-  // Step 7: Dedup by file
-  const seenFiles = new Set<string>();
-  return blended
-    .filter(r => {
-      if (seenFiles.has(r.file)) return false;
-      seenFiles.add(r.file);
-      return true;
-    })
-    .filter(r => r.score >= minScore)
-    .slice(0, limit);
+  return typesafeQuery(store, searches.map(s => s.type + ": " + s.query).join("\n"),
+    { ...options, collection: options?.collections },
+    searches.map(s => ({ ...s, ...(s.type === "lex" ? { expression: buildFTS5Query(s.query) } : {}) })));
 }

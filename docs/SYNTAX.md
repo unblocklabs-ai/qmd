@@ -28,7 +28,7 @@ newline        = "\n" ;
 
 ## Default Behavior
 
-A QMD query is either a single expand query or a multi-line query document. Any single-line query with no prefix is treated as an expand query and passed to the expansion model, which emits lex, vec, and hyde variants automatically.
+A QMD query is either a single natural-language query or a multi-line query document. A single-line query retrieves vector and BM25 candidates directly, then ranks deduplicated excerpts with TypeSafe. It does not call a local expansion model. The grammar's `expand_query` name and `expand:` spelling remain legacy aliases.
 
 ```
 # These are equivalent and cannot be combined with typed lines:
@@ -100,11 +100,11 @@ expand: error handling best practices
 error handling best practices
 ```
 
-Both forms call the local query expansion model, which generates lex, vec, and hyde variations automatically.
+Both forms now run literal vector + BM25 recall and TypeSafe scoring. Neither invokes local query expansion.
 
 ## Intent
 
-An optional `intent:` line provides background context to disambiguate ambiguous queries. It steers query expansion, reranking, and snippet extraction but does not search on its own.
+An optional `intent:` line provides background context to disambiguate ambiguous queries. It steers TypeSafe scoring and snippet/chunk selection but does not search on its own.
 
 - At most one `intent:` line per query document
 - `intent:` cannot appear alone — at least one `lex:`, `vec:`, or `hyde:` line is required

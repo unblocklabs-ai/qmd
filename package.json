@@ -1,7 +1,7 @@
 {
   "name": "@unblocklabs/qmd",
   "version": "2.9.6",
-  "description": "Query Markup Documents - On-device hybrid search for markdown files with BM25, vector search, and LLM reranking",
+  "description": "Query Markup Documents - Local BM25/vector retrieval with TypeSafe-ranked hybrid queries",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

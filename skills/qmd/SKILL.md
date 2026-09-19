@@ -34,13 +34,12 @@ qmd search "merchant reality support interviews" -n 5
 qmd multi-get "#abc123,#def432" --format md
 ```
 
-**Default to structured `qmd query` with `intent:`, `lex:`, `vec:`, and `hyde:`
-fields that you write yourself.** You are a better query expander than the
-built-in model: you know the user's actual goal, the domain vocabulary, and the
-nearby-but-wrong concepts to avoid. Do not just paste the user's words into
-`qmd query "..."` and hope the expansion model guesses right — supply the
-`intent:` and craft the lexical and semantic terms deliberately (see
-[Pick the right search mode](#pick-the-right-search-mode)).
+Use `qmd query` for vector + BM25 retrieval followed by TypeSafe ranking.
+Plain natural-language queries use both backends without local expansion.
+Add `--intent` or explicit typed variants when you have useful disambiguating
+context. `query` sends selected excerpts, source paths, query and intent to
+TypeSafe, using `TYPESAFE_API_KEY` or `TYPESAFE_API_KEY_FILE` configured in the
+process environment. Scope collections appropriately; never print credentials.
 
 When reporting what you retrieved, a compact note is enough; do not paste whole
 files unless needed:
@@ -61,39 +60,26 @@ qmd search "cockpit OKR Goodhart" -n 10
 qmd search '"AI Before Headcount"' -c concepts -n 5
 ```
 
-Use **`qmd query` with structured fields** when the user describes an idea
-indirectly, uses different wording than the source, or needs conceptual recall.
-**This is the default mode — write the fields yourself rather than leaning on
-query expansion.** Combine exact anchors with semantic recall:
+Use **`qmd query`** for semantic + keyword recall, ranked by usefulness:
 
 ```bash
-qmd query $'intent: Find the concept note about metrics as instruments without letting OKRs replace judgment.\nlex: cockpit instruments OKR Goodhart metrics judgment\nvec: data informed not metric driven product judgment\nhyde: A concept note says metrics are useful like cockpit instruments, but leaders should remain data-informed rather than metric-driven because OKRs and dashboards can Goodhart product judgment.'
+qmd query "how do we use metrics without becoming metric-driven?" -n 10
+qmd query "performance" --intent "web page latency, not sports" --explain
 ```
 
-Structured query fields (you author each one — do not delegate this to the
-expansion model):
-
-- `intent:` states what you are trying to find **and what to avoid**. Always
-  supply this. It steers ranking away from nearby-but-wrong concepts.
-- `lex:` exact terms, aliases, titles, code symbols, and rare words you expect
-  in the source. This is your own keyword expansion.
-- `vec:` paraphrases the idea in natural language, in source-like wording.
-- `hyde:` describes the document or answer that would satisfy the request.
-
-You do not need all four every time, but you should almost always write at least
-`intent:` plus one of `lex:`/`vec:`. A bare `qmd query "the user's sentence"`
-throws away the context only you have and relies on the built-in expander to
-reconstruct it — prefer the structured form.
-
-If you genuinely have nothing to expand (a single rare token, a verbatim phrase),
-that is a job for `qmd search`, not bare `qmd query`:
+Optional structured fields let you author retrieval variants:
+- `intent:` disambiguates the request; it does not retrieve by itself.
+- `lex:` exact terms, aliases, quoted phrases and exclusions.
+- `vec:` a natural-language semantic query.
+- `hyde:` a hypothetical source passage, not a factual assertion.
 
 ```bash
-qmd query --format json --explain $'intent: ...\nlex: ...\nvec: ...'  # inspect ranking
+qmd query $'intent: web latency, not sports\nlex: "connection pool" -redis\nvec: why do connections time out under load'
 ```
 
-If `qmd query` is slow or model/GPU setup fails, fall back to `qmd search` with
-better lexical terms.
+`vsearch` remains vector-only. If TypeSafe is unavailable or local-only search
+is needed, use `qmd vsearch`, `qmd search`, or explicit `query --no-rerank`.
+A high usefulness score is not proof; inspect source dates and attribution.
 
 ## Retrieve sources
 
@@ -201,7 +187,8 @@ Omit `-c` to search everything.
 
 ## MCP Tool: `query`
 
-When using the MCP server, prefer structured searches:
+The MCP tool keeps the name `query`. Pass `query` for plain hybrid recall, or
+`searches` for explicit typed variants:
 
 ```json
 {
@@ -278,9 +265,8 @@ server configuration.
 - **Do not slice files with `sed`/`head`/`tail`.** Use the `path:from:count`
   suffix (e.g. `qmd get "#abc123:120:40"`) or `--from`/`-l`. Output is already
   line-numbered; piping breaks docid resolution, the header, and virtual paths.
-- **Do not lean on query expansion.** Write `intent:`/`lex:`/`vec:`/`hyde:`
-  yourself. A bare `qmd query "user sentence"` discards the context only you
-  have. You expand the query; the model just ranks.
+- **No automatic query expansion.** Add intent or typed variants when they
+  improve recall; plain queries already search both vector and BM25.
 - **Do not overuse semantic search.** If you know exact titles or terms, BM25 is
   faster and often better.
 - **Do not mutate indexes casually.** `qmd collection add`, `qmd update`, and
@@ -288,8 +274,8 @@ server configuration.
 - **Model-backed commands can be environment-sensitive.** If `qmd query`,
   `qmd vsearch`, or reranking fails because local models/GPU are unavailable,
   use `qmd search` and stronger lexical/structured terms.
-- **Ambiguous user wording needs intent.** Add `intent:` rather than hoping query
-  expansion guesses the right domain.
+- **Ambiguous user wording benefits from intent.** Add `intent:` to distinguish
+  the requested domain from nearby-but-wrong concepts.
 - **Collection names matter.** Search `concepts` for synthesized wiki pages,
   `sources` for transcripts/raw source pages, and docs collections for code or
   project documentation.

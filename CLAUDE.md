@@ -22,7 +22,7 @@ qmd doctor                        # Diagnose config, index, model, and device is
 qmd update                        # Re-index collections; configured update hooks run first
 qmd trust [list|revoke]           # Approve a checked-in .qmd config's hooks/paths/models
 qmd embed                         # Generate vector embeddings (uses node-llama-cpp)
-qmd query <query>                 # Search with query expansion + reranking (recommended)
+qmd query <query>                 # Vector + BM25 retrieval, then TypeSafe ranking
 qmd search <query>                # Full-text keyword search (BM25, no LLM)
 qmd vsearch <query>               # Vector similarity search (no reranking)
 qmd bench <fixture.json>          # Run search-quality benchmarks
@@ -121,7 +121,7 @@ qmd multi-get "#abc123, #def456"
 --min-score <num>        # Minimum score threshold
 --full                   # Show full document content
 --intent <text>          # Describe what you're after to sharpen ranking (query)
---no-rerank              # Skip LLM reranking (faster, lower quality)
+--no-rerank              # Explicit local-only retrieval; no TypeSafe calls
 --full-path              # Show on-disk paths instead of qmd:// URIs
 
 # Get / multi-get
@@ -154,8 +154,8 @@ bun test --preload ./src/test-preload.ts test/
 
 - SQLite FTS5 for full-text search (BM25)
 - sqlite-vec for vector similarity search
-- node-llama-cpp for embeddings (embeddinggemma), reranking (qwen3-reranker), and query expansion (Qwen3)
-- Reciprocal Rank Fusion (RRF) for combining results
+- node-llama-cpp for local embeddings; vsearch and explicit expansion/rerank primitives retain their existing behavior
+- query merges vector + BM25 excerpts and uses TypeSafe; set TYPESAFE_API_KEY or TYPESAFE_API_KEY_FILE
 - Smart chunking: 900 tokens/chunk with 15% overlap, prefers markdown headings as boundaries
 - AST-aware chunking: use `--chunk-strategy auto` to chunk code files (.ts/.js/.py/.go/.rs) at function/class/import boundaries via tree-sitter. Default is `regex` (existing behavior). Markdown and unknown file types always use regex chunking.
 

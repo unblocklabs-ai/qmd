@@ -660,8 +660,7 @@ describe("search (unified API)", () => {
     expect(results).toHaveLength(1);
   });
 
-  // Tests below use search({ query: ... }) which triggers LLM query expansion
-  describe.skipIf(!!process.env.CI)("with LLM query expansion", () => {
+  describe("literal hybrid retrieval without TypeSafe", () => {
     test("search() with query and rerank:false returns results", async () => {
       const results = await store.search({ query: "authentication", rerank: false });
       expect(results.length).toBeGreaterThan(0);

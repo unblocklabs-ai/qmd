@@ -53,15 +53,12 @@ import {
   syncConfigToDb,
   reindexCollection,
   resolveVirtualPath,
-  STRONG_SIGNAL_MIN_SCORE,
-  STRONG_SIGNAL_MIN_GAP,
   insertContent,
   insertDocument,
   cleanupOrphanedVectors,
   generateEmbeddings,
   getHashesNeedingEmbedding,
   clearAllEmbeddings,
-  getHybridRrfWeights,
   _resetProductionModeForTesting,
   hybridQuery,
   structuredSearch,
@@ -70,7 +67,6 @@ import {
   type DocumentResult,
   type SearchResult,
   type RankedResult,
-  type RankedListMeta,
   type VectorSearchStage,
 } from "../src/store.js";
 import { createStore as createSdkStore } from "../src/index.js";
@@ -1334,49 +1330,6 @@ describe("Query expansion cache (#818)", () => {
     }
   });
 
-  test("hybridQuery drops a cached expansion whose sub-queries contributed nothing", async () => {
-    const store = await createTestStore();
-    try {
-      await insertTestDocument(store.db, "docs", {
-        name: "alpha",
-        title: "Alpha Bravo",
-        body: "# Alpha\n\nalpha bravo charlie content.",
-      });
-      const model = store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL;
-      const cacheKey = getCacheKey("expandQuery", { query: "alpha bravo", model });
-      store.setCachedResult(cacheKey, JSON.stringify([{ type: "lex", query: "zzzqqq wwwuuu" }]));
-
-      // intent disables the strong-signal bypass so the cached expansion is
-      // actually consulted; it no longer reaches the expansion model itself.
-      await hybridQuery(store, "alpha bravo", { limit: 5, minScore: 0, skipRerank: true, intent: "unrelated meta commentary" });
-
-      // The dud expansion found nothing — it must not survive to poison the
-      // next warm repeat of this query.
-      expect(store.getCachedResult(cacheKey)).toBeNull();
-    } finally {
-      await cleanupTestDb(store);
-    }
-  });
-
-  test("hybridQuery keeps a cached expansion that contributed results", async () => {
-    const store = await createTestStore();
-    try {
-      await insertTestDocument(store.db, "docs", {
-        name: "alpha",
-        title: "Alpha Bravo",
-        body: "# Alpha\n\nalpha bravo charlie content.",
-      });
-      const model = store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL;
-      const cacheKey = getCacheKey("expandQuery", { query: "alpha bravo", model });
-      store.setCachedResult(cacheKey, JSON.stringify([{ type: "lex", query: "charlie" }]));
-
-      await hybridQuery(store, "alpha bravo", { limit: 5, minScore: 0, skipRerank: true, intent: "unrelated meta commentary" });
-
-      expect(store.getCachedResult(cacheKey)).not.toBeNull();
-    } finally {
-      await cleanupTestDb(store);
-    }
-  });
 });
 
 
@@ -1857,14 +1810,14 @@ describe("FTS Search", () => {
     const secondScore = results[1]!.score;
 
     // With correct normalization: strong match should be well above threshold
-    expect(topScore).toBeGreaterThanOrEqual(STRONG_SIGNAL_MIN_SCORE);
+    expect(topScore).toBeGreaterThanOrEqual(0.85);
 
     // Gap should exceed threshold when there's a dominant match
     const gap = topScore - secondScore;
-    expect(gap).toBeGreaterThanOrEqual(STRONG_SIGNAL_MIN_GAP);
+    expect(gap).toBeGreaterThanOrEqual(0.15);
 
     // Full strong signal check should pass (this was dead code before the fix)
-    const hasStrongSignal = topScore >= STRONG_SIGNAL_MIN_SCORE && gap >= STRONG_SIGNAL_MIN_GAP;
+    const hasStrongSignal = topScore >= 0.85 && gap >= 0.15;
     expect(hasStrongSignal).toBe(true);
 
     await cleanupTestDb(store);
@@ -2754,38 +2707,6 @@ describe("Reciprocal Rank Fusion", () => {
 
     // doc1 should rank higher due to weight
     expect(fused[0]!.file).toBe("doc1");
-  });
-
-  test("hybrid RRF weights boost original vector evidence over expansion-only hits", () => {
-    const originalFtsOnly = makeResult("original-fts-only.md", 0.95);
-    const expansionOnly = makeResult("lex-expansion-only.md", 0.95);
-    const originalVector = makeResult("original-vector.md", 0.95);
-
-    // Mirrors hybridQuery's common list order when a lex expansion exists:
-    // original FTS, lex expansion FTS, original vector.
-    const rankedLists = [
-      [originalFtsOnly],
-      [expansionOnly],
-      [originalVector],
-    ];
-    const rankedListMeta: RankedListMeta[] = [
-      { source: "fts", queryType: "original", query: "user query" },
-      { source: "fts", queryType: "lex", query: "lex expansion" },
-      { source: "vec", queryType: "original", query: "user query" },
-    ];
-
-    const positionBasedWeights = rankedLists.map((_, i) => i < 2 ? 2.0 : 1.0);
-    const buggyOrder = reciprocalRankFusion(rankedLists, positionBasedWeights);
-
-    expect(buggyOrder.findIndex(r => r.file === "lex-expansion-only.md"))
-      .toBeLessThan(buggyOrder.findIndex(r => r.file === "original-vector.md"));
-
-    const semanticWeights = getHybridRrfWeights(rankedListMeta);
-    const fixedOrder = reciprocalRankFusion(rankedLists, semanticWeights);
-
-    expect(semanticWeights).toEqual([2.0, 1.0, 2.0]);
-    expect(fixedOrder.findIndex(r => r.file === "original-vector.md"))
-      .toBeLessThan(fixedOrder.findIndex(r => r.file === "lex-expansion-only.md"));
   });
 
   test("RRF adds top-rank bonus", () => {
@@ -4924,7 +4845,7 @@ describe("Embedding batching", () => {
     }
   });
 
-  test("hybridQuery uses the active llm embed model for precomputed vector lookups", async () => {
+  test("hybridQuery uses the active llm embed model for literal vector lookups", async () => {
     const store = await createTestStore();
     const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
     const embedBatchSpy = vi.fn(async (texts: string[]) => texts.map(() => ({
@@ -4945,57 +4866,18 @@ describe("Embedding batching", () => {
     try {
       await hybridQuery(store, "hybrid query", { limit: 5, minScore: 0, skipRerank: true });
 
-      expect(embedBatchSpy).toHaveBeenCalledTimes(1);
+      expect(embedBatchSpy).not.toHaveBeenCalled();
       expect(searchVecSpy).toHaveBeenCalledTimes(1);
       expect(searchVecSpy.mock.calls[0]?.[0]).toBe("hybrid query");
       expect(searchVecSpy.mock.calls[0]?.[1]).toBe(model);
-      expect(searchVecSpy.mock.calls[0]?.[5]).toEqual([1, 2, 3]);
+      expect(searchVecSpy.mock.calls[0]?.[5]).toBeUndefined();
     } finally {
       await cleanupTestDb(store);
     }
   });
 
-  test("hybridQuery routes lex expansions to FTS and vec/hyde to vector search (#680)", async () => {
-    const store = await createTestStore();
-    const model = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
-    const embedBatchSpy = vi.fn(async (texts: string[]) => texts.map(() => ({
-      embedding: [1, 2, 3],
-      model,
-    })));
-    const searchVecSpy = vi.fn(async () => [] as SearchResult[]) as any;
-    const searchFtsSpy = vi.fn(() => [] as SearchResult[]) as any;
 
-    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
-    store.llm = {
-      embedModelName: model,
-      embedBatch: embedBatchSpy,
-    } as any;
-    store.searchVec = searchVecSpy as any;
-    store.searchFTS = searchFtsSpy as any;
-    store.expandQuery = vi.fn(async () => [
-      { type: "lex", query: "keyword terms" },
-      { type: "vec", query: "semantic sentence" },
-      { type: "hyde", query: "hypothetical snippet" },
-    ]) as any;
-
-    try {
-      await hybridQuery(store, "user query", { limit: 5, minScore: 0, skipRerank: true });
-
-      const ftsQueries = searchFtsSpy.mock.calls.map((call: unknown[]) => call[0]);
-      const vecQueries = searchVecSpy.mock.calls.map((call: unknown[]) => call[0]);
-
-      expect(ftsQueries).toEqual(["user query", "keyword terms"]);
-      expect(ftsQueries).not.toContain("semantic sentence");
-      expect(ftsQueries).not.toContain("hypothetical snippet");
-
-      expect(vecQueries).toEqual(["user query", "semantic sentence", "hypothetical snippet"]);
-      expect(vecQueries).not.toContain("keyword terms");
-    } finally {
-      await cleanupTestDb(store);
-    }
-  });
-
-  test("structuredSearch uses the active llm embed model for precomputed vector lookups", async () => {
+  test("structuredSearch uses the active llm embed model for vector lookups", async () => {
     const store = await createTestStore();
     const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
     const embedBatchSpy = vi.fn(async (texts: string[]) => texts.map(() => ({
@@ -5018,81 +4900,16 @@ describe("Embedding batching", () => {
         skipRerank: true,
       });
 
-      expect(embedBatchSpy).toHaveBeenCalledTimes(1);
+      expect(embedBatchSpy).not.toHaveBeenCalled();
       expect(searchVecSpy).toHaveBeenCalledTimes(1);
       expect(searchVecSpy.mock.calls[0]?.[0]).toBe("structured query");
       expect(searchVecSpy.mock.calls[0]?.[1]).toBe(model);
-      expect(searchVecSpy.mock.calls[0]?.[5]).toEqual([1, 2, 3]);
+      expect(searchVecSpy.mock.calls[0]?.[5]).toBeUndefined();
     } finally {
       await cleanupTestDb(store);
     }
   });
 
-  test("hybrid and structured reranking use the exact vector chunk span", async () => {
-    const store = await createTestStore();
-    const model = "hf:test/vector-span-model.gguf";
-    const prefix = "Lexical query terms appear here, outside the embedded span. ";
-    const exactChunk = "Exact semantic memory.";
-    const body = `${prefix}${exactChunk} Trailing context.`;
-    const filepath = "qmd://docs/memory.md";
-    const vectorResult: SearchResult = {
-      filepath,
-      displayPath: "docs/memory.md",
-      title: "Memory",
-      context: null,
-      hash: "spanhash",
-      docid: "spanha",
-      collectionName: "docs",
-      modifiedAt: "",
-      bodyLength: body.length,
-      body,
-      score: 0.9,
-      source: "vec",
-      chunkPos: prefix.length,
-      chunkLen: exactChunk.length,
-    };
-    const rerankSpy = vi.fn(async (_query: string, documents: { file: string; text: string }[]) =>
-      documents.map(document => ({ file: document.file, score: 0.8 }))
-    );
-
-    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
-    store.llm = {
-      embedModelName: model,
-      async embedBatch(texts: string[]) {
-        return texts.map(() => ({ embedding: [1, 2, 3], model }));
-      },
-    } as any;
-    store.searchFTS = vi.fn(() => []) as any;
-    store.searchVec = vi.fn(async () => [vectorResult]) as any;
-    store.expandQuery = vi.fn(async () => []) as any;
-    store.rerank = rerankSpy as any;
-
-    try {
-      const hybrid = await hybridQuery(store, "lexical query", { limit: 1, minScore: 0 });
-      expect(rerankSpy).toHaveBeenLastCalledWith(
-        "lexical query",
-        [{ file: filepath, text: exactChunk }],
-        undefined,
-        undefined,
-      );
-      expect(hybrid[0]).toMatchObject({ bestChunk: exactChunk, bestChunkPos: prefix.length });
-
-      rerankSpy.mockClear();
-      const structured = await structuredSearch(store, [{ type: "vec", query: "lexical query" }], {
-        limit: 1,
-        minScore: 0,
-      });
-      expect(rerankSpy).toHaveBeenLastCalledWith(
-        "lexical query",
-        [{ file: filepath, text: exactChunk }],
-        undefined,
-        undefined,
-      );
-      expect(structured[0]).toMatchObject({ bestChunk: exactChunk, bestChunkPos: prefix.length });
-    } finally {
-      await cleanupTestDb(store);
-    }
-  });
 
   test("generateEmbeddings rejects invalid batch limits", async () => {
     const store = await createTestStore();

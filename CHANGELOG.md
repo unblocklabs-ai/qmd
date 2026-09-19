@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Select BM25 excerpts using actual FTS matches so prefix, stemmed and CJK hits
+  do not grade an unrelated introduction. Preserve original source spans.
+- Repair legacy chunk metadata lazily when SDK queries read stored spans, even
+  when no status or embedding call has run first.
+
+### Changed
+
+- Replace `query`'s local expansion/reranking pipeline with literal vector + BM25
+  retrieval, source-excerpt deduplication and independent TypeSafe usefulness
+  scoring. CLI, MCP and SDK retain existing names; `vsearch` is unchanged.
+- Query uses `TYPESAFE_API_KEY` or `TYPESAFE_API_KEY_FILE` (raw key or dotenv), or
+  explicit SDK credentials. It sends selected excerpts, query, source paths,
+  optional intent and time context to TypeSafe. Missing keys and scoring failures
+  fail explicitly; `--no-rerank` / `rerank:false` remains local-only.
+- Query scores and `--explain` now describe TypeSafe usefulness rather than an
+  RRF/local-reranker blend. Different passages from the same source are retained.
+
 ## [2.9.6] - 2026-09-18
 
 ### Fixed

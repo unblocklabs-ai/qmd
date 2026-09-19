@@ -17,7 +17,6 @@ import {
   extractSnippet,
   extractIntentTerms,
   INTENT_WEIGHT_SNIPPET,
-  INTENT_WEIGHT_CHUNK,
   type ExpandedQuery,
 } from "../src/store.js";
 
@@ -294,102 +293,6 @@ describe("extractSnippet intent weight behavior", () => {
 });
 
 // =============================================================================
-// Chunk selection scoring with intent
-// =============================================================================
-
-describe("intent keyword extraction logic", () => {
-  // Mirrors the chunk selection scoring in hybridQuery, using the shared
-  // extractIntentTerms helper and INTENT_WEIGHT_CHUNK constant.
-  function scoreChunk(text: string, query: string, intent?: string): number {
-    const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
-    const intentTerms = intent ? extractIntentTerms(intent) : [];
-    const lower = text.toLowerCase();
-    const qScore = queryTerms.reduce((acc, term) => acc + (lower.includes(term) ? 1 : 0), 0);
-    const iScore = intentTerms.reduce((acc, term) => acc + (lower.includes(term) ? INTENT_WEIGHT_CHUNK : 0), 0);
-    return qScore + iScore;
-  }
-
-  const chunks = [
-    "Web performance: optimize page load times, reduce latency, improve rendering pipeline.",
-    "Team performance: build trust, give feedback, set clear expectations for the group.",
-    "Health performance: exercise regularly, sleep 8 hours, manage stress for endurance.",
-  ];
-
-  test("without intent, all chunks score equally on 'performance'", () => {
-    const scores = chunks.map(c => scoreChunk(c, "performance"));
-    // All contain "performance", so all score 1
-    expect(scores[0]).toBe(scores[1]);
-    expect(scores[1]).toBe(scores[2]);
-  });
-
-  test("with web intent, web chunk scores highest", () => {
-    const intent = "looking for notes about page load times and latency optimization";
-    const scores = chunks.map(c => scoreChunk(c, "performance", intent));
-    expect(scores[0]).toBeGreaterThan(scores[1]!);
-    expect(scores[0]).toBeGreaterThan(scores[2]!);
-  });
-
-  test("with health intent, health chunk scores highest", () => {
-    const intent = "looking for notes about exercise, sleep, and endurance";
-    const scores = chunks.map(c => scoreChunk(c, "performance", intent));
-    expect(scores[2]).toBeGreaterThan(scores[0]!);
-    expect(scores[2]).toBeGreaterThan(scores[1]!);
-  });
-
-  test("intent terms have lower weight than query terms (1.0)", () => {
-    const intent = "looking for latency";
-    // Chunk 0 has "performance" (query: 1.0) + "latency" (intent: INTENT_WEIGHT_CHUNK) = 1.5
-    const withBoth = scoreChunk(chunks[0]!, "performance", intent);
-    const queryOnly = scoreChunk(chunks[0]!, "performance");
-    expect(withBoth).toBe(queryOnly + INTENT_WEIGHT_CHUNK);
-  });
-
-  test("stop words are filtered, short domain terms survive", () => {
-    const intent = "the art of web performance";
-    // "the" (stop word), "art" (survives), "of" (stop word),
-    // "web" (survives), "performance" (survives)
-    // intent terms after filtering: ["art", "web", "performance"]
-    // Chunk 0 has "web" + "performance" → 2 intent hits (no "art")
-    // Chunks 1,2 have "performance" only → 1 intent hit
-    const scores = chunks.map(c => scoreChunk(c, "test", intent));
-    expect(scores[0]).toBe(INTENT_WEIGHT_CHUNK * 2); // "web" + "performance"
-    expect(scores[1]).toBe(INTENT_WEIGHT_CHUNK);      // "performance" only
-    expect(scores[2]).toBe(INTENT_WEIGHT_CHUNK);      // "performance" only
-  });
-});
-
-// =============================================================================
-// Strong-signal bypass with intent
-// =============================================================================
-
-describe("strong-signal bypass logic", () => {
-  // Mirrors the logic in hybridQuery:
-  // const hasStrongSignal = !intent && topScore >= STRONG_SIGNAL_MIN_SCORE && gap >= STRONG_SIGNAL_MIN_GAP
-  function hasStrongSignal(topScore: number, secondScore: number, intent?: string): boolean {
-    return !intent
-      && topScore >= 0.85
-      && (topScore - secondScore) >= 0.15;
-  }
-
-  test("strong signal detected without intent", () => {
-    expect(hasStrongSignal(0.90, 0.70)).toBe(true);
-  });
-
-  test("strong signal bypassed when intent provided", () => {
-    expect(hasStrongSignal(0.90, 0.70, "looking for health performance")).toBe(false);
-  });
-
-  test("weak signal not affected by intent", () => {
-    expect(hasStrongSignal(0.50, 0.45)).toBe(false);
-    expect(hasStrongSignal(0.50, 0.45, "some intent")).toBe(false);
-  });
-
-  test("close scores not strong even without intent", () => {
-    expect(hasStrongSignal(0.90, 0.80)).toBe(false); // gap < 0.15
-  });
-});
-
-// =============================================================================
 // parseStructuredQuery with intent
 // =============================================================================
 
@@ -507,7 +410,5 @@ describe("intent constants", () => {
     expect(INTENT_WEIGHT_SNIPPET).toBe(0.3);
   });
 
-  test("INTENT_WEIGHT_CHUNK is 0.5", () => {
-    expect(INTENT_WEIGHT_CHUNK).toBe(0.5);
-  });
+
 });

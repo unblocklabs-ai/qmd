@@ -134,7 +134,7 @@ async function buildInstructions(store: QMDStore): Promise<string> {
 
   // --- Search tool ---
   lines.push("");
-  lines.push("Search: Use `query` with sub-queries (lex/vec/hyde):");
+  lines.push("Search: `query` combines vector + BM25 recall and TypeSafe ranking. Plain query or typed variants:");
   lines.push("  - type:'lex' — BM25 keyword search (exact terms, fast)");
   lines.push("  - type:'vec' — semantic vector search (meaning-based)");
   lines.push("  - type:'hyde' — hypothetical document (write what the answer looks like)");
@@ -252,92 +252,33 @@ async function createMcpServer(store: QMDStore, inflight?: InflightGate): Promis
     "query",
     {
       title: "Query",
-      description: `Search the knowledge base using a query document — one or more typed sub-queries combined for best recall.
-
-Each result includes a \`line\` field with the absolute 1-indexed line of the best match in the source markdown. To read more context around a hit, call \`get(file, fromLine = max(1, line - 20), maxLines = 80, lineNumbers = true)\`.
-
-## Query Types
-
-**lex** — BM25 keyword search. Fast, exact, no LLM needed.
-Full lex syntax:
-- \`term\` — prefix match ("perf" matches "performance")
-- \`"exact phrase"\` — phrase must appear verbatim
-- \`-term\` or \`-"phrase"\` — exclude documents containing this
-
-Good lex examples:
-- \`"connection pool" timeout -redis\`
-- \`"machine learning" -sports -athlete\`
-- \`handleError async typescript\`
-
-**vec** — Semantic vector search. Write a natural language question. Finds documents by meaning, not exact words.
-- \`how does the rate limiter handle burst traffic?\`
-- \`what is the tradeoff between consistency and availability?\`
-
-**hyde** — Hypothetical document. Write 50-100 words that look like the answer. Often the most powerful for nuanced topics.
-- \`The rate limiter uses a token bucket algorithm. When a client exceeds 100 req/min, subsequent requests return 429 until the window resets.\`
-
-## Strategy
-
-Combine types for best results. First sub-query gets 2× weight — put your strongest signal first.
-
-| Goal | Approach |
-|------|----------|
-| General search (recommended) | Pass \`query\` — auto-expanded into typed variants, fused, reranked |
-| Know exact term/name | \`lex\` only |
-| Concept search | \`vec\` only |
-| Best recall | \`lex\` + \`vec\` |
-| Complex/nuanced | \`lex\` + \`vec\` + \`hyde\` |
-| Unknown vocabulary | Pass \`query\` with natural language so the server auto-expands it |
-
-## Examples
-
-Simple lookup:
-\`\`\`json
-[{ "type": "lex", "query": "CAP theorem" }]
-\`\`\`
-
-Best recall on a technical topic:
-\`\`\`json
-[
-  { "type": "lex", "query": "\\"connection pool\\" timeout -redis" },
-  { "type": "vec", "query": "why do database connections time out under load" },
-  { "type": "hyde", "query": "Connection pool exhaustion occurs when all connections are in use and new requests must wait. This typically happens under high concurrency when queries run longer than expected." }
-]
-\`\`\`
-
-Intent-aware lex (C++ performance, not sports):
-\`\`\`json
-[
-  { "type": "lex", "query": "\\"C++ performance\\" optimization -sports -athlete" },
-  { "type": "vec", "query": "how to optimize C++ program performance" }
-]
-\`\`\``,
-      annotations: { readOnlyHint: true, openWorldHint: false },
+      description: "Search with vector + BM25 recall, deduplicate source excerpts, and rank each independently with TypeSafe. Plain query retrieves ceil(1.5 × limit) from each backend without local expansion or reranking. Typed searches remain supported: lex uses quoted phrases and -negation, vec/hyde use semantic retrieval. TypeSafe receives the query, optional intent, source paths, selected excerpts and evaluation time; requires a server-side TYPESAFE_API_KEY or TYPESAFE_API_KEY_FILE. Scores reflect usefulness, not proof of truth. Set rerank:false for explicit local-only retrieval. Each result includes a 1-based line for use with get. Different useful passages from one file may be returned.",
+      annotations: { readOnlyHint: true, openWorldHint: true },
       inputSchema: z.object({
         query: z.string().optional().describe(
-          "Plain-text query, auto-expanded by the SDK into lex/vec/hyde variants, fused via " +
-          "RRF and reranked. Recommended default for most searches. Mutually exclusive with 'searches'."
+          "Plain-text query for vector + BM25 recall and TypeSafe ranking. " +
+          "Recommended default. Mutually exclusive with 'searches'."
         ),
         searches: z.array(subSearchSchema).max(10).optional().describe(
-          "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight. Use for precise " +
+          "Typed sub-queries to execute (lex/vec/hyde). Use for precise " +
           "control over retrieval strategy. Mutually exclusive with 'query'."
         ),
-        limit: z.number().optional().default(10).describe("Max results (default: 10)"),
-        minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
-        candidateLimit: z.number().optional().describe(
-          "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
+        limit: z.number().int().min(1).max(500).optional().default(10).describe("Max results (default: 10)"),
+        minScore: z.number().min(0).max(1).optional().default(0).describe("Min usefulness 0-1 (default: 0)"),
+        candidateLimit: z.number().int().min(1).max(1500).optional().describe(
+          "Optional maximum candidates to score after deduplication; default all retrieved candidates"
         ),
         collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
         intent: z.string().optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
         rerank: z.boolean().optional().default(true).describe(
-          "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
+          "Score results using TypeSafe (default: true). False uses local reciprocal-rank ordering without API calls."
         ),
       }),
     },
     track(async ({ query, searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
-      // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
+      // Require exactly one of `query` (plain text) or `searches` (typed sub-queries).
       if (!query && (!searches || searches.length === 0)) {
         return {
           content: [{ type: "text" as const, text: "Error: provide either 'query' (plain text) or 'searches' (typed sub-queries)" }],
@@ -354,7 +295,7 @@ Intent-aware lex (C++ performance, not sports):
       // Use default collections if none specified
       const effectiveCollections = collections ?? defaultCollectionNames;
 
-      // Plain `query` is auto-expanded by the SDK (expand → fuse → rerank);
+      // Plain `query` uses vector + BM25 retrieval and TypeSafe scoring;
       // `searches` runs the caller's typed sub-queries directly.
       const searchOptions = query
         ? { query }

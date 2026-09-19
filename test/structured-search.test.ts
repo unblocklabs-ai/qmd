@@ -308,27 +308,27 @@ describe("structuredSearch", () => {
   test("returns empty array when no documents match", async () => {
     const results = await structuredSearch(store, [
       { type: "lex", query: "nonexistent-term-xyz123" }
-    ]);
+    ], { skipRerank: true });
     expect(results).toEqual([]);
   });
 
   test("accepts all search types without error", async () => {
     // These may return empty results but should not throw
-    await expect(structuredSearch(store, [{ type: "lex", query: "test" }])).resolves.toBeDefined();
+    await expect(structuredSearch(store, [{ type: "lex", query: "test" }], { skipRerank: true })).resolves.toBeDefined();
     // vec and hyde require embeddings, so just test lex
   });
 
   test("respects limit option", async () => {
     const results = await structuredSearch(store, [
       { type: "lex", query: "test" }
-    ], { limit: 5 });
+    ], { limit: 5, skipRerank: true });
     expect(results.length).toBeLessThanOrEqual(5);
   });
 
   test("respects minScore option", async () => {
     const results = await structuredSearch(store, [
       { type: "lex", query: "test" }
-    ], { minScore: 0.5 });
+    ], { minScore: 0.5, skipRerank: true });
     for (const r of results) {
       expect(r.score).toBeGreaterThanOrEqual(0.5);
     }
