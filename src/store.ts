@@ -1809,6 +1809,7 @@ export async function reindexCollection(
     content = normalizeContentForIndex(content, relativeFile);
 
     if (!content.trim()) {
+      seenPaths.delete(path);
       processed++;
       continue;
     }
@@ -4692,8 +4693,8 @@ export function insertEmbedding(
 ): void {
   const hashSeq = `${hash}_${seq}`;
 
-  withLazyContentVectorMigration(db, () => {
-    // Insert content_vectors first — crash-safe ordering (see getHashesForEmbedding)
+  withLazyContentVectorMigration(db, () => db.transaction(() => {
+    // Completion metadata and vector data must commit (or roll back) together.
     const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, chunk_len, model, embed_fingerprint, total_chunks, embedded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
     insertContentVectorStmt.run(hash, seq, pos, chunkLen, model, fingerprint, totalChunks, embeddedAt);
 
@@ -4702,7 +4703,7 @@ export function insertEmbedding(
     const insertVecStmt = db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
     deleteVecStmt.run(hashSeq);
     insertVecStmt.run(hashSeq, embedding);
-  });
+  })());
 }
 
 function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<string, number>, model: string): number {

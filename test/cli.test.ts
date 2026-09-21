@@ -1287,6 +1287,27 @@ describe("CLI Update Command", () => {
     expect(stdout).toContain("Updating");
   });
 
+  test("update removes blanked content from search and restores rewritten content", async () => {
+    const env = await createIsolatedTestEnv("blanked");
+    const root = await mkdtemp(join(testDir, "blanked-docs-"));
+    const file = join(root, "note.md");
+    const body = "# Note\n\nquartzblankingproof\n";
+    await writeFile(file, body);
+    expect((await runQmd(["collection", "add", root, "--name", "notes"], env)).exitCode).toBe(0);
+    const search = () => runQmd(["search", "quartzblankingproof", "--json"], env);
+    expect(JSON.parse((await search()).stdout)).toHaveLength(1);
+    for (const empty of ["", " \n\t "]) {
+      await writeFile(file, empty);
+      const update = await runQmd(["update"], env);
+      expect(update.exitCode).toBe(0);
+      expect(update.stdout).toContain("0 new, 0 updated, 0 unchanged, 1 removed");
+      expect(JSON.parse((await search()).stdout)).toEqual([]);
+      await writeFile(file, body);
+      expect((await runQmd(["update"], env)).exitCode).toBe(0);
+      expect(JSON.parse((await search()).stdout)).toHaveLength(1);
+    }
+  });
+
   test("deactivates stale docs when collection has zero matching files", async () => {
     const { dbPath, configDir } = await createIsolatedTestEnv("update-empty");
     const collectionDir = join(testDir, `update-empty-${Date.now()}`);

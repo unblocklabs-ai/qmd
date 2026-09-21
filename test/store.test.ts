@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
 import * as llmModule from "../src/llm.js";
-import type { LlamaCpp } from "../src/llm.js";
+import { LlamaCpp } from "../src/llm.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
@@ -2853,7 +2853,7 @@ describe("Reindex Collection", () => {
     }
   });
 
-  test("skips unreadable files and reports the error code (#460)", async () => {
+  test("skips unreadable files without deactivating their previously indexed content (#460)", async () => {
     const store = await createTestStore();
     const collectionName = "skip-unreadable";
     const collectionPath = join(testDir, `skip-unreadable-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -2862,6 +2862,7 @@ describe("Reindex Collection", () => {
     const badPath = join(collectionPath, "bad.md");
     await writeFile(goodPath, "# Good\n\nreadable body\n");
     await writeFile(badPath, "# Bad\n\nunreadable body\n");
+    expect((await reindexCollection(store, collectionPath, "**/*.md", collectionName)).indexed).toBe(2);
     await chmod(badPath, 0o000);
 
     try {
@@ -2878,7 +2879,9 @@ describe("Reindex Collection", () => {
       }
 
       const result = await reindexCollection(store, collectionPath, "**/*.md", collectionName);
-      expect(result.indexed).toBe(1);
+      expect(result.indexed).toBe(0);
+      expect(result.unchanged).toBe(1);
+      expect(result.removed).toBe(0);
       expect(result.skipped).toBe(1);
       expect(result.skippedFiles).toHaveLength(1);
       expect(result.skippedFiles[0]!.file).toBe("bad.md");
@@ -2887,7 +2890,7 @@ describe("Reindex Collection", () => {
       const paths = store.db.prepare(`
         SELECT path FROM documents WHERE collection = ? AND active = 1 ORDER BY path
       `).all(collectionName) as { path: string }[];
-      expect(paths.map(r => r.path)).toEqual(["good.md"]);
+      expect(paths.map(r => r.path)).toEqual(["bad.md", "good.md"]);
     } finally {
       try { await chmod(badPath, 0o644); } catch { /* already restored / missing */ }
       await rm(collectionPath, { recursive: true, force: true });
@@ -3320,6 +3323,33 @@ describe("Fuzzy Matching", () => {
 // =============================================================================
 
 describe("Vector Table", () => {
+  test("insertEmbedding rolls back failed new and replacement vector writes", async () => {
+    const store = await createTestStore();
+    try {
+      await insertTestDocument(store.db, "docs", { hash: "atomicvector", body: "Atomic vector writes" });
+      store.ensureVecTable(3);
+      const insert = (vector: number[], pos: number) => store.insertEmbedding("atomicvector", 0, pos,
+        new Float32Array(vector), DEFAULT_EMBED_MODEL, "now", 1, undefined, 5);
+      const metadata = () => store.db.prepare("SELECT * FROM content_vectors WHERE hash = 'atomicvector'").all();
+      const vectors = () => store.db.prepare("SELECT hash_seq, embedding FROM vectors_vec").all();
+      expect(() => insert([1, 0], 0)).toThrow(/dimension/i);
+      expect(metadata()).toEqual([]);
+      expect(vectors()).toEqual([]);
+      expect(store.getHashesNeedingEmbedding()).toBe(1);
+
+      insert([1, 0, 0], 0);
+      expect(store.getHashesNeedingEmbedding()).toBe(0);
+      const before = { metadata: metadata(), vectors: vectors() };
+      expect(() => insert([0, 1], 10)).toThrow(/dimension/i);
+      expect({ metadata: metadata(), vectors: vectors() }).toEqual(before);
+      insert([0, 1, 0], 10);
+      expect(store.db.prepare("SELECT pos FROM content_vectors WHERE hash = 'atomicvector'").get()).toEqual({ pos: 10 });
+      expect(vectors()).not.toEqual(before.vectors);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
   test("ensureVecTable creates vector table", async () => {
     const store = await createTestStore();
 
@@ -4332,6 +4362,42 @@ describe("Edge Cases", () => {
 });
 
 describe("Embedding batching", () => {
+  test("generateEmbeddings leaves failed vector writes pending and retries them on the next run", async () => {
+    const store = await createTestStore();
+    const llm = new LlamaCpp();
+    let sample = true;
+    let failWrites = true;
+    vi.spyOn(llm, "tokenize").mockResolvedValue([1, 2]);
+    vi.spyOn(llm, "embed").mockImplementation(async () => {
+      const embedding = sample || !failWrites ? [1, 0, 0] : [1, 0];
+      sample = false;
+      return { embedding, model: DEFAULT_EMBED_MODEL };
+    });
+    vi.spyOn(llm, "embedBatch").mockImplementation(async texts => texts.map(() => ({
+      embedding: failWrites ? [1, 0] : [1, 0, 0], model: DEFAULT_EMBED_MODEL,
+    })));
+    store.llm = llm;
+    setDefaultLlamaCpp(llm);
+    try {
+      await insertTestDocument(store.db, "docs", { hash: "retryvector", body: "A small document" });
+      expect((await generateEmbeddings(store)).errors).toBe(1);
+      expect(store.db.prepare("SELECT COUNT(*) AS count FROM content_vectors").get()).toEqual({ count: 0 });
+      expect(store.db.prepare("SELECT COUNT(*) AS count FROM vectors_vec").get()).toEqual({ count: 0 });
+      expect(store.getHashesNeedingEmbedding()).toBe(1);
+      failWrites = false;
+      const retry = await generateEmbeddings(store);
+      expect(retry.errors).toBe(0);
+      expect(retry.docsProcessed).toBe(1);
+      expect(retry.chunksEmbedded).toBe(1);
+      expect(store.getHashesNeedingEmbedding()).toBe(0);
+      expect(store.db.prepare("SELECT COUNT(*) AS count FROM vectors_vec").get()).toEqual({ count: 1 });
+    } finally {
+      setDefaultLlamaCpp(null);
+      await llm.dispose();
+      await cleanupTestDb(store);
+    }
+  });
+
   function createFakeTokenizer() {
     return {
       async tokenize(text: string) {

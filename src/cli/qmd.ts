@@ -1982,6 +1982,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
     // Skip empty files - nothing useful to index
     if (!content.trim()) {
+      seenPaths.delete(path);
       processed++;
       continue;
     }

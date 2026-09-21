@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [2.10.1] - 2026-09-20
+
+### Fixed
+
+- Remove previously indexed content from search when a file is successfully
+  read as empty or whitespace, in both SDK and CLI updates. Transient read
+  failures continue to preserve the last indexed content.
+- Commit embedding metadata and vector data atomically so failed writes remain
+  retryable instead of silently appearing complete. Failed vector replacements
+  preserve the previous embedding.
+
 ## [2.10.0] - 2026-09-19
 
 ### Fixed

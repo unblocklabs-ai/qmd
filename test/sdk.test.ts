@@ -63,6 +63,29 @@ function freshDbPath(): string {
   return join(testDir, `test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
 }
 
+test("update deactivates a blanked file and restores it when content returns", async () => {
+  const root = await mkdtemp(join(testDir, "blanked-"));
+  const file = join(root, "note.md");
+  const body = "# Note\n\nquartzblankingproof\n";
+  await writeFile(file, body);
+  const store = await createStore({ dbPath: freshDbPath(), config: { collections: { notes: { path: root } } } });
+  try {
+    expect((await store.update()).indexed).toBe(1);
+    expect(await store.searchLex("quartzblankingproof")).toHaveLength(1);
+    for (const empty of ["", " \n\t "]) {
+      await writeFile(file, empty);
+      expect((await store.update()).removed).toBe(1);
+      expect(await store.searchLex("quartzblankingproof")).toHaveLength(0);
+      expect((await store.update()).removed).toBe(0);
+      await writeFile(file, body);
+      await store.update();
+      expect(await store.searchLex("quartzblankingproof")).toHaveLength(1);
+    }
+  } finally {
+    await store.close();
+  }
+});
+
 // =============================================================================
 // Constructor Tests
 // =============================================================================

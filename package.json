@@ -1,6 +1,6 @@
 {
   "name": "@unblocklabs/qmd",
-  "version": "2.10.0",
+  "version": "2.10.1",
   "description": "Query Markup Documents - Local BM25/vector retrieval with TypeSafe-ranked hybrid queries",
   "type": "module",
   "main": "dist/index.js",
