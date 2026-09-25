@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.10.2] - 2026-09-25
+
 ### Changed
 
 - Remove generated local training artifacts, the unused GRPO config and
