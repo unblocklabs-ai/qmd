@@ -44,7 +44,7 @@ if not os.path.exists(_eval_common_path):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from eval_common import QMDRewardFunction, run_eval
 
-# --- Config (inlined from experiments/grpo/grpo.yaml) ---
+# --- Standalone experimental config ---
 BASE_MODEL = "Qwen/Qwen3-1.7B"
 SFT_MODEL = "tobil/qmd-query-expansion-1.7B-sft"
 OUTPUT_MODEL = "tobil/qmd-query-expansion-1.7B-grpo"

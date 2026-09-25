@@ -124,8 +124,7 @@ experiments/
 │   ├── sft_lfm2.yaml
 │   └── sft_lfm2.py
 ├── grpo/          # Experimental GRPO recipe and config
-│   ├── grpo.py
-│   └── grpo.yaml
+│   └── grpo.py
 └── gepa/          # DSPy-based prompt optimization (GEPA)
     ├── dspy_gepa.py
     └── ...

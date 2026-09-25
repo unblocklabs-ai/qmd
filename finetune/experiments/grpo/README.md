@@ -5,18 +5,13 @@ It is not part of the default production pipeline.
 
 ## Files
 
-- `grpo.yaml` – experimental GRPO hyperparameters
-- `grpo.py` – standalone GRPO training script
+- `grpo.py` – standalone GRPO training script with its own configuration
 
 ## Run
 
 ```bash
-# Recommended default: run from repo root
-cd /home/tobi/qmd
-uv run finetune/experiments/grpo/grpo.py
-
-# Or use unified entrypoint (deprecated in main pipeline):
-uv run train.py grpo --config finetune/experiments/grpo/grpo.yaml
+# Run from finetune/
+uv run experiments/grpo/grpo.py
 ```
 
 ## Notes

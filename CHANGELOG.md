@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Remove generated local training artifacts, the unused GRPO config and
+  unreachable GRPO entrypoint code. The standalone experimental script remains.
+- Correct the training, benchmark and `multi-get` documentation to match current
+  behavior.
+
 ## [2.10.1] - 2026-09-20
 
 ### Fixed

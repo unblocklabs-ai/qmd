@@ -13,7 +13,7 @@ pipeline_tag: text-generation
 
 # QMD Query Expansion Fine-Tuning
 
-Train small language models to expand search queries for [QMD](https://github.com/tobi/qmd)'s hybrid retrieval pipeline.
+Train small language models to expand search queries for [QMD](https://github.com/unblocklabs-ai/qmd). These models support standalone `vsearch` expansion and explicit SDK expansion; plain `query` retrieves the original query with BM25 and vector search before TypeSafe scoring.
 
 ## What This Does
 
@@ -27,7 +27,7 @@ vec: how to configure authentication settings
 vec: authentication configuration options
 ```
 
-These feed into QMD's three search backends:
+The expansion types route to two retrieval backends:
 - **`lex:`** lines go to BM25 full-text search (short, keyword-focused)
 - **`vec:`** lines go to vector similarity search (natural language phrases)
 - **`hyde:`** is a hypothetical document passage for embedding-based retrieval ([HyDE](https://arxiv.org/abs/2212.10496) technique)
@@ -122,7 +122,7 @@ Teaches the model the `lex:/vec:/hyde:` output format from labeled examples.
 | Base model | `Qwen/Qwen3-1.7B` |
 | Method | LoRA (rank 16, alpha 32) |
 | Target modules | All projection layers (q/k/v/o/gate/up/down) |
-| Dataset | ~2,290 examples (train split) |
+| Dataset | Prepared from deduplicated `data/*.jsonl` inputs |
 | Effective batch size | 16 (4 x 4 gradient accumulation) |
 | Epochs | 5 |
 | Learning rate | 2e-4 (cosine schedule) |
@@ -262,4 +262,3 @@ deterministic, and suitable as an RL signal. See `SCORING.md` for the full rubri
 
 > GRPO scores are not tracked in this branch; see `experiments/grpo/` for historical
 > experimental results.
-

@@ -126,7 +126,7 @@ qmd multi-get "#abc123, #def456"
 
 # Get / multi-get
 -l <num>                 # Maximum lines per file
---max-bytes <num>        # Skip files larger than this (default 10KB)
+--max-bytes <num>        # Skip files larger than this (default 64 KiB)
 --no-line-numbers        # Disable line numbers (on by default for get/multi-get)
 
 # Output format (search, query, multi-get)
