@@ -1895,6 +1895,32 @@ describe("FTS Search", () => {
 
 describe("Document Retrieval", () => {
   describe("findDocument", () => {
+    test("virtual reads preserve literal paths instead of URL-normalizing them", async () => {
+      const store = await createTestStore();
+      const collectionName = await createTestCollection({ pwd: "/literal/paths" });
+      const paths = ["notes/with space.md", "notes/with%20space.md", "notes/question?draft.md"];
+      for (const [index, path] of paths.entries()) {
+        const body = `Literal document ${index}`;
+        await insertTestDocument(store.db, collectionName, {
+          name: `literal-${index}`, displayPath: path, body,
+        });
+        const uri = `qmd://${collectionName}/${path}`;
+        const result = store.findDocument(uri, { includeBody: true });
+        expect("error" in result).toBe(false);
+        if (!("error" in result)) {
+          expect(result.filepath).toBe(uri);
+          expect(result.body).toBe(body);
+        }
+        expect(store.getDocumentBody({ filepath: uri })).toBe(body);
+      }
+      const alternate = [`qmd:////${collectionName}/${paths[0]}`, `qmd://${collectionName}/${paths[0]}?index=other`];
+      for (const uri of alternate) {
+        expect("error" in store.findDocument(uri)).toBe(true);
+        expect(store.getDocumentBody({ filepath: uri })).toBeNull();
+      }
+      await cleanupTestDb(store);
+    });
+
     test("findDocument finds by exact filepath", async () => {
       const store = await createTestStore();
       const collectionName = await createTestCollection({ pwd: "/exact/path", glob: "**/*.md" });

@@ -5096,7 +5096,16 @@ export function findDocument(db: Database, filename: string, options: { includeB
   `;
 
   // Try to match by virtual path first
-  let doc = db.prepare(`
+  const virtual = parseVirtualPath(filepath);
+  // Parsing also accepts alternate spellings and query strings. Exact reads
+  // must preserve the literal input before falling back to fuzzy/absolute paths.
+  const exactVirtual = virtual && `qmd://${virtual.collectionName}/${virtual.path}` === filepath ? virtual : null;
+  let doc = exactVirtual ? db.prepare(`
+    SELECT ${selectCols}
+    FROM documents d
+    JOIN content ON content.hash = d.hash
+    WHERE d.collection = ? AND d.path = ? AND d.active = 1
+  `).get(exactVirtual.collectionName, exactVirtual.path) as DbDocRow | null : db.prepare(`
     SELECT ${selectCols}
     FROM documents d
     JOIN content ON content.hash = d.hash
@@ -5179,7 +5188,14 @@ export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: 
 
   // Try virtual path first
   if (filepath.startsWith('qmd://')) {
-    row = db.prepare(`
+    const virtual = parseVirtualPath(filepath);
+    const exactVirtual = virtual && `qmd://${virtual.collectionName}/${virtual.path}` === filepath ? virtual : null;
+    row = exactVirtual ? db.prepare(`
+      SELECT content.doc as body
+      FROM documents d
+      JOIN content ON content.hash = d.hash
+      WHERE d.collection = ? AND d.path = ? AND d.active = 1
+    `).get(exactVirtual.collectionName, exactVirtual.path) as { body: string } | null : db.prepare(`
       SELECT content.doc as body
       FROM documents d
       JOIN content ON content.hash = d.hash

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Use the existing collection/path index for exact virtual document reads,
+  preserving literal paths and the existing lookup fallbacks.
+
 ## [2.11.0] - 2026-10-04
 
 ### Added
