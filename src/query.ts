@@ -40,6 +40,83 @@ function selectLexicalChunk(chunks: { pos: number; text: string }[], body: strin
   }).sort((a, b) => b.matches - a.matches || b.intentMatches - a.intentMatches || a.chunk.pos - b.chunk.pos)[0]?.chunk;
 }
 
+export type CandidateDiscoveryOptions = Pick<HybridQueryOptions,
+  "collection" | "allowedPaths" | "intent" | "chunkStrategy" | "signal" | "hooks" | "trace"> & {
+  query: string;
+  lane: "lex" | "vec";
+  /** Exact backend depth, before invalid/duplicate excerpts are omitted. */
+  limit: number;
+};
+/** score is the raw backend score (negative BM25 or vector similarity); rank is zero-based. */
+export type DiscoveryCandidate = HybridQueryResult & { method: "vector" | "bm25"; rank: number };
+
+/** Local single-lane discovery: no query expansion, remote scoring or merged cap. */
+export async function discoverCandidates(store: Store, options: CandidateDiscoveryOptions,
+  expression?: string | null): Promise<DiscoveryCandidate[]> {
+  if (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 1500) throw new Error("discovery limit must be from 1 to 1500");
+  if (!options.query.trim() || options.query.length > MAX_QUERY_EXCERPT_CHARS || (options.intent?.length ?? 0) > MAX_QUERY_EXCERPT_CHARS) {
+    throw new Error("discovery query and intent must each be at most 12000 characters; query must not be blank");
+  }
+  options.signal?.throwIfAborted();
+  const candidates = new Map<string, DiscoveryCandidate>();
+  const add = (hit: HybridQueryResult, method: DiscoveryCandidate["method"], rank: number) => {
+    if (!hit.bestChunk.trim() || hit.bestChunk.length > MAX_QUERY_EXCERPT_CHARS) return;
+    const key = JSON.stringify([hit.file, hit.bestChunk.trim()]);
+    if (!candidates.has(key)) candidates.set(key, { ...hit, method, rank });
+  };
+  if (options.lane === "vec") {
+    if (!store.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'").get()) return [];
+    options.hooks?.onEmbedStart?.(1);
+    const start = performance.now();
+    const hits = await store.searchVec(options.query, (store.llm ?? getDefaultLlamaCpp()).embedModelName,
+      options.limit, options.collection, undefined, undefined, options.trace, options.allowedPaths);
+    options.signal?.throwIfAborted();
+    options.hooks?.onEmbedDone?.(performance.now() - start);
+    for (const [rank, hit] of hits.entries()) {
+      const pos = hit.chunkPos, len = hit.chunkLen, body = hit.body ?? "";
+      if (pos === undefined || len === undefined || pos < 0 || len <= 0 || pos + len > body.length) continue;
+      add({ file: hit.filepath, displayPath: hit.displayPath, title: hit.title, body,
+        bestChunk: body.slice(pos, pos + len), bestChunkPos: pos, score: hit.score,
+        context: hit.context, docid: hit.docid }, "vector", rank);
+    }
+  } else {
+    const terms = expression === undefined
+      ? queryTerms(options.query).map(term => `"${normalizeCjkForFTS(term).trim()}"`).join(" OR ") : expression;
+    if (!terms) return [];
+    const collections = typeof options.collection === "string" ? [options.collection] : options.collection;
+    const scope = JSON.stringify(options.allowedPaths ?? {});
+    const marker = `qmd-match-${randomUUID()}`;
+    const rows = store.db.prepare(`SELECT d.collection, d.path, d.hash, d.title, c.doc,
+        bm25(documents_fts, 1.5, 4.0, 1.0) AS rank, highlight(documents_fts, 2, ?, ?) AS highlighted
+      FROM documents_fts JOIN documents d ON d.id = documents_fts.rowid
+        JOIN content c ON c.hash = d.hash
+      WHERE documents_fts MATCH ? AND d.active = 1
+        AND (? IS NULL OR d.collection IN (SELECT value FROM json_each(?)))
+        AND (NOT EXISTS (SELECT 1 FROM json_each(?) scope WHERE scope.key = d.collection)
+          OR EXISTS (SELECT 1 FROM json_each(?) scope, json_each(scope.value) paths
+            WHERE scope.key = d.collection AND paths.value = d.path))
+      ORDER BY rank, d.collection, d.path LIMIT ?`).all<{
+        collection: string; path: string; hash: string; title: string; doc: string; rank: number; highlighted: string;
+      }>(marker, marker, terms, collections ? JSON.stringify(collections) : null,
+        collections ? JSON.stringify(collections) : null, scope, scope, options.limit);
+    for (const [rank, row] of rows.entries()) {
+      options.signal?.throwIfAborted();
+      const file = `qmd://${row.collection}/${row.path}`;
+      const stored = getStoredChunkSpans(store.db, row.hash)
+        .filter(span => span.pos >= 0 && span.chunk_len > 0 && span.pos + span.chunk_len <= row.doc.length)
+        .map(span => ({ pos: span.pos, text: row.doc.slice(span.pos, span.pos + span.chunk_len) }));
+      const chunks = stored.length ? stored : await chunkDocumentAsync(row.doc,
+        undefined, undefined, undefined, file, options.chunkStrategy === "semantic" ? "regex" : options.chunkStrategy);
+      const selected = selectLexicalChunk(chunks, row.doc, row.highlighted, marker, options.intent);
+      if (!selected) continue;
+      add({ file, displayPath: `${row.collection}/${row.path}`, title: row.title, body: row.doc,
+        bestChunk: selected.text, bestChunkPos: selected.pos, score: row.rank,
+        context: store.getContextForFile(file), docid: row.hash.slice(0, 6) }, "bm25", rank);
+    }
+  }
+  return [...candidates.values()];
+}
+
 /** Shared query implementation for CLI, MCP and SDK. vsearch does not call this. */
 export async function typesafeQuery(store: Store, query: string, options: HybridQueryOptions = {},
   searches?: readonly RetrievalQuery[]): Promise<HybridQueryResult[]> {
@@ -72,9 +149,6 @@ export async function typesafeQuery(store: Store, query: string, options: Hybrid
     ...(to !== undefined ? { sessionStartedTo: to } : {}),
   };
   const perMethod = Math.ceil(limit * 1.5);
-  const collection = options.collection;
-  const collections = typeof collection === "string" ? [collection] : collection;
-  const scope = JSON.stringify(options.allowedPaths ?? {});
   const terms = queryTerms(query);
   const requests: readonly RetrievalQuery[] = searches ?? [
     { type: "vec", query },
@@ -93,57 +167,13 @@ export async function typesafeQuery(store: Store, query: string, options: Hybrid
       existing.retrievalScore = Math.max(existing.retrievalScore, retrievalScore);
     } else candidates.set(key, { ...hit, methods: [method], retrievalScore });
   };
-  const hasVectors = !!store.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'").get();
   for (const request of requests) {
     signal.throwIfAborted();
-    if (request.type !== "lex") {
-      if (!hasVectors) continue;
-      options.hooks?.onEmbedStart?.(1);
-      const start = performance.now();
-      // Embeddings run sequentially, matching the native store's concurrency contract.
-      const hits = await store.searchVec(request.query, (store.llm ?? getDefaultLlamaCpp()).embedModelName,
-        perMethod, collection, undefined, undefined, options.trace, options.allowedPaths);
-      options.hooks?.onEmbedDone?.(performance.now() - start);
-      for (const [rank, hit] of hits.entries()) {
-        const pos = hit.chunkPos, len = hit.chunkLen, body = hit.body ?? "";
-        if (pos === undefined || len === undefined || pos < 0 || len <= 0 || pos + len > body.length) continue;
-        add({ file: hit.filepath, displayPath: hit.displayPath, title: hit.title, body,
-          bestChunk: body.slice(pos, pos + len), bestChunkPos: pos, score: hit.score,
-          context: hit.context, docid: hit.docid }, "vector", rank);
-      }
-      continue;
-    }
-    if (!request.expression) continue;
-    const marker = `qmd-match-${randomUUID()}`;
-    // Scope active documents BEFORE LIMIT: unrelated collections must not starve recall.
-    const rows = store.db.prepare(`SELECT d.collection, d.path, d.hash, d.title, c.doc,
-        bm25(documents_fts, 1.5, 4.0, 1.0) AS rank,
-        highlight(documents_fts, 2, ?, ?) AS highlighted
-      FROM documents_fts JOIN documents d ON d.id = documents_fts.rowid
-        JOIN content c ON c.hash = d.hash
-      WHERE documents_fts MATCH ? AND d.active = 1
-        AND (? IS NULL OR d.collection IN (SELECT value FROM json_each(?)))
-        AND (NOT EXISTS (SELECT 1 FROM json_each(?) scope WHERE scope.key = d.collection)
-          OR EXISTS (SELECT 1 FROM json_each(?) scope, json_each(scope.value) paths
-            WHERE scope.key = d.collection AND paths.value = d.path))
-      ORDER BY rank, d.collection, d.path LIMIT ?`).all<{
-        collection: string; path: string; hash: string; title: string; doc: string; rank: number; highlighted: string;
-      }>(marker, marker, request.expression, collections ? JSON.stringify(collections) : null,
-        collections ? JSON.stringify(collections) : null, scope, scope, perMethod);
-    for (const [rank, row] of rows.entries()) {
-      signal.throwIfAborted();
-      const file = `qmd://${row.collection}/${row.path}`;
-      const stored = getStoredChunkSpans(store.db, row.hash)
-        .filter(span => span.pos >= 0 && span.chunk_len > 0 && span.pos + span.chunk_len <= row.doc.length)
-        .map(span => ({ pos: span.pos, text: row.doc.slice(span.pos, span.pos + span.chunk_len) }));
-      // Newly indexed, not-yet-embedded documents still support lexical recall.
-      const chunks = stored.length ? stored : await chunkDocumentAsync(row.doc,
-        undefined, undefined, undefined, file, options.chunkStrategy === "semantic" ? "regex" : options.chunkStrategy);
-      const selected = selectLexicalChunk(chunks, row.doc, row.highlighted, marker, options.intent);
-      if (!selected) continue;
-      add({ file, displayPath: `${row.collection}/${row.path}`, title: row.title, body: row.doc,
-        bestChunk: selected.text, bestChunkPos: selected.pos, score: Math.abs(row.rank) / (1 + Math.abs(row.rank)),
-        context: store.getContextForFile(file), docid: row.hash.slice(0, 6) }, "bm25", rank);
+    // Embeddings remain sequential, matching the native store concurrency contract.
+    const hits = await discoverCandidates(store, { ...options, signal, query: request.query,
+      lane: request.type === "lex" ? "lex" : "vec", limit: perMethod }, request.expression);
+    for (const { method, rank, ...hit } of hits) {
+      add(hit, method, rank);
     }
   }
   const shortlist = [...candidates.values()].sort((a, b) => b.retrievalScore - a.retrievalScore)

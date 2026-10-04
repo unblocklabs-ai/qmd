@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Expose exact-depth single-lane candidate discovery in the SDK, sharing scoped
+  vector/BM25 excerpt discovery with hybrid queries without remote scoring.
+- Export model-aware query/document embedding formatters for SDK consumers.
+
 ## [2.10.4] - 2026-10-04
 
 ### Fixes

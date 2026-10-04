@@ -75,6 +75,9 @@ import {
 import {
   LlamaCpp,
 } from "./llm.js";
+import { discoverCandidates, type CandidateDiscoveryOptions, type DiscoveryCandidate } from "./query.js";
+export { formatDocForEmbedding, formatQueryForEmbedding } from "./llm.js";
+export type { CandidateDiscoveryOptions, DiscoveryCandidate } from "./query.js";
 export type { TypeSafeOptions } from "./typesafe-query.js";
 import {
   setConfigSource,
@@ -261,6 +264,9 @@ export interface QMDStore {
   /** Vector + BM25 retrieval with independent TypeSafe scoring */
   search(options: SearchOptions): Promise<HybridQueryResult[]>;
 
+  /** Exact-depth local candidate discovery, without expansion or remote scoring. */
+  discoverCandidates(options: CandidateDiscoveryOptions): Promise<DiscoveryCandidate[]>;
+
   /** BM25 keyword search (fast, no LLM) */
   searchLex(query: string, options?: LexSearchOptions): Promise<SearchResult[]>;
 
@@ -423,6 +429,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   const store: QMDStore = {
     internal,
     dbPath: internal.dbPath,
+    discoverCandidates: (opts) => discoverCandidates(internal, opts),
 
     // Search
     search: async (opts) => {

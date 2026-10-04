@@ -38,6 +38,28 @@ function score(value: 0 | 1 | 2 | 3) {
 }
 const typesafe = { apiKey: "test-only-key", timeoutMs: 1000 };
 
+test("SDK discovery preserves exact lane depth and scopes without expansion or remote scoring", async () => {
+  for (let i = 0; i < 12; i++) await document(`allowed-${i}.md`, `discoveryneedle evidence ${i}`);
+  for (let i = 0; i < 15; i++) await document(`denied-${i}.md`, `discoveryneedle ${i}`, "other");
+  const fetch = vi.spyOn(globalThis, "fetch");
+  const expand = vi.spyOn(store.internal, "expandQuery");
+  const lexical = await store.discoverCandidates({ query: '"discoveryneedle missingword"', lane: "lex", collection: "docs", limit: 10 });
+  expect(lexical).toHaveLength(10);
+  expect(lexical.every(hit => hit.method === "bm25" && hit.file.startsWith("qmd://docs/"))).toBe(true);
+  expect(lexical.every(hit => hit.score < 0)).toBe(true);
+  const scoped = await store.discoverCandidates({ query: "discoveryneedle", lane: "lex", limit: 1,
+    allowedPaths: { docs: ["allowed-11.md"], other: [] } });
+  expect(scoped.map(hit => hit.file)).toEqual(["qmd://docs/allowed-11.md"]);
+  store.internal.db.exec("CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)");
+  const semantic = await document("semantic.md", "Exact semantic span");
+  const vector = vi.spyOn(store.internal, "searchVec").mockResolvedValue([semantic]);
+  const vectors = await store.discoverCandidates({ query: "semantic", lane: "vec", collection: "docs", limit: 10 });
+  expect(vector.mock.calls[0]?.[2]).toBe(10);
+  expect(vectors[0]).toMatchObject({ method: "vector", bestChunk: semantic.body, bestChunkPos: 0 });
+  expect(fetch).not.toHaveBeenCalled();
+  expect(expand).not.toHaveBeenCalled();
+});
+
 test("SDK query retrieves 1.5k per backend, deduplicates excerpts and uses TypeSafe rather than local models", async () => {
   const direct = await document("direct.md", "staging approved by Mira");
   const background = await document("background.md", "staging general background");
