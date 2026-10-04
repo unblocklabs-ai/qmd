@@ -224,8 +224,8 @@ describe("rebuildFTSForCjkNormalization — large-library full migration", () =>
     }
   });
 
-  test("opens successfully and indexes all active docs (50 × ≥10KB bodies)", async () => {
-    const DOC_COUNT = 60;
+  test("indexes every page of a large library (1,001 × ≥10KB bodies)", async () => {
+    const DOC_COUNT = 1001;
     const bigBody = "lorem ipsum dolor sit amet ".repeat(450); // ~12 KB
     expect(bigBody.length).toBeGreaterThanOrEqual(10 * 1024);
 
@@ -259,15 +259,14 @@ describe("rebuildFTSForCjkNormalization — large-library full migration", () =>
       expect(ver?.value).toBe(FTS_CJK_NORMALIZED_VERSION);
 
       // FTS rowcount equals active doc count — every active doc got indexed
-      // (crossing the BATCH_SIZE=500 boundary is fine; this is the smaller
-      // multi-batch correctness check).
+      // Include documents beyond the 500-row batch boundary.
       expect(ftsRowCount(db)).toBe(activeDocCount(db));
       expect(ftsRowCount(db)).toBe(DOC_COUNT);
 
       // And the index actually serves a query for a per-doc unique token.
-      const hits = store.searchFTS("unique-token-42", 10, "big");
+      const hits = store.searchFTS(`unique-token-${DOC_COUNT}`, 10, "big");
       expect(hits.length).toBe(1);
-      expect(hits[0]!.displayPath).toBe("big/doc-42.md");
+      expect(hits[0]!.displayPath).toBe(`big/doc-${DOC_COUNT}.md`);
 
       // No leftover shadow table after the swap.
       const shadow = db.prepare(

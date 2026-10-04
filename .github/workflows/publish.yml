@@ -37,6 +37,8 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
+      - run: npm run test:types
+      - run: npm run test:rules
       - run: npm run build
       - run: npm publish --provenance --access public
 

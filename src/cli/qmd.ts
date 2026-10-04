@@ -265,7 +265,6 @@ type FinishSuccessfulCliCommandOptions = {
   command: string;
   format?: OutputFormat;
   cleanup?: () => Promise<void>;
-  exit?: (code: number) => void;
   stdout?: CliLifecycleWritable;
   stderr?: CliLifecycleWritable;
 };
@@ -296,9 +295,6 @@ async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
  * that still call `process.exit()` after loading the native binding
  * (signal handlers, error paths, `bun test`).
  *
- * If the caller passes an explicit `exit` for testability, we honor it —
- * the lifecycle tests verify the legacy flush → cleanup → exit ordering.
- * Production callers must not pass `exit`.
  */
 export async function finishSuccessfulCliCommand(options: FinishSuccessfulCliCommandOptions): Promise<void> {
   const stderr = options.stderr ?? process.stderr;
@@ -313,11 +309,6 @@ export async function finishSuccessfulCliCommand(options: FinishSuccessfulCliCom
     );
   }
   await flushWritable(stderr);
-
-  if (options.exit) {
-    options.exit(0);
-    return;
-  }
 
   process.exitCode = 0;
 }

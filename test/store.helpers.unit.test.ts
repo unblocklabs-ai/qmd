@@ -14,11 +14,6 @@ import {
   getPwd,
   getRealPath,
   isPathInsideDir,
-  isVirtualPath,
-  parseVirtualPath,
-  normalizeVirtualPath,
-  normalizeDocid,
-  isDocid,
   handelize,
   cleanupOrphanedVectors,
   countOrphanedVectors,
@@ -295,34 +290,6 @@ describe("handelize", () => {
     expect(handelize("a.md")).toBe("a.md");
   });
 
-  test("normalizes virtual paths", () => {
-    expect(normalizeVirtualPath("qmd://docs/readme.md")).toBe("qmd://docs/readme.md");
-    expect(normalizeVirtualPath("docs/readme.md")).toBe("docs/readme.md");
-  });
-
-  test("detects virtual paths", () => {
-    expect(isVirtualPath("qmd://docs/readme.md")).toBe(true);
-    expect(isVirtualPath("/tmp/file.md")).toBe(false);
-  });
-
-  test("parses virtual paths", () => {
-    expect(parseVirtualPath("qmd://docs/readme.md")).toEqual({
-      collectionName: "docs",
-      path: "readme.md",
-    });
-  });
-
-  test("normalizes docids", () => {
-    expect(normalizeDocid("123456")).toBe("123456");
-    expect(normalizeDocid("#123456")).toBe("123456");
-  });
-
-  test("checks docid validity", () => {
-    expect(isDocid("123456")).toBe(true);
-    expect(isDocid("#123456")).toBe(true);
-    expect(isDocid("bad-id")).toBe(false);
-    expect(isDocid("12345")).toBe(false);
-  });
 });
 
 // =============================================================================

@@ -39,6 +39,12 @@ jobs:
       - name: Dead-code analysis
         run: npx knip
 
+      - name: Type contracts
+        run: npm run test:types
+
+      - name: Lint rule tests
+        run: npm run test:rules
+
       - name: Tests
         run: npx vitest run --reporter=verbose --testTimeout 60000 test/
         env:

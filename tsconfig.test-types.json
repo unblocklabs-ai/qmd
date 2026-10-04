@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.build.json",
+  "compilerOptions": { "noEmit": true },
+  "include": ["test/sdk.types.ts", "src/**/*.d.ts"]
+}

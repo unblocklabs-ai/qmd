@@ -143,7 +143,15 @@ bun link               # Install globally as 'qmd'
 
 ## Tests
 
-All tests live in `test/`. Run everything:
+Run all validation gates, including consumer types, lint rules, both runtimes,
+and packaging:
+
+```sh
+bun run test
+```
+
+Runtime tests live in `test/`; lint-rule tests live in `tools/oxlint/`. To run
+only the runtime suites:
 
 ```sh
 npx vitest run --reporter=verbose test/

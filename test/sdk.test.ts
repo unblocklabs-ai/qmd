@@ -20,8 +20,6 @@ import {
   type SearchOptions,
   type LexSearchOptions,
   type VectorSearchOptions,
-  type VSearchOptions,
-  type VectorSearchResult,
   type ExpandQueryOptions,
 } from "../src/index.js";
 import { setDefaultLlamaCpp } from "../src/llm.js";
@@ -1308,35 +1306,10 @@ describe("config initialization", () => {
 });
 
 // =============================================================================
-// Type Export Tests (compile-time checks, runtime verification)
+// SDK surface checks (consumer types are checked in sdk.types.ts)
 // =============================================================================
 
-describe("type exports", () => {
-  test("StoreOptions type is usable", () => {
-    const opts: StoreOptions = {
-      dbPath: "/tmp/test.sqlite",
-      config: { collections: {} },
-    };
-    expect(opts.dbPath).toBe("/tmp/test.sqlite");
-  });
-
-  test("CollectionConfig type is usable", () => {
-    const config: CollectionConfig = {
-      global_context: "test",
-      collections: {
-        test: { path: "/tmp", pattern: "**/*.md" },
-      },
-    };
-    expect(config.collections).toHaveProperty("test");
-  });
-
-  test("vsearch types are usable", () => {
-    const opts: VSearchOptions = { expand: false, collection: "memory", limit: 5 };
-    const results: VectorSearchResult[] = [];
-    expect(opts.collection).toBe("memory");
-    expect(results).toEqual([]);
-  });
-
+describe("SDK surface", () => {
   test("QMDStore type exposes expected methods", async () => {
     const store = await createStore({
       dbPath: freshDbPath(),

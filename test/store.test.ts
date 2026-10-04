@@ -5666,6 +5666,7 @@ describe("isDocid", () => {
   });
 
   test("accepts bare 6-char hex", () => {
+    expect(isDocid("123456")).toBe(true);
     expect(isDocid("abc123")).toBe(true);
     expect(isDocid("def456")).toBe(true);
     expect(isDocid("ABCDEF")).toBe(true);
