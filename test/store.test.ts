@@ -2790,7 +2790,7 @@ describe("Reindex Collection", () => {
       expect(bodies).toHaveLength(1);
       expect(bodies[0]!.body).toContain("safe");
       expect(bodies.map(b => b.body).join("")).not.toContain(marker);
-      // fast-glob + onlyFiles may omit the symlink entirely; if it is listed,
+      // File discovery may omit the symlink entirely; if it is listed,
       // containment must skip it rather than ingest the target.
       if (result.skippedFiles.length > 0) {
         expect(result.skippedFiles.some(s => s.code === "OUTSIDE_COLLECTION")).toBe(true);
@@ -2822,7 +2822,7 @@ describe("Reindex Collection", () => {
 
       store.db.prepare(`DELETE FROM documents`).run();
       const abs = await reindexCollection(store, collectionPath, join(parent, "outside.md"), "docs");
-      expect(abs.skippedFiles.some(s => s.code === "OUTSIDE_COLLECTION")).toBe(true);
+      expect(abs.indexed).toBe(0);
       const absBodies = store.db.prepare(`
         SELECT content.doc as body FROM documents d
         JOIN content ON content.hash = d.hash

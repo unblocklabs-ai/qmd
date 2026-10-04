@@ -1,6 +1,6 @@
 import { isBun, openDatabase } from "../db.js";
 import type { Database, SQLiteValue } from "../db.js";
-import fastGlob from "fast-glob";
+import { glob } from "tinyglobby";
 import { spawn as nodeSpawn } from "child_process";
 import { isQmdMcpPid, mcpDaemonStateFiles } from "./mcp-pid.js";
 import { embedLockPathForDb, tryAcquireEmbedLock, EMBED_LOCK_BUSY_MESSAGE } from "./embed-lock.js";
@@ -1926,8 +1926,9 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     ...excludeDirs.map(d => `**/${d}/**`),
     ...(ignorePatterns || []),
   ];
-  const allFiles: string[] = await fastGlob(splitGlobMask(globPattern), {
+  const allFiles: string[] = await glob(splitGlobMask(globPattern), {
     cwd: resolvedPwd,
+    expandDirectories: false,
     onlyFiles: true,
     followSymbolicLinks: false,
     dot: false,
@@ -4781,7 +4782,7 @@ if (isMain) {
           const selfPath = fileURLToPath(import.meta.url);
           const indexArgs = cli.values.index ? ["--index", String(cli.values.index)] : [];
           const hostArgs = host ? ["--host", host] : [];
-          const spawnArgs = selfPath.endsWith(".ts")
+          const spawnArgs = selfPath.endsWith(".ts") && !isBun
             ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs]
             : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port), ...hostArgs];
           const child = nodeSpawn(process.execPath, spawnArgs, {

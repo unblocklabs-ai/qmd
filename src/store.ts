@@ -20,7 +20,7 @@ import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
-import fastGlob from "fast-glob";
+import { glob } from "tinyglobby";
 import { qmdHomedir } from "./paths.js";
 import {
   LlamaCpp,
@@ -75,10 +75,10 @@ export interface VectorSearchTiming {
 export type VectorSearchTrace = (timing: VectorSearchTiming) => void;
 
 /**
- * Split a collection glob mask into fast-glob patterns.
+ * Split a collection glob mask into glob patterns.
  *
  * `--mask "a.md,*.txt"` is a comma-separated union (issue #557), but
- * fast-glob treats a comma outside `{...}` as a literal character, so
+ * Glob matching treats a comma outside `{...}` as a literal character, so
  * the joined string matches nothing. Brace form `{a.md,*.txt}` is
  * already valid glob syntax and is left intact.
  *
@@ -1755,8 +1755,9 @@ export async function reindexCollection(
     ...excludeDirs.map(d => `**/${d}/**`),
     ...(options?.ignorePatterns || []),
   ];
-  const allFiles: string[] = await fastGlob(splitGlobMask(globPattern), {
+  const allFiles: string[] = await glob(splitGlobMask(globPattern), {
     cwd: collectionPath,
+    expandDirectories: false,
     onlyFiles: true,
     followSymbolicLinks: false,
     dot: false,

@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixes
+
+- Replace the vulnerable glob dependency chain used for collection indexing
+  with tinyglobby, removing the braces stack-exhaustion advisory
+  (GHSA-vfj7-8cjw-p6xm) without changing collection masks or ignore patterns.
+- Launch TypeScript daemons directly under Bun instead of loading Node's tsx
+  hook, which can stall startup with ESM dependencies.
+
 ## [2.10.3] - 2026-10-04
 
 ### Documentation

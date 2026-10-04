@@ -639,6 +639,16 @@ describe("CLI Add Command", () => {
     expect(list.stdout).toContain("memory.md");
   });
 
+  test("does not expand a bare directory mask into its files", async () => {
+    const env = await createIsolatedTestEnv("directory-mask");
+    const result = await runQmd(
+      ["collection", "add", fixturesDir, "--name", "directory-mask", "--mask", "notes"],
+      { dbPath: env.dbPath, configDir: env.configDir },
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("No files found matching pattern");
+  });
+
   test("indexes comma-separated --mask patterns as a union (#557)", async () => {
     const env = await createIsolatedTestEnv("comma-mask");
     const collectionDir = join(testDir, `comma-mask-${testCounter}`);
