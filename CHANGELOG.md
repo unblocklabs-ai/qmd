@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.11.1] - 2026-10-04
+
 ### Changed
 
 - Use the existing collection/path index for exact virtual document reads,
