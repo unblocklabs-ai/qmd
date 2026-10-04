@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.10.4] - 2026-10-04
+
 ### Fixes
 
 - Replace the vulnerable glob dependency chain used for collection indexing
