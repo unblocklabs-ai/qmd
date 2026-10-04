@@ -1,4 +1,4 @@
-# QMD — Query Markup Documents
+# QMD - Query Markup Documents
 
 QMD is Unblock Labs' on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for agentic workflows.
 
@@ -204,7 +204,7 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
 
 | Tool | Parameter | Type | Notes |
 |------|-----------|------|-------|
-| `query` | `query` | string | Plain query to expand automatically. Mutually exclusive with `searches`. |
+| `query` | `query` | string | Plain query for vector + BM25 recall. Mutually exclusive with `searches`. |
 | `query` | `searches` | array | Typed sub-queries (`lex`/`vec`/`hyde`), 1–10. Mutually exclusive with `query`. |
 | `query` | `collections` | string[] | Filter by collection names (OR). **Array only** — singular `collection` is silently ignored. |
 | `query` | `intent` | string | Disambiguation context (does not search on its own) |
@@ -323,7 +323,7 @@ const results2 = await store.search({
   explain: true,
 })
 
-// Pre-expanded queries — skip auto-expansion, control each sub-query
+// Explicit typed variants — control each retrieval request
 const results3 = await store.search({
   queries: [
     { type: 'lex', query: '"connection pool" timeout -redis' },
@@ -542,7 +542,11 @@ reranking, query uses the best reciprocal retrieval rank (1 / rank).
 
 ### GGUF Models (via node-llama-cpp)
 
-QMD uses three local GGUF models (auto-downloaded on first use):
+QMD retains three local GGUF model roles, downloaded when an operation needs them.
+Plain `query` uses local embeddings plus remote TypeSafe scoring; it does not load
+the local generation or reranking models. Standalone `vsearch` uses the generation
+model for expansion unless `--no-expand` / SDK `expand:false` is supplied. Explicit
+SDK expansion and low-level local-rerank operations retain their respective models.
 
 | Model | Purpose | Size |
 |-------|---------|------|
@@ -847,7 +851,7 @@ never gated.
 ├──────────┬───────────────────────────────────────────────────────┤
 │ search   │ BM25 full-text search only                           │
 │ vsearch  │ Vector semantic search only                          │
-│ query    │ Hybrid: FTS + Vector + Query Expansion + Re-ranking  │
+│ query    │ Vector + BM25 recall, then TypeSafe ranking          │
 └──────────┴───────────────────────────────────────────────────────┘
 ```
 
@@ -1269,11 +1273,15 @@ Override them per-role without touching source via the `models:` block in
 
 ### Qwen3-Reranker
 
-Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross-encoder reranking. Returns documents sorted by relevance score (0.0 - 1.0).
+The explicit low-level local reranking primitive uses node-llama-cpp's
+`createRankingContext()` and `rankAndSort()` API. It returns cross-encoder relevance
+scores (0.0–1.0); it is not used by `query`, whose scores come from TypeSafe.
 
 ### Qwen3 (Query Expansion)
 
-Used for generating query variations via `LlamaChatSession`.
+Used for standalone `vsearch` expansion and explicit SDK `expandQuery` calls via
+`LlamaChatSession`. Plain `query` does not automatically generate variations;
+callers can supply typed variants themselves.
 
 ## License
 

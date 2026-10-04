@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [2.10.3] - 2026-10-04
+
+### Documentation
+
+- Clarify that plain hybrid `query` uses vector + BM25 recall and TypeSafe
+  ranking, without local query expansion or reranking. Standalone `vsearch`
+  and explicit SDK primitives retain their local model behavior.
+- Align the README, SDK option documentation, and agent skill. Runtime search
+  behavior is unchanged.
+
 ## [2.10.2] - 2026-09-25
 
 ### Changed

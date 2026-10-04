@@ -167,7 +167,7 @@ export type UpdateResult = {
 export interface SearchOptions extends Pick<HybridQueryOptions, "typesafe" | "signal" | "allowedPaths" | "trace" | "timeContext"> {
   /** Simple query string — literal vector + BM25 recall, then TypeSafe ranking */
   query?: string;
-  /** Pre-expanded queries (from expandQuery) — skips auto-expansion */
+  /** Explicit typed retrieval variants; plain query also performs no automatic expansion. */
   queries?: ExpandedQuery[];
   /** Domain intent hint — steers reranking and snippet/chunk selection */
   intent?: string;

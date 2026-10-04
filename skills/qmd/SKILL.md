@@ -265,8 +265,9 @@ server configuration.
 - **Do not slice files with `sed`/`head`/`tail`.** Use the `path:from:count`
   suffix (e.g. `qmd get "#abc123:120:40"`) or `--from`/`-l`. Output is already
   line-numbered; piping breaks docid resolution, the header, and virtual paths.
-- **No automatic query expansion.** Add intent or typed variants when they
+- **Plain `query` does not auto-expand.** Add intent or typed variants when they
   improve recall; plain queries already search both vector and BM25.
+  Standalone `vsearch` does expand locally unless `--no-expand` is supplied.
 - **Do not overuse semantic search.** If you know exact titles or terms, BM25 is
   faster and often better.
 - **Do not mutate indexes casually.** `qmd collection add`, `qmd update`, and
