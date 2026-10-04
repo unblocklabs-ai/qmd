@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.11.0] - 2026-10-04
+
 ### Added
 
 - Expose exact-depth single-lane candidate discovery in the SDK, sharing scoped
