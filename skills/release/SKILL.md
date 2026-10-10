@@ -47,11 +47,11 @@ When the user triggers `/release <version>`:
 
 7. **Push** — after explicit confirmation, run `git push origin main --tags`.
 
-8. **Publish the GitHub Release** — after CI passes, create a non-draft GitHub
+8. **Publish the GitHub Release and watch publication** — after CI passes, create a non-draft GitHub
    Release for the tag using the extracted changelog. The `published` release
    event triggers npm trusted publishing; pushing the tag alone does not.
 
-9. **Watch publication** — after creating the release, start a background dispatch to watch the
+   After creating the release, start a background dispatch to watch the
    publish workflow. Use `interactive_shell` in dispatch mode with:
    ```
    gh run watch $(gh run list --workflow=publish.yml --limit=1 --json databaseId --jq '.[0].databaseId') --exit-status
