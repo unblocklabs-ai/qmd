@@ -66,28 +66,8 @@ There is no session GET stream and no idle-session TTL.
 
 ## Tools
 
-### query
-
-Search with pre-expanded queries.
-
-```json
-{
-  "searches": [
-    { "type": "lex", "query": "keyword phrases" },
-    { "type": "vec", "query": "natural language question" },
-    { "type": "hyde", "query": "hypothetical answer passage..." }
-  ],
-  "limit": 10,
-  "collection": "optional",
-  "minScore": 0.0
-}
-```
-
-| Type | Method | Input |
-|------|--------|-------|
-| `lex` | BM25 | Keywords (2-5 terms) |
-| `vec` | Vector | Question |
-| `hyde` | Vector | Answer passage (50-100 words) |
+Search is provided by OpenClaw's `memory_search` tool, not this MCP server.
+The MCP `query` tool and REST `/query` and `/search` endpoints are removed.
 
 ### get
 

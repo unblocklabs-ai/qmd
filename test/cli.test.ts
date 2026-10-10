@@ -28,6 +28,7 @@ let testCounter = 0; // Unique counter for each test run
 // Get the directory where this test file lives
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(thisDir, "..");
+const canonicalSkill = readFileSync(join(projectRoot, "skills", "qmd", "SKILL.md"), "utf8");
 const qmdScript = join(projectRoot, "src", "cli", "qmd.ts");
 const isBunRuntime = typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
 const tsxCli = join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs");
@@ -232,14 +233,20 @@ beforeEach(async () => {
 });
 
 describe("CLI Help", () => {
+  test.each(["search", "query", "deep-search"])("removed %s command cannot search", async command => {
+    const { stderr, exitCode } = await runQmd([command, "meeting"]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Unknown command");
+  });
   test("shows help with --help flag", async () => {
     const { stdout, exitCode } = await runQmd(["--help"]);
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Usage:");
     expect(stdout).toContain("qmd collection add");
-    expect(stdout).toContain("qmd search");
+    expect(stdout).toContain("memory_search");
     expect(stdout).toContain("--no-gpu");
     expect(stdout).toContain("qmd skill show/install");
+    expect(stdout).not.toContain("qmd query <query>");
   });
 
   test("shows help with no arguments", async () => {
@@ -257,25 +264,23 @@ describe("CLI Skills", () => {
     expect(stderr).toBe("");
     expect(exitCode).toBe(0);
     expect(stdout).toContain("qmd");
-    expect(stdout).toContain("Search local markdown knowledge bases");
+    expect(stdout).toContain(canonicalSkill.match(/^description:\s*(.+)$/m)![1]);
   });
 
   test("gets version-matched runtime skill content", async () => {
     const { stdout, stderr, exitCode } = await runQmd(["skills", "get", "qmd"]);
     expect(stderr).toBe("");
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("# QMD - Query Markdown Documents");
-    expect(stdout).toContain("## MCP Tool: `query`");
-    expect(stdout).not.toContain("This file is a discovery stub");
+    expect(stdout).toBe(canonicalSkill);
   });
 
   test("gets runtime skill with supplementary references", async () => {
     const { stdout, stderr, exitCode } = await runQmd(["skills", "get", "qmd", "--full"]);
     expect(stderr).toBe("");
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("# QMD - Query Markdown Documents");
+    expect(stdout).toContain(canonicalSkill);
     expect(stdout).toContain("--- references/mcp-setup.md ---");
-    expect(stdout).toContain("# QMD MCP Server Setup");
+    expect(stdout).toContain(readFileSync(join(projectRoot, "skills", "qmd", "references", "mcp-setup.md"), "utf8"));
   });
 
   test("prints canonical repository skill path", async () => {
@@ -289,9 +294,7 @@ describe("CLI Skills", () => {
     const { stdout, stderr, exitCode } = await runQmd(["skill", "show"]);
     expect(stderr).toBe("");
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("# QMD - Query Markdown Documents");
-    expect(stdout).toContain("## MCP Tool: `query`");
-    expect(stdout).not.toContain("This file is a discovery stub");
+    expect(stdout).toContain(canonicalSkill);
   });
 
   test("legacy skill install writes a qmd skill show bootstrap", async () => {
@@ -361,7 +364,7 @@ describe("CLI Skill Commands", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain("QMD Skill");
     expect(stdout).toContain("name: qmd");
-    expect(stdout).toContain("allowed-tools: Bash(qmd:*), mcp__qmd__*");
+    expect(stdout).toContain(canonicalSkill);
   });
 
   test("shows skill help with -h", async () => {
@@ -972,111 +975,6 @@ describe("CLI Status Command", () => {
   });
 });
 
-describe("CLI Search Command", () => {
-  beforeEach(async () => {
-    // Ensure we have indexed files
-    await runQmd(["collection", "add", "."]);
-  });
-
-  test("searches for documents with BM25", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "meeting"]);
-    expect(exitCode).toBe(0);
-    // Should find meeting.md
-    expect(stdout.toLowerCase()).toContain("meeting");
-  });
-
-  test("searches with limit option", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "-n", "1", "test"]);
-    expect(exitCode).toBe(0);
-  });
-
-  test("searches with all results option", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "--all", "the"]);
-    expect(exitCode).toBe(0);
-  });
-
-  test("returns no results message for non-matching query", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "xyznonexistent123"]);
-    expect(exitCode).toBe(0);
-    expect(stdout).toContain("No results");
-  });
-
-  test("returns empty JSON array for non-matching query with --json", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "xyznonexistent123", "--json"]);
-    expect(exitCode).toBe(0);
-    expect(JSON.parse(stdout)).toEqual([]);
-  });
-
-  test("returns CSV header only for non-matching query with --csv", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "xyznonexistent123", "--csv"]);
-    expect(exitCode).toBe(0);
-    expect(stdout.trim()).toBe("docid,score,file,title,context,line,snippet");
-  });
-
-  test("returns empty XML container for non-matching query with --xml", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "xyznonexistent123", "--xml"]);
-    expect(exitCode).toBe(0);
-    expect(stdout.trim()).toBe("<results></results>");
-  });
-
-  test("returns empty output for non-matching query with --md", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "xyznonexistent123", "--md"]);
-    expect(exitCode).toBe(0);
-    expect(stdout.trim()).toBe("");
-  });
-
-  test("returns empty output for non-matching query with --files", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "xyznonexistent123", "--files"]);
-    expect(exitCode).toBe(0);
-    expect(stdout.trim()).toBe("");
-  });
-
-  test("returns min-score threshold message for default CLI output", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "test", "--min-score", "2"]);
-    expect(exitCode).toBe(0);
-    expect(stdout).toContain("No results found above minimum score threshold.");
-  });
-
-  test("returns format-safe empty output when --min-score filters all results", async () => {
-    const json = await runQmd(["search", "test", "--json", "--min-score", "2"]);
-    expect(json.exitCode).toBe(0);
-    expect(JSON.parse(json.stdout)).toEqual([]);
-
-    const csv = await runQmd(["search", "test", "--csv", "--min-score", "2"]);
-    expect(csv.exitCode).toBe(0);
-    expect(csv.stdout.trim()).toBe("docid,score,file,title,context,line,snippet");
-
-    const xml = await runQmd(["search", "test", "--xml", "--min-score", "2"]);
-    expect(xml.exitCode).toBe(0);
-    expect(xml.stdout.trim()).toBe("<results></results>");
-
-    const md = await runQmd(["search", "test", "--md", "--min-score", "2"]);
-    expect(md.exitCode).toBe(0);
-    expect(md.stdout.trim()).toBe("");
-
-    const files = await runQmd(["search", "test", "--files", "--min-score", "2"]);
-    expect(files.exitCode).toBe(0);
-    expect(files.stdout.trim()).toBe("");
-  });
-
-  test("requires query argument", async () => {
-    const { stdout, stderr, exitCode } = await runQmd(["search"]);
-    expect(exitCode).toBe(1);
-    // Error message goes to stderr
-    expect(stderr).toContain("Usage:");
-  });
-
-  test("--json --full includes line field for round-tripping to qmd get", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "meeting", "--json", "--full", "-n", "1"]);
-    expect(exitCode).toBe(0);
-    const results = JSON.parse(stdout);
-    expect(results.length).toBeGreaterThan(0);
-    expect(results[0].line).toBeTypeOf("number");
-    expect(results[0].line).toBeGreaterThan(0);
-    expect(results[0].body).toBeTypeOf("string");
-  });
-});
-
 describe("CLI Get Command", () => {
   beforeEach(async () => {
     // Ensure we have indexed files
@@ -1297,24 +1195,24 @@ describe("CLI Update Command", () => {
     expect(stdout).toContain("Updating");
   });
 
-  test("update removes blanked content from search and restores rewritten content", async () => {
+  test("update removes blanked indexed content and restores rewritten content", async () => {
     const env = await createIsolatedTestEnv("blanked");
     const root = await mkdtemp(join(testDir, "blanked-docs-"));
     const file = join(root, "note.md");
     const body = "# Note\n\nquartzblankingproof\n";
     await writeFile(file, body);
     expect((await runQmd(["collection", "add", root, "--name", "notes"], env)).exitCode).toBe(0);
-    const search = () => runQmd(["search", "quartzblankingproof", "--json"], env);
-    expect(JSON.parse((await search()).stdout)).toHaveLength(1);
+    const read = () => runQmd(["get", "qmd://notes/note.md"], env);
+    expect((await read()).stdout).toContain("quartzblankingproof");
     for (const empty of ["", " \n\t "]) {
       await writeFile(file, empty);
       const update = await runQmd(["update"], env);
       expect(update.exitCode).toBe(0);
       expect(update.stdout).toContain("0 new, 0 updated, 0 unchanged, 1 removed");
-      expect(JSON.parse((await search()).stdout)).toEqual([]);
+      expect((await read()).exitCode).toBe(1);
       await writeFile(file, body);
       expect((await runQmd(["update"], env)).exitCode).toBe(0);
-      expect(JSON.parse((await search()).stdout)).toHaveLength(1);
+      expect((await read()).stdout).toContain("quartzblankingproof");
     }
   });
 
@@ -1517,62 +1415,6 @@ describe("CLI Error Handling", () => {
 
     // The custom database should exist
     expect(existsSync(customDbPath)).toBe(true);
-  });
-});
-
-describe("CLI Output Formats", () => {
-  beforeEach(async () => {
-    await runQmd(["collection", "add", "."]);
-  });
-
-  test("search with --json flag outputs JSON", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "--json", "test"]);
-    expect(exitCode).toBe(0);
-    // Should be valid JSON
-    const parsed = JSON.parse(stdout);
-    expect(Array.isArray(parsed)).toBe(true);
-  });
-
-  test("search with --files flag outputs file paths", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "--files", "meeting"]);
-    expect(exitCode).toBe(0);
-    expect(stdout).toContain(".md");
-  });
-
-  test("search output includes snippets by default", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "API"]);
-    expect(exitCode).toBe(0);
-    // If results found, should have snippet content
-    if (!stdout.includes("No results")) {
-      expect(stdout.toLowerCase()).toContain("api");
-    }
-  });
-});
-
-describe("CLI Search with Collection Filter", () => {
-  let localDbPath: string;
-
-  beforeEach(async () => {
-    // Use a fresh database for this test suite
-    localDbPath = getFreshDbPath();
-    // Create multiple collections with explicit names
-    await runQmd(["collection", "add", ".", "--name", "notes", "--mask", "notes/*.md"], { dbPath: localDbPath });
-    await runQmd(["collection", "add", ".", "--name", "docs", "--mask", "docs/*.md"], { dbPath: localDbPath });
-  });
-
-  test("filters search by collection name", async () => {
-    const { stdout, stderr, exitCode } = await runQmd([
-      "search",
-      "-c",
-      "notes",
-      "meeting",
-    ], { dbPath: localDbPath });
-    if (exitCode !== 0) {
-      console.log("Collection filter search failed:");
-      console.log("stdout:", stdout);
-      console.log("stderr:", stderr);
-    }
-    expect(exitCode).toBe(0);
   });
 });
 
@@ -1953,21 +1795,20 @@ describe("collection ignore patterns", () => {
     expect(stdout).toContain("2 new");
   });
 
-  test("ignored files are not searchable", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "session", "-n", "10"], {
+  test("ignored files are absent from indexed listings", async () => {
+    const { stdout, exitCode } = await runQmd(["ls", "ignoretst"], {
       cwd: ignoreTestDir,
       dbPath: localDbPath,
       configDir: localConfigDir,
     });
     // Should find no results since sessions/ was ignored
-    if (exitCode === 0) {
-      expect(stdout).not.toContain("session1");
-      expect(stdout).not.toContain("session2");
-    }
+    expect(exitCode).toBe(0);
+    expect(stdout).not.toContain("session1");
+    expect(stdout).not.toContain("session2");
   });
 
-  test("non-ignored files are searchable", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "personal note", "-n", "10"], {
+  test("non-ignored files remain indexed", async () => {
+    const { stdout, exitCode } = await runQmd(["ls", "ignoretst"], {
       cwd: ignoreTestDir,
       dbPath: localDbPath,
       configDir: localConfigDir,
@@ -2014,237 +1855,6 @@ describe("collection ignore patterns", () => {
 // =============================================================================
 // Output Format Tests - qmd:// URIs, context, and docid
 // =============================================================================
-
-describe("search output formats", () => {
-  let localDbPath: string;
-  let localConfigDir: string;
-  const collName = "fixtures";
-
-  beforeAll(async () => {
-    const env = await createIsolatedTestEnv("output-format");
-    localDbPath = env.dbPath;
-    localConfigDir = env.configDir;
-
-    // Add collection
-    const { exitCode, stderr } = await runQmd(
-      ["collection", "add", fixturesDir, "--name", collName],
-      { dbPath: localDbPath, configDir: localConfigDir }
-    );
-    if (exitCode !== 0) console.error("collection add failed:", stderr);
-    expect(exitCode).toBe(0);
-
-    // Add context
-    await runQmd(["context", "add", `qmd://${collName}/`, "Test fixtures for QMD"], { dbPath: localDbPath, configDir: localConfigDir });
-  });
-
-  test("search --json includes qmd:// path, docid, and context", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "test", "--json", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
-    expect(exitCode).toBe(0);
-
-    const results = JSON.parse(stdout);
-    expect(results.length).toBeGreaterThan(0);
-
-    const result = results[0];
-    expect(result.file).toMatch(new RegExp(`^qmd://${collName}/`));
-    expect(result.docid).toMatch(/^#[a-f0-9]{6}$/);
-    expect(result.context).toBe("Test fixtures for QMD");
-    // Ensure no full filesystem paths
-    expect(result.file).not.toMatch(/^\/Users\//);
-    expect(result.file).not.toMatch(/^\/home\//);
-  });
-
-  test("custom-index search links include ?index= and can be passed back to qmd get", async () => {
-    const env = await createIsolatedTestEnv("custom-index-links");
-    const customColl = "fixtures-alt";
-    const customIndex = "release-notes";
-    const customCacheDir = join(testDir, `cache-${Date.now()}-${Math.random().toString(16).slice(2)}`);
-    await mkdir(customCacheDir, { recursive: true });
-
-    const sharedEnv = {
-      INDEX_PATH: "",
-      XDG_CACHE_HOME: customCacheDir,
-    };
-
-    const addResult = await runQmd(
-      ["--index", customIndex, "collection", "add", fixturesDir, "--name", customColl],
-      { dbPath: env.dbPath, configDir: env.configDir, env: sharedEnv }
-    );
-    expect(addResult.exitCode).toBe(0);
-
-    const searchResult = await runQmd(
-      ["--index", customIndex, "search", "test", "--json", "-n", "1"],
-      { dbPath: env.dbPath, configDir: env.configDir, env: sharedEnv }
-    );
-    expect(searchResult.exitCode).toBe(0);
-
-    const results = JSON.parse(searchResult.stdout);
-    const file = results[0]?.file;
-    expect(file).toMatch(new RegExp(`^qmd://${customColl}/.+\\?index=${customIndex}$`));
-
-    const getResult = await runQmd(
-      ["get", file, "-l", "2"],
-      { dbPath: env.dbPath, configDir: env.configDir, env: sharedEnv }
-    );
-    expect(getResult.exitCode).toBe(0);
-    expect(getResult.stdout.trim().length).toBeGreaterThan(0);
-  });
-
-  test("search --files includes qmd:// path, docid, and context", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "test", "--files", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
-    expect(exitCode).toBe(0);
-
-    // Format: #docid,score,qmd://collection/path,"context"
-    expect(stdout).toMatch(new RegExp(`^#[a-f0-9]{6},[\\d.]+,qmd://${collName}/`, "m"));
-    expect(stdout).toContain("Test fixtures for QMD");
-    // Ensure no full filesystem paths
-    expect(stdout).not.toMatch(/\/Users\//);
-    expect(stdout).not.toMatch(/\/home\//);
-  });
-
-  test("search --csv includes qmd:// path, docid, and context", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "test", "--csv", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
-    expect(exitCode).toBe(0);
-
-    // Header should include context
-    expect(stdout).toMatch(/^docid,score,file,title,context,line,snippet$/m);
-    // Data rows should have qmd:// paths and context
-    expect(stdout).toMatch(new RegExp(`#[a-f0-9]{6},[\\d.]+,qmd://${collName}/`));
-    expect(stdout).toContain("Test fixtures for QMD");
-    // Ensure no full filesystem paths
-    expect(stdout).not.toMatch(/\/Users\//);
-    expect(stdout).not.toMatch(/\/home\//);
-  });
-
-  test("search --md includes docid, context, and qmd:// file line", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "test", "--md", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
-    expect(exitCode).toBe(0);
-
-    expect(stdout).toMatch(/\*\*docid:\*\* `#[a-f0-9]{6}`/);
-    expect(stdout).toContain("**context:** Test fixtures for QMD");
-    // The file path must be a qmd:// URI so the model can pipe it back into
-    // `qmd get` without having to reassemble a collection-relative string.
-    expect(stdout).toMatch(new RegExp(`\\*\\*file:\\*\\* \`qmd://${collName}/`));
-  });
-
-  test("search --xml includes qmd:// path, docid, and context", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "test", "--xml", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
-    expect(exitCode).toBe(0);
-
-    expect(stdout).toMatch(new RegExp(`<file docid="#[a-f0-9]{6}" name="qmd://${collName}/`));
-    expect(stdout).toContain('context="Test fixtures for QMD"');
-    // Ensure no full filesystem paths
-    expect(stdout).not.toMatch(/\/Users\//);
-    expect(stdout).not.toMatch(/\/home\//);
-  });
-
-  test("search --full-path --json swaps qmd:// for absolute realpath when cwd is unrelated", async () => {
-    // Use "/" as cwd so the fixtures path (under tmpdir) is NOT a subpath of $PWD.
-    const { stdout, exitCode } = await runQmd(
-      ["search", "test", "--full-path", "--json", "-n", "1"],
-      { dbPath: localDbPath, configDir: localConfigDir, cwd: "/" }
-    );
-    expect(exitCode).toBe(0);
-    const results = JSON.parse(stdout);
-    expect(results.length).toBeGreaterThan(0);
-    const result = results[0];
-    expect(result.file).not.toMatch(/^qmd:\/\//);
-    // Must be an absolute path ending in .md.
-    expect(result.file).toMatch(/^\/.+\.md$/);
-    // --full-path: the on-disk path replaces the docid as the identifier.
-    expect(result.docid).toBeUndefined();
-  });
-
-  test("search --full-path --json uses ./-prefixed $PWD-relative path when in a parent of the file", async () => {
-    const { stdout, exitCode } = await runQmd(
-      ["search", "test", "--full-path", "--json", "-n", "1"],
-      { dbPath: localDbPath, configDir: localConfigDir, cwd: fixturesDir }
-    );
-    expect(exitCode).toBe(0);
-    const results = JSON.parse(stdout);
-    expect(results.length).toBeGreaterThan(0);
-    const result = results[0];
-    expect(result.file).not.toMatch(/^qmd:\/\//);
-    // Must start with "./" so it's unambiguously a filesystem path and not
-    // mistaken for a bare collection-relative string.
-    expect(result.file.startsWith("./")).toBe(true);
-    expect(result.file).not.toMatch(/^\.\.\//);
-    expect(result.file).toMatch(/\.md$/);
-  });
-
-  test("search --full-path default CLI format shows on-disk path and drops the docid", async () => {
-    const { stdout, exitCode } = await runQmd(
-      ["search", "test", "--full-path", "-n", "1"],
-      { dbPath: localDbPath, configDir: localConfigDir, cwd: "/" }
-    );
-    expect(exitCode).toBe(0);
-    // eslint-disable-next-line no-control-regex
-    const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b\]8;;[^\x07]*\x07/g, "");
-    const plain = stripAnsi(stdout);
-    expect(plain).not.toMatch(/qmd:\/\//);
-    expect(plain).toMatch(/^\/.+\.md/m);
-    // No `#docid` suffix when --full-path is set.
-    expect(plain).not.toMatch(/#[a-f0-9]{6}\s*$/m);
-  });
-
-  test("search --full-path --md uses on-disk path in heading and drops the docid", async () => {
-    const { stdout, exitCode } = await runQmd(
-      ["search", "test", "--full-path", "--md", "-n", "1"],
-      { dbPath: localDbPath, configDir: localConfigDir, cwd: "/" }
-    );
-    expect(exitCode).toBe(0);
-    expect(stdout).not.toMatch(/qmd:\/\//);
-    expect(stdout).not.toMatch(/\*\*docid:\*\*/);
-    expect(stdout).toMatch(/\*\*file:\*\* `\/.+\.md`/);
-  });
-
-  test("search --format json matches the legacy --json behavior", async () => {
-    const a = await runQmd(["search", "test", "--format", "json", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
-    const b = await runQmd(["search", "test", "--json", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
-    expect(a.exitCode).toBe(0);
-    expect(b.exitCode).toBe(0);
-    // Both must yield valid JSON with at least one result.
-    const ar = JSON.parse(a.stdout);
-    const br = JSON.parse(b.stdout);
-    expect(ar.length).toBeGreaterThan(0);
-    expect(br.length).toBeGreaterThan(0);
-    // Identical first-result file path (the rest may differ in score formatting only).
-    expect(ar[0].file).toBe(br[0].file);
-  });
-
-  test("search --format md works equivalent to legacy --md", async () => {
-    const a = await runQmd(["search", "test", "--format", "md", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
-    expect(a.exitCode).toBe(0);
-    expect(a.stdout).toMatch(/\*\*docid:\*\* `#[a-f0-9]{6}`/);
-    expect(a.stdout).toMatch(new RegExp(`\\*\\*file:\\*\\* \`qmd://${collName}/`));
-  });
-
-  test("search --format with an unknown kind fails cleanly", async () => {
-    const { exitCode, stderr } = await runQmd(["search", "test", "--format", "yaml", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
-    expect(exitCode).not.toBe(0);
-    expect(stderr).toContain("Unknown --format value");
-  });
-
-  test("search default CLI format includes plain qmd:// path, docid, and context in non-TTY mode", async () => {
-    const { stdout, exitCode } = await runQmd(["search", "test", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
-    expect(exitCode).toBe(0);
-
-    // runQmd uses piped stdio, so stdout is non-TTY and should not contain OSC 8 links.
-    expect(stdout).toMatch(new RegExp(`^qmd://${collName}/.*#[a-f0-9]{6}`, "m"));
-    expect(stdout).toContain("Context: Test fixtures for QMD");
-    expect(stdout).not.toContain("\x1b]8;;");
-    // Ensure no full filesystem paths
-    expect(stdout).not.toMatch(/\/Users\//);
-    expect(stdout).not.toMatch(/\/home\//);
-    // The visible path must NOT be the bare collection-relative form
-    // (a leading `${collName}/foo.md` would be "relative to nowhere").
-    // Strip ANSI and OSC 8 sequences then assert no result line starts with
-    // a bare collection-relative path missing the qmd:// scheme.
-    // eslint-disable-next-line no-control-regex
-    const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b\]8;;[^\x07]*\x07/g, "");
-    const plain = stripAnsi(stdout);
-    expect(plain).not.toMatch(new RegExp(`^${collName}/`, "m"));
-  });
-});
 
 describe("editor URI templates", () => {
   test("buildEditorUri expands path, line, and col placeholders", () => {
@@ -2730,15 +2340,21 @@ describe("mcp http daemon", () => {
       const ready = await waitForServer(port);
       expect(ready).toBe(true);
 
-      const res = await fetch(`http://localhost:${port}/query`, {
+      const res = await fetch(`http://localhost:${port}/mcp`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ searches: [{ type: "lex", query: "authentication" }], limit: 5, rerank: false }),
+        headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream",
+          "MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "tools/call", "Mcp-Name": "get" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
+          params: { name: "get", arguments: { file: "qmd://mcp-fixtures/notes/meeting.md" }, _meta: {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": { name: "named-index-test", version: "1.0.0" },
+            "io.modelcontextprotocol/clientCapabilities": {},
+          } } }),
       });
       expect(res.status).toBe(200);
       const body = await res.json();
-      const files = body.results.map((r: { file: string }) => r.file);
-      expect(files.some((file: string) => file.includes("mcp-fixtures/notes/meeting.md"))).toBe(true);
+      expect(body.result.isError).not.toBe(true);
+      expect(JSON.stringify(body.result)).toContain("mcp-fixtures/notes/meeting.md");
     } finally {
       const closed = new Promise(r => proc.once("close", r));
       proc.kill("SIGTERM");
@@ -2746,7 +2362,7 @@ describe("mcp http daemon", () => {
     }
   }, 10000);
 
-  test("daemon HTTP server honors --index, scopes pidfile, and queries the named store (#772)", async () => {
+  test("daemon HTTP server honors --index, scopes pidfile, and reads the named store (#772)", async () => {
     const customIndex = "mcp-daemon-alt-index";
     const customCacheDir = join(daemonTestDir, `cache-daemon-index-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     const customConfigDir = join(daemonTestDir, `config-daemon-index-${Date.now()}-${Math.random().toString(16).slice(2)}`);
@@ -2807,15 +2423,21 @@ describe("mcp http daemon", () => {
       const ready = await waitForServer(port);
       expect(ready).toBe(true);
 
-      const res = await fetch(`http://localhost:${port}/query`, {
+      const res = await fetch(`http://localhost:${port}/mcp`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ searches: [{ type: "lex", query: "authentication" }], limit: 5, rerank: false }),
+        headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream",
+          "MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "tools/call", "Mcp-Name": "get" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
+          params: { name: "get", arguments: { file: "qmd://mcp-fixtures/notes/meeting.md" }, _meta: {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": { name: "named-index-test", version: "1.0.0" },
+            "io.modelcontextprotocol/clientCapabilities": {},
+          } } }),
       });
       expect(res.status).toBe(200);
       const body = await res.json();
-      const files = body.results.map((r: { file: string }) => r.file);
-      expect(files.some((file: string) => file.includes("mcp-fixtures/notes/meeting.md"))).toBe(true);
+      expect(body.result.isError).not.toBe(true);
+      expect(JSON.stringify(body.result)).toContain("mcp-fixtures/notes/meeting.md");
 
       const { stdout: stopOut, exitCode: stopCode } = await runQmd(
         ["--index", customIndex, "mcp", "stop"],

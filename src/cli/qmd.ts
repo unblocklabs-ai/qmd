@@ -16,7 +16,6 @@ import {
   homedir,
   resolve,
   enableProductionMode,
-  searchFTS,
   extractSnippet,
   getContextForFile,
   getContextForPath,
@@ -64,9 +63,7 @@ import {
   getTopLevelPathsWithoutContext,
   handelize,
   escapeLikePattern,
-  hybridQuery,
   vectorSearchQuery,
-  structuredSearch,
   addLineNumbers,
   type ExpandedQuery,
   type HybridQueryExplain,
@@ -640,7 +637,7 @@ async function showStatus(): Promise<void> {
     }
     console.log(`  ${c.dim}# Search within a collection${c.reset}`);
     if (collections.length > 0 && collections[0]) {
-      console.log(`  qmd search "query" -c ${collections[0].name}`);
+      console.log(`  qmd vsearch "query" --no-expand -c ${collections[0].name}`);
     }
   } else {
     console.log(`\n${c.dim}No collections. Run 'qmd collection add .' to index markdown files.${c.reset}`);
@@ -2683,128 +2680,6 @@ function collectionSearchFilter(names: string[]): string | string[] | undefined 
   return names;
 }
 
-/**
- * Parse structured search query syntax.
- * Lines starting with lex:, vec:, or hyde: are routed directly.
- * Plain lines without prefix use literal hybrid retrieval and TypeSafe scoring.
- * 
- * Returns null if this is a plain query (single line, no prefix).
- * Returns ExpandedQuery[] if structured syntax detected.
- * Throws if multiple plain lines (ambiguous).
- * 
- * Examples:
- *   "CAP theorem"                    -> null (plain query, use expansion)
- *   "lex: CAP theorem"               -> [{ type: 'lex', query: 'CAP theorem' }]
- *   "lex: CAP\nvec: consistency"     -> [{ type: 'lex', ... }, { type: 'vec', ... }]
- *   "CAP\nconsistency"               -> throws (multiple plain lines)
- */
-interface ParsedStructuredQuery {
-  searches: ExpandedQuery[];
-  intent?: string;
-}
-
-function parseStructuredQuery(query: string): ParsedStructuredQuery | null {
-  const rawLines = query.split('\n').map((line, idx) => ({
-    raw: line,
-    trimmed: line.trim(),
-    number: idx + 1,
-  })).filter(line => line.trimmed.length > 0);
-
-  if (rawLines.length === 0) return null;
-
-  const prefixRe = /^(lex|vec|hyde):\s*/i;
-  const expandRe = /^expand:\s*/i;
-  const intentRe = /^intent:\s*/i;
-  const typed: ExpandedQuery[] = [];
-  let intent: string | undefined;
-
-  for (const line of rawLines) {
-    if (expandRe.test(line.trimmed)) {
-      if (rawLines.length > 1) {
-        throw new Error(`Line ${line.number} starts with expand:, but query documents cannot mix expand with typed lines. Submit a single expand query instead.`);
-      }
-      const text = line.trimmed.replace(expandRe, '').trim();
-      if (!text) {
-        throw new Error('expand: query must include text.');
-      }
-      return null; // treat as standalone expand query
-    }
-
-    // Parse intent: lines
-    if (intentRe.test(line.trimmed)) {
-      if (intent !== undefined) {
-        throw new Error(`Line ${line.number}: only one intent: line is allowed per query document.`);
-      }
-      const text = line.trimmed.replace(intentRe, '').trim();
-      if (!text) {
-        throw new Error(`Line ${line.number}: intent: must include text.`);
-      }
-      intent = text;
-      continue;
-    }
-
-    const match = line.trimmed.match(prefixRe);
-    if (match) {
-      const type = match[1]!.toLowerCase() as 'lex' | 'vec' | 'hyde';
-      const text = line.trimmed.slice(match[0].length).trim();
-      if (!text) {
-        throw new Error(`Line ${line.number} (${type}:) must include text.`);
-      }
-      if (/\r|\n/.test(text)) {
-        throw new Error(`Line ${line.number} (${type}:) contains a newline. Keep each query on a single line.`);
-      }
-      typed.push({ type, query: text, line: line.number });
-      continue;
-    }
-
-    if (rawLines.length === 1) {
-      // Single plain line -> implicit expand
-      return null;
-    }
-
-    throw new Error(`Line ${line.number} is missing a lex:/vec:/hyde:/intent: prefix. Each line in a query document must start with one.`);
-  }
-
-  // intent: alone is not a valid query — must have at least one search
-  if (intent && typed.length === 0) {
-    throw new Error('intent: cannot appear alone. Add at least one lex:, vec:, or hyde: line.');
-  }
-
-  return typed.length > 0 ? { searches: typed, intent } : null;
-}
-
-function search(query: string, opts: OutputOptions): void {
-  const db = getDb();
-
-  // Validate collection filter (supports multiple -c flags)
-  // Use default collections if none specified
-  const collectionNames = resolveCollectionFilter(opts.collection, true);
-
-  // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
-  const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-  const results = searchFTS(db, query, fetchLimit, collectionSearchFilter(collectionNames));
-
-  // Add context to results
-  const resultsWithContext = results.map(r => ({
-    file: r.filepath,
-    displayPath: r.displayPath,
-    title: r.title,
-    body: r.body || "",
-    score: r.score,
-    context: getContextForFile(db, r.filepath),
-    hash: r.hash,
-    docid: r.docid,
-  }));
-
-  closeDb();
-
-  if (resultsWithContext.length === 0) {
-    printEmptySearchResults(opts.format);
-    return;
-  }
-  outputResults(resultsWithContext, query, opts);
-}
-
 // Log query expansion as a tree to stderr (CLI progress feedback)
 function logExpansionTree(originalQuery: string, expanded: ExpandedQuery[]): void {
   const lines: string[] = [];
@@ -2863,125 +2738,6 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       chunkLen: r.chunkLen,
     })), query, { ...opts, limit: results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
-}
-
-async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
-  const store = getStore();
-
-  // Validate collection filter (supports multiple -c flags)
-  // Use default collections if none specified
-  const collectionNames = resolveCollectionFilter(opts.collection, true);
-
-  checkIndexHealth(store.db);
-
-  // Check for structured query syntax (lex:/vec:/hyde:/intent: prefixes)
-  const parsed = parseStructuredQuery(query);
-  if (!parsed) query = query.replace(/^expand:\s*/i, ""); // Legacy spelling, now literal hybrid recall.
-  // Intent can come from --intent flag or from intent: line in query document
-  const intent = opts.intent || parsed?.intent;
-
-  await withLLMSession(async () => {
-    let results;
-
-    if (parsed) {
-      const structuredQueries = parsed.searches;
-      // Structured search — user provided their own query expansions
-      const typeLabels = structuredQueries.map(s => s.type).join('+');
-      process.stderr.write(`${c.dim}Structured search: ${structuredQueries.length} queries (${typeLabels})${c.reset}\n`);
-      if (intent) {
-        process.stderr.write(`${c.dim}├─ intent: ${intent}${c.reset}\n`);
-      }
-
-      // Log each sub-query
-      for (const s of structuredQueries) {
-        let preview = s.query.replace(/\n/g, ' ');
-        if (preview.length > 72) preview = preview.substring(0, 69) + '...';
-        process.stderr.write(`${c.dim}├─ ${s.type}: ${preview}${c.reset}\n`);
-      }
-      process.stderr.write(`${c.dim}└─ Searching...${c.reset}\n`);
-
-      results = await structuredSearch(store, structuredQueries, {
-        collections: collectionNames.length > 0 ? collectionNames : undefined,
-        limit: opts.all ? 500 : (opts.limit || 10),
-        minScore: opts.minScore || 0,
-        candidateLimit: opts.candidateLimit,
-        skipRerank: opts.skipRerank,
-        explain: !!opts.explain,
-        intent,
-        chunkStrategy: opts.chunkStrategy,
-        hooks: {
-          onEmbedStart: (count) => {
-            process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
-          },
-          onEmbedDone: (ms) => {
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
-          },
-          onRerankStart: (chunkCount) => {
-            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
-            progress.indeterminate();
-          },
-          onRerankDone: (ms) => {
-            progress.clear();
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
-          },
-        },
-      });
-    } else {
-      // Literal hybrid retrieval and independent TypeSafe scoring.
-      results = await hybridQuery(store, query, {
-        collection: collectionSearchFilter(collectionNames),
-        limit: opts.all ? 500 : (opts.limit || 10),
-        minScore: opts.minScore || 0,
-        candidateLimit: opts.candidateLimit,
-        skipRerank: opts.skipRerank,
-        explain: !!opts.explain,
-        intent,
-        chunkStrategy: opts.chunkStrategy,
-        hooks: {
-          onEmbedStart: (count) => {
-            process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
-          },
-          onEmbedDone: (ms) => {
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
-          },
-          onRerankStart: (chunkCount) => {
-            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
-            progress.indeterminate();
-          },
-          onRerankDone: (ms) => {
-            progress.clear();
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
-          },
-        },
-      });
-    }
-
-    closeDb();
-
-    if (results.length === 0) {
-      printEmptySearchResults(opts.format);
-      return;
-    }
-
-    // Use first lex/vec query for output context, or original query
-    const structuredQueries = parsed?.searches;
-    const displayQuery = structuredQueries
-      ? (structuredQueries.find(s => s.type === 'lex')?.query || structuredQueries.find(s => s.type === 'vec')?.query || query)
-      : query;
-
-    outputResults(results.map(r => ({
-      file: r.file,
-      displayPath: r.displayPath,
-      title: r.title,
-      body: r.body,
-      chunkPos: r.bestChunkPos,
-      chunkLen: r.bestChunk.length,
-      score: r.score,
-      context: r.context,
-      docid: r.docid,
-      explain: r.explain,
-    })), displayQuery, { ...opts, limit: results.length });
-  }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
 }
 
 // Parse CLI arguments using util.parseArgs
@@ -3544,9 +3300,7 @@ function showHelp(): void {
   console.log("  qmd <command> [options]");
   console.log("");
   console.log("Primary commands:");
-  console.log("  qmd query <query>             - Vector + BM25 search with TypeSafe ranking");
-  console.log("  qmd query 'lex:..\\nvec:...'   - Structured query document (you provide lex/vec/hyde lines)");
-  console.log("  qmd search <query>            - Full-text BM25 keywords (no LLM)");
+  console.log("  Use OpenClaw memory_search for BM25 + vector retrieval with TypeSafe ranking.");
   console.log("  qmd vsearch <query>           - Vector similarity only");
   console.log("  qmd get <file>[:from[:count]] - Show a document (line-numbered; #docid in header)");
   console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
@@ -3572,40 +3326,6 @@ function showHelp(): void {
   console.log("  qmd pull [--refresh] [--progress] - Download embedding/generation/rerank models");
   console.log("  qmd cleanup [--dry-run]       - Drop inactive docs/orphans, compact FTS, vacuum");
   console.log("");
-  console.log("Query syntax (qmd query):");
-  console.log("  QMD queries are either a literal hybrid query (no prefix) or a multi-line");
-  console.log("  document where every line is typed with lex:, vec:, or hyde:. This grammar");
-  console.log("  matches the docs in docs/SYNTAX.md and is enforced in the CLI.");
-  console.log("");
-  const grammar = [
-    `query          = expand_query | query_document ;`,
-    `expand_query   = text | explicit_expand ;`,
-    `explicit_expand= "expand:" text ;`,
-    `query_document = [ intent_line ] { typed_line } ;`,
-    `intent_line    = "intent:" text newline ;`,
-    `typed_line     = type ":" text newline ;`,
-    `type           = "lex" | "vec" | "hyde" ;`,
-    `text           = quoted_phrase | plain_text ;`,
-    `quoted_phrase  = '"' { character } '"' ;`,
-    `plain_text     = { character } ;`,
-    `newline        = "\\n" ;`,
-  ];
-  console.log("  Grammar:");
-  for (const line of grammar) {
-    console.log(`    ${line}`);
-  }
-  console.log("");
-  console.log("  Examples:");
-  console.log("    qmd query \"how does auth work\"                # vector + BM25 → TypeSafe");
-  console.log("    qmd query $'lex: CAP theorem\\nvec: consistency'  # typed query document");
-  console.log("    qmd query $'lex: \"exact matches\" sports -baseball'  # phrase + negation lex search");
-  console.log("    qmd query $'hyde: Hypothetical answer text'       # hyde-only document");
-  console.log("");
-  console.log("  Constraints:");
-  console.log("    - Standalone expand queries cannot mix with typed lines.");
-  console.log("    - Query documents allow only lex:, vec:, or hyde: prefixes.");
-  console.log("    - Each typed line must be single-line text with balanced quotes.");
-  console.log("");
   console.log("AI agents & integrations:");
   console.log("  - Run `qmd mcp` to expose the MCP server (stdio) to agents/IDEs.");
   console.log("  - Run `qmd skills get qmd --full` for version-matched agent instructions.");
@@ -3625,7 +3345,6 @@ function showHelp(): void {
   console.log("  --full                     - Output full document instead of snippet");
   console.log("  -C, --candidate-limit <n>  - Optional cap after deduplication (default: all candidates)");
   console.log("  --no-rerank                - Local-only reciprocal-rank ordering; no TypeSafe calls");
-  console.log("  TYPESAFE_API_KEY[_FILE]    - Server-side query credential; file may be raw key or dotenv");
   console.log("  --no-expand                - vsearch only: use the literal query without LLM expansion");
   console.log("  --no-gpu                   - Force CPU mode for llama.cpp operations (same as QMD_FORCE_CPU=1)");
   console.log("  --line-numbers             - Include line numbers (search; get/multi-get are on by default)");
@@ -3633,7 +3352,6 @@ function showHelp(): void {
   console.log("  --full-path                - Show on-disk paths instead of qmd:// + docid (get/multi-get/search/query)");
   console.log("                                Paths are ./-prefixed when under $PWD, absolute otherwise");
   console.log("                                Results whose file is gone keep qmd:// + docid and warn on stderr");
-  console.log("  --explain                  - Include retrieval score traces (query, CLI/--format json)");
   console.log("  --format <kind>            - Output format: cli (default) | json | csv | md | xml | files");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
   console.log("");
@@ -3900,7 +3618,7 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   if (invalid.length > 0) {
     nextSteps.push("Run `qmd pull --refresh` to replace invalid cached model files, or delete the listed file and rerun `qmd pull`.");
   } else {
-    nextSteps.push("Run `qmd pull` to download missing embedding/generation/reranking models before `qmd embed` or `qmd query`.");
+    nextSteps.push("Run `qmd pull` to download missing models before `qmd embed` or `qmd vsearch`.");
   }
 }
 
@@ -4663,14 +4381,6 @@ if (isMain) {
       break;
     }
 
-    case "search":
-      if (!cli.query) {
-        console.error("Usage: qmd search [options] <query>");
-        process.exit(1);
-      }
-      search(cli.query, cli.opts);
-      break;
-
     case "vsearch":
     case "vector-search": // undocumented alias
       if (!cli.query) {
@@ -4683,16 +4393,6 @@ if (isMain) {
       }
       await resolveLocalConfigTrust();
       await vectorSearch(cli.query, cli.opts);
-      break;
-
-    case "query":
-    case "deep-search": // undocumented alias
-      if (!cli.query) {
-        console.error("Usage: qmd query [options] <query>");
-        process.exit(1);
-      }
-      await resolveLocalConfigTrust();
-      await querySearch(cli.query, cli.opts);
       break;
 
     case "bench": {

@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-10-10
+
+### Changed
+
+- Remove CLI `query`, `search` and `deep-search`, MCP `query`, and REST
+  `/query` and `/search`. Ranked agent search now belongs to Unblock Memory's
+  two-query `memory_search` tool. Indexed reads, maintenance, local `vsearch`,
+  and low-level SDK retrieval remain available.
+- Update bundled agent guidance for indexed reads and the unified search tool.
+- Validate removed routes and origin guards against the real HTTP server in CI.
+
 ## [2.11.1] - 2026-10-04
 
 ### Changed

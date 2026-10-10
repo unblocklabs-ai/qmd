@@ -18,12 +18,10 @@ import { z } from "zod";
 import { existsSync } from "fs";
 import {
   createStore,
-  extractSnippet,
   addLineNumbers,
   getDefaultDbPath,
   DEFAULT_MULTI_GET_MAX_BYTES,
   type QMDStore,
-  type ExpandedQuery,
   type IndexStatus,
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
@@ -33,16 +31,6 @@ import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 // =============================================================================
 // Types for structured content
 // =============================================================================
-
-type SearchResultItem = {
-  docid: string;  // Short docid (#abc123) for quick reference
-  file: string;
-  title: string;
-  score: number;
-  context: string | null;
-  line: number;   // Absolute line in source markdown
-  snippet: string;
-};
 
 type StatusResult = {
   totalDocuments: number;
@@ -68,20 +56,6 @@ type StatusResult = {
 function encodeQmdPath(path: string): string {
   // Encode each path segment separately to preserve slashes
   return path.split('/').map(segment => encodeURIComponent(segment)).join('/');
-}
-
-/**
- * Format search results as human-readable text summary
- */
-function formatSearchSummary(results: SearchResultItem[], query: string): string {
-  if (results.length === 0) {
-    return `No results found for "${query}"`;
-  }
-  const lines = [`Found ${results.length} result${results.length === 1 ? '' : 's'} for "${query}":\n`];
-  for (const r of results) {
-    lines.push(`${r.docid} ${Math.round(r.score * 100)}% ${r.file} - ${r.title}`);
-  }
-  return lines.join('\n');
 }
 
 function getPackageVersion(): string {
@@ -132,21 +106,6 @@ async function buildInstructions(store: QMDStore): Promise<string> {
     lines.push(`Note: ${status.needsEmbedding} documents need embedding. Run \`qmd embed\` to update.`);
   }
 
-  // --- Search tool ---
-  lines.push("");
-  lines.push("Search: `query` combines vector + BM25 recall and TypeSafe ranking. Plain query or typed variants:");
-  lines.push("  - type:'lex' — BM25 keyword search (exact terms, fast)");
-  lines.push("  - type:'vec' — semantic vector search (meaning-based)");
-  lines.push("  - type:'hyde' — hypothetical document (write what the answer looks like)");
-  lines.push("");
-  lines.push("  Always provide `intent` on every search call to disambiguate and improve snippets.");
-  lines.push("");
-  lines.push("Examples:");
-  lines.push("  Quick keyword lookup: [{type:'lex', query:'error handling'}]");
-  lines.push("  Semantic search: [{type:'vec', query:'how to handle errors gracefully'}]");
-  lines.push("  Best results: [{type:'lex', query:'error'}, {type:'vec', query:'error handling best practices'}]");
-  lines.push("  With intent: searches=[{type:'lex', query:'performance'}], intent='web page load times'");
-
   // --- Retrieval workflow ---
   lines.push("");
   lines.push("Retrieval:");
@@ -157,7 +116,7 @@ async function buildInstructions(store: QMDStore): Promise<string> {
   lines.push("");
   lines.push("Tips:");
   lines.push("  - File paths in results are relative to their collection.");
-  lines.push("  - Use `minScore: 0.5` to filter low-confidence results.");
+  lines.push("  - Search through OpenClaw's `memory_search` tool; this server provides indexed document reads and status only.");
   lines.push("  - Results include a `context` field describing the content type.");
 
   return lines.join("\n");
@@ -184,9 +143,6 @@ async function createMcpServer(store: QMDStore, inflight?: InflightGate): Promis
       },
     },
   );
-
-  // Pre-fetch default collection names for search tools
-  const defaultCollectionNames = await store.getDefaultCollectionNames();
 
   // ---------------------------------------------------------------------------
   // Resource: qmd://{path} - read-only access to documents by path
@@ -229,111 +185,6 @@ async function createMcpServer(store: QMDStore, inflight?: InflightGate): Promis
           mimeType: "text/markdown",
           text,
         }],
-      };
-    })
-  );
-
-  // ---------------------------------------------------------------------------
-  // Tool: query (Primary search tool)
-  // ---------------------------------------------------------------------------
-
-  const subSearchSchema = z.object({
-    type: z.enum(['lex', 'vec', 'hyde']).describe(
-      "lex = BM25 keywords (supports \"phrase\" and -negation); " +
-      "vec = semantic question; hyde = hypothetical answer passage"
-    ),
-    query: z.string().describe(
-      "The query text. For lex: use keywords, \"quoted phrases\", and -negation. " +
-      "For vec: natural language question. For hyde: 50-100 word answer passage."
-    ),
-  });
-
-  server.registerTool(
-    "query",
-    {
-      title: "Query",
-      description: "Search with vector + BM25 recall, deduplicate source excerpts, and rank each independently with TypeSafe. Plain query retrieves ceil(1.5 × limit) from each backend without local expansion or reranking. Typed searches remain supported: lex uses quoted phrases and -negation, vec/hyde use semantic retrieval. TypeSafe receives the query, optional intent, source paths, selected excerpts and evaluation time; requires a server-side TYPESAFE_API_KEY or TYPESAFE_API_KEY_FILE. Scores reflect usefulness, not proof of truth. Set rerank:false for explicit local-only retrieval. Each result includes a 1-based line for use with get. Different useful passages from one file may be returned.",
-      annotations: { readOnlyHint: true, openWorldHint: true },
-      inputSchema: z.object({
-        query: z.string().optional().describe(
-          "Plain-text query for vector + BM25 recall and TypeSafe ranking. " +
-          "Recommended default. Mutually exclusive with 'searches'."
-        ),
-        searches: z.array(subSearchSchema).max(10).optional().describe(
-          "Typed sub-queries to execute (lex/vec/hyde). Use for precise " +
-          "control over retrieval strategy. Mutually exclusive with 'query'."
-        ),
-        limit: z.number().int().min(1).max(500).optional().default(10).describe("Max results (default: 10)"),
-        minScore: z.number().min(0).max(1).optional().default(0).describe("Min usefulness 0-1 (default: 0)"),
-        candidateLimit: z.number().int().min(1).max(1500).optional().describe(
-          "Optional maximum candidates to score after deduplication; default all retrieved candidates"
-        ),
-        collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
-        intent: z.string().optional().describe(
-          "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
-        ),
-        rerank: z.boolean().optional().default(true).describe(
-          "Score results using TypeSafe (default: true). False uses local reciprocal-rank ordering without API calls."
-        ),
-      }),
-    },
-    track(async ({ query, searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
-      // Require exactly one of `query` (plain text) or `searches` (typed sub-queries).
-      if (!query && (!searches || searches.length === 0)) {
-        return {
-          content: [{ type: "text" as const, text: "Error: provide either 'query' (plain text) or 'searches' (typed sub-queries)" }],
-          isError: true,
-        };
-      }
-      if (query && searches && searches.length > 0) {
-        return {
-          content: [{ type: "text" as const, text: "Error: 'query' and 'searches' are mutually exclusive; provide only one" }],
-          isError: true,
-        };
-      }
-
-      // Use default collections if none specified
-      const effectiveCollections = collections ?? defaultCollectionNames;
-
-      // Plain `query` uses vector + BM25 retrieval and TypeSafe scoring;
-      // `searches` runs the caller's typed sub-queries directly.
-      const searchOptions = query
-        ? { query }
-        : { queries: (searches ?? []).map(s => ({ type: s.type, query: s.query })) };
-
-      const results = await store.search({
-        ...searchOptions,
-        collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
-        limit,
-        minScore,
-        candidateLimit,
-        rerank,
-        intent,
-      });
-
-      // Use the plain query, or the first lex/vec sub-query, for snippet extraction
-      const primaryQuery = query
-        || searches?.find(s => s.type === 'lex')?.query
-        || searches?.find(s => s.type === 'vec')?.query
-        || searches?.[0]?.query
-        || "";
-
-      const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.body, primaryQuery, 300, r.bestChunkPos, r.bestChunk.length, intent);
-        return {
-          docid: `#${r.docid}`,
-          file: r.displayPath,
-          title: r.title,
-          score: Math.round(r.score * 100) / 100,
-          context: r.context,
-          line,
-          snippet: addLineNumbers(snippet, line),
-        };
-      });
-
-      return {
-        content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery) }],
-        structuredContent: { results: filtered },
       };
     })
   );
@@ -805,9 +656,6 @@ export async function startMcpHttpServer(
     ...(existsSync(configPath) ? { configPath } : {}),
   });
 
-  // Pre-fetch default collection names for REST endpoint
-  const defaultCollectionNames = await store.getDefaultCollectionNames();
-
   // Official 2026-07-28 HTTP entry: one factory, per-request instance, JSON
   // responses (matches the previous enableJsonResponse: true). Dual-speaks
   // 2025-era traffic statelessly by default (`legacy: "stateless"`).
@@ -831,11 +679,6 @@ export async function startMcpHttpServer(
       arguments?: Record<string, unknown>;
     };
   };
-  type RestSearchInput = {
-    type?: unknown;
-    query?: unknown;
-  };
-
   /** Extract a human-readable label from a JSON-RPC body */
   function describeRequest(body: JsonRpcLikeBody): string {
     const method = typeof body.method === "string" ? body.method : "unknown";
@@ -917,63 +760,6 @@ export async function startMcpHttpServer(
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(body);
         log(`${ts()} GET /health (${Date.now() - reqStart}ms)`);
-        return;
-      }
-
-      // REST endpoint: POST /search — structured search without MCP protocol
-      // REST endpoint: POST /query (alias: /search) — structured search without MCP protocol
-      if ((pathname === "/query" || pathname === "/search") && nodeReq.method === "POST") {
-        const rawBody = await collectBody(nodeReq);
-        const params = JSON.parse(rawBody) as Record<string, unknown>;
-
-        // Validate required fields
-        if (!params.searches || !Array.isArray(params.searches)) {
-          nodeRes.writeHead(400, { "Content-Type": "application/json" });
-          nodeRes.end(JSON.stringify({ error: "Missing required field: searches (array)" }));
-          return;
-        }
-
-        // Map to internal format
-        const searches = params.searches as RestSearchInput[];
-        const queries: ExpandedQuery[] = searches.map((s) => ({
-          type: s.type as 'lex' | 'vec' | 'hyde',
-          query: String(s.query || ""),
-        }));
-
-        // Use default collections if none specified
-        const effectiveCollections = Array.isArray(params.collections) ? params.collections.map(String) : defaultCollectionNames;
-
-        const results = await store.search({
-          queries,
-          collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
-          limit: typeof params.limit === "number" ? params.limit : 10,
-          minScore: typeof params.minScore === "number" ? params.minScore : 0,
-          candidateLimit: typeof params.candidateLimit === "number" ? params.candidateLimit : undefined,
-          intent: typeof params.intent === "string" ? params.intent : undefined,
-          rerank: typeof params.rerank === "boolean" ? params.rerank : undefined,
-        });
-
-        // Use first lex or vec query for snippet extraction
-        const primaryQuery = searches.find((s) => s.type === 'lex')?.query
-          || searches.find((s) => s.type === 'vec')?.query
-          || searches[0]?.query || "";
-
-        const formatted = results.map(r => {
-          const { line, snippet } = extractSnippet(r.body, String(primaryQuery), 300, r.bestChunkPos, r.bestChunk.length, typeof params.intent === "string" ? params.intent : undefined);
-          return {
-            docid: `#${r.docid}`,
-            file: `qmd://${encodeQmdPath(r.displayPath)}`,
-            title: r.title,
-            score: Math.round(r.score * 100) / 100,
-            context: r.context,
-            line,
-            snippet: addLineNumbers(snippet, line),
-          };
-        });
-
-        nodeRes.writeHead(200, { "Content-Type": "application/json" });
-        nodeRes.end(JSON.stringify({ results: formatted }));
-        log(`${ts()} POST /query ${params.searches.length} queries (${Date.now() - reqStart}ms)`);
         return;
       }
 

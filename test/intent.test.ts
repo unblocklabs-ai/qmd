@@ -4,7 +4,6 @@
  * Tests cover:
  * - extractIntentTerms: stop word filtering, punctuation, acronyms, edge cases
  * - extractSnippet with intent: disambiguation across multiple document sections
- * - parseStructuredQuery with intent: lines (parsing, validation, error cases)
  * - Chunk selection scoring with intent
  * - Strong-signal bypass when intent is present
  * - Intent constants
@@ -17,85 +16,8 @@ import {
   extractSnippet,
   extractIntentTerms,
   INTENT_WEIGHT_SNIPPET,
-  type ExpandedQuery,
 } from "../src/store.js";
 
-// =============================================================================
-// parseStructuredQuery — duplicated from src/cli/qmd.ts for unit testing
-// (qmd.ts doesn't export it since it's a CLI internal)
-// =============================================================================
-
-interface ParsedStructuredQuery {
-  searches: ExpandedQuery[];
-  intent?: string;
-}
-
-function parseStructuredQuery(query: string): ParsedStructuredQuery | null {
-  const rawLines = query.split('\n').map((line, idx) => ({
-    raw: line,
-    trimmed: line.trim(),
-    number: idx + 1,
-  })).filter(line => line.trimmed.length > 0);
-
-  if (rawLines.length === 0) return null;
-
-  const prefixRe = /^(lex|vec|hyde):\s*/i;
-  const expandRe = /^expand:\s*/i;
-  const intentRe = /^intent:\s*/i;
-  const typed: ExpandedQuery[] = [];
-  let intent: string | undefined;
-
-  for (const line of rawLines) {
-    if (expandRe.test(line.trimmed)) {
-      if (rawLines.length > 1) {
-        throw new Error(`Line ${line.number} starts with expand:, but query documents cannot mix expand with typed lines. Submit a single expand query instead.`);
-      }
-      const text = line.trimmed.replace(expandRe, '').trim();
-      if (!text) {
-        throw new Error('expand: query must include text.');
-      }
-      return null;
-    }
-
-    if (intentRe.test(line.trimmed)) {
-      if (intent !== undefined) {
-        throw new Error(`Line ${line.number}: only one intent: line is allowed per query document.`);
-      }
-      const text = line.trimmed.replace(intentRe, '').trim();
-      if (!text) {
-        throw new Error(`Line ${line.number}: intent: must include text.`);
-      }
-      intent = text;
-      continue;
-    }
-
-    const match = line.trimmed.match(prefixRe);
-    if (match) {
-      const type = match[1]!.toLowerCase() as 'lex' | 'vec' | 'hyde';
-      const text = line.trimmed.slice(match[0].length).trim();
-      if (!text) {
-        throw new Error(`Line ${line.number} (${type}:) must include text.`);
-      }
-      if (/\r|\n/.test(text)) {
-        throw new Error(`Line ${line.number} (${type}:) contains a newline. Keep each query on a single line.`);
-      }
-      typed.push({ type, query: text, line: line.number });
-      continue;
-    }
-
-    if (rawLines.length === 1) {
-      return null;
-    }
-
-    throw new Error(`Line ${line.number} is missing a lex:/vec:/hyde:/intent: prefix. Each line in a query document must start with one.`);
-  }
-
-  if (intent && typed.length === 0) {
-    throw new Error('intent: cannot appear alone. Add at least one lex:, vec:, or hyde: line.');
-  }
-
-  return typed.length > 0 ? { searches: typed, intent } : null;
-}
 
 // =============================================================================
 // extractIntentTerms
@@ -292,114 +214,6 @@ describe("extractSnippet intent weight behavior", () => {
   });
 });
 
-// =============================================================================
-// parseStructuredQuery with intent
-// =============================================================================
-
-describe("parseStructuredQuery with intent", () => {
-  test("parses intent + lex query", () => {
-    const result = parseStructuredQuery("intent: web performance\nlex: performance");
-    expect(result).not.toBeNull();
-    expect(result!.intent).toBe("web performance");
-    expect(result!.searches).toHaveLength(1);
-    expect(result!.searches[0]!.type).toBe("lex");
-    expect(result!.searches[0]!.query).toBe("performance");
-  });
-
-  test("parses intent + multiple typed lines", () => {
-    const result = parseStructuredQuery(
-      "intent: web page load times\nlex: performance\nvec: how to improve performance"
-    );
-    expect(result).not.toBeNull();
-    expect(result!.intent).toBe("web page load times");
-    expect(result!.searches).toHaveLength(2);
-    expect(result!.searches[0]!.type).toBe("lex");
-    expect(result!.searches[1]!.type).toBe("vec");
-  });
-
-  test("intent can appear after typed lines", () => {
-    const result = parseStructuredQuery(
-      "lex: performance\nintent: web page load times\nvec: latency"
-    );
-    expect(result).not.toBeNull();
-    expect(result!.intent).toBe("web page load times");
-    expect(result!.searches).toHaveLength(2);
-  });
-
-  test("intent is case-insensitive prefix", () => {
-    const result = parseStructuredQuery("Intent: web perf\nlex: performance");
-    expect(result).not.toBeNull();
-    expect(result!.intent).toBe("web perf");
-  });
-
-  test("no intent returns undefined", () => {
-    const result = parseStructuredQuery("lex: performance\nvec: speed");
-    expect(result).not.toBeNull();
-    expect(result!.intent).toBeUndefined();
-  });
-
-  test("intent alone throws error", () => {
-    expect(() => parseStructuredQuery("intent: web performance")).toThrow(
-      /intent: cannot appear alone/
-    );
-  });
-
-  test("multiple intent lines throw error", () => {
-    expect(() =>
-      parseStructuredQuery("intent: web perf\nintent: team health\nlex: performance")
-    ).toThrow(/only one intent: line is allowed/);
-  });
-
-  test("empty intent text throws error", () => {
-    expect(() =>
-      parseStructuredQuery("intent:\nlex: performance")
-    ).toThrow(/intent: must include text/);
-  });
-
-  test("intent with whitespace-only text throws error", () => {
-    expect(() =>
-      parseStructuredQuery("intent:   \nlex: performance")
-    ).toThrow(/intent: must include text/);
-  });
-
-  test("single plain line still returns null (expand mode)", () => {
-    const result = parseStructuredQuery("how does auth work");
-    expect(result).toBeNull();
-  });
-
-  test("expand: line still returns null", () => {
-    const result = parseStructuredQuery("expand: auth stuff");
-    expect(result).toBeNull();
-  });
-
-  test("intent with expand throws error (expand can't mix)", () => {
-    expect(() =>
-      parseStructuredQuery("intent: web\nexpand: performance")
-    ).toThrow(/cannot mix expand/);
-  });
-
-  test("empty query returns null", () => {
-    expect(parseStructuredQuery("")).toBeNull();
-    expect(parseStructuredQuery("  \n  \n  ")).toBeNull();
-  });
-
-  test("intent with blank lines is fine", () => {
-    const result = parseStructuredQuery(
-      "intent: web perf\n\nlex: performance\n\nvec: speed"
-    );
-    expect(result).not.toBeNull();
-    expect(result!.intent).toBe("web perf");
-    expect(result!.searches).toHaveLength(2);
-  });
-
-  test("intent preserves full text including colons", () => {
-    const result = parseStructuredQuery(
-      "intent: web performance: LCP, FID, CLS\nlex: performance"
-    );
-    expect(result).not.toBeNull();
-    expect(result!.intent).toBe("web performance: LCP, FID, CLS");
-  });
-});
 
 // =============================================================================
 // Constants exported

@@ -224,23 +224,6 @@ describe("Path fidelity — CLI integration", () => {
     expect(add.exitCode, `collection add failed: ${add.stderr}`).toBe(0);
   });
 
-  test("(1) search --json file field contains literal path, not handalized slug", async () => {
-    const { stdout, exitCode } = await runQmd(
-      ["search", "searchterm-alpha", "--json"],
-      { cwd: collectionDir, dbPath, configDir }
-    );
-    expect(exitCode).toBe(0);
-
-    const results = JSON.parse(stdout) as Array<{ file: string }>;
-    expect(results.length).toBeGreaterThan(0);
-
-    const meetingResult = results.find((r) => r.file.includes("Meeting"));
-    expect(meetingResult).toBeDefined();
-    // Must contain the literal filename fragment
-    expect(meetingResult!.file).toContain("# Meeting - 234232 3432 __ 5.md");
-    // Must not contain the handalized version
-    expect(meetingResult!.file).not.toContain("Meeting-234232-3432-5.md");
-  });
 
   test("(2) get --full-path resolves to real filesystem path for crazy-named file", async () => {
     const virtualPath = `qmd://crazytest/Budget & Revenue (Q4) [2024].md`;
@@ -300,38 +283,15 @@ describe("Path fidelity — CLI integration", () => {
     expect(stdout).not.toContain("Notes-42-foo-bar.md");
   });
 
-  test("(5) search --json returns docid that can be fetched back", async () => {
-    const { stdout: searchOut, exitCode: searchExit } = await runQmd(
-      ["search", "searchterm-beta", "--json"],
-      { cwd: collectionDir, dbPath, configDir }
-    );
-    expect(searchExit).toBe(0);
-
-    const results = JSON.parse(searchOut) as Array<{ docid: string; file: string }>;
-    expect(results.length).toBeGreaterThan(0);
-
-    const hit = results[0]!;
-    expect(hit.docid).toMatch(/^#[a-f0-9]{6}$/);
-
-    // Fetch by docid — must work
-    const { stdout: getOut, exitCode: getExit } = await runQmd(
-      ["get", hit.docid],
-      { cwd: collectionDir, dbPath, configDir }
-    );
-    expect(getExit, `get by docid failed`).toBe(0);
-    expect(getOut).toContain("Budget & Revenue (Q4) [2024].md");
-  });
 
   test("normal filenames are still stored correctly (regression)", async () => {
     const { stdout, exitCode } = await runQmd(
-      ["search", "Plain filename", "--json"],
+      ["get", "qmd://crazytest/normal-file.md"],
       { cwd: collectionDir, dbPath, configDir }
     );
     expect(exitCode).toBe(0);
-    const results = JSON.parse(stdout) as Array<{ file: string }>;
-    const hit = results.find((r) => r.file.includes("normal-file"));
-    expect(hit).toBeDefined();
-    expect(hit!.file).toContain("normal-file.md");
+    expect(stdout).toContain("normal-file.md");
+    expect(stdout).toContain("Plain filename");
   });
 });
 
@@ -577,16 +537,13 @@ describe("Path fidelity — migration from handalized index", () => {
     expect(pathsAfter).not.toContain("Meeting-234232-3432-5.md");
     expect(pathsAfter).not.toContain("Budget-Revenue-Q4-2024.md");
 
-    // Search must work after migration
+    // Reads must work after migration
     const { stdout: searchOut, exitCode: searchExit } = await runQmd(
-      ["search", "searchterm-alpha", "--json"],
+      ["get", "qmd://crazytest/# Meeting - 234232 3432 __ 5.md"],
       { cwd: collectionDir, dbPath, configDir }
     );
     expect(searchExit).toBe(0);
-    const results = JSON.parse(searchOut) as Array<{ file: string }>;
-    expect(results.length).toBeGreaterThan(0);
-    const meetingResult = results.find((r) => r.file.includes("Meeting"));
-    expect(meetingResult).toBeDefined();
-    expect(meetingResult!.file).toContain("# Meeting - 234232 3432 __ 5.md");
+    expect(searchOut).toContain("# Meeting - 234232 3432 __ 5.md");
+    expect(searchOut).toContain("searchterm-alpha");
   });
 });

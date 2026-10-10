@@ -4,31 +4,16 @@ QMD is Unblock Labs' on-device search engine for everything you need to remember
 
 This repository, [`unblocklabs-ai/qmd`](https://github.com/unblocklabs-ai/qmd), is the canonical home of the Unblock Labs project and the source of the `@unblocklabs/qmd` package.
 
-QMD combines local BM25 and vector retrieval with remote TypeSafe usefulness
-scoring for `query`. `search` remains local BM25; `vsearch` is unchanged.
+QMD provides local indexing, BM25/vector candidate discovery and indexed reads.
+Agent-facing ranked retrieval is consolidated in OpenClaw's `memory_search`
+from `@unblocklabs/unblock-memory`, which accepts `bm25Query` and `vectorQuery`
+and uses the same TypeSafe ranking core as Memory Whisperer.
 
-```mermaid
-flowchart LR
-  Q[Query] --> FTS[BM25: top 1.5k]
-  Q --> VS[Vector: top 1.5k]
-  FTS --> D[Deduplicate excerpts within each source]
-  VS --> D
-  D --> T[TypeSafe: independent usefulness scores]
-  T --> O[Top k results]
-```
-
-Set `TYPESAFE_API_KEY` or `TYPESAFE_API_KEY_FILE` in the CLI/MCP process environment.
-The file may contain a raw key or a dotenv `TYPESAFE_API_KEY` entry; an explicit
-file never falls back to a different credential. Do not check keys into collection
-configuration. SDK calls may instead supply `typesafe: { apiKeyFile: "/private/key" }`.
-
-`query` sends the query, optional intent, selected source excerpts, source paths
-and evaluation time to TypeSafe. Use collection filters to limit that scope.
-Missing credentials or any scoring failure produces an explicit error, not a
-silent fallback. `--no-rerank` (SDK/MCP `rerank:false`) explicitly skips TypeSafe
-and uses local reciprocal-rank ordering. Six judgments run concurrently, with
-a 10-second per-request timeout and a 60-second search deadline checked between
-retrieval operations; a native embedding already in flight cannot be interrupted.
+The CLI `query`, `search` and `deep-search` alias, MCP `query`, and REST
+`/query` and `/search` are removed. `vsearch` remains a local vector diagnostic;
+SDK primitives and legacy SDK/benchmark hybrid APIs remain available.
+Use the plugin's TypeSafe configuration for `memory_search`; this CLI/MCP
+server no longer provides an agent-facing remote-ranked search.
 
 You can read more about QMD's progress in the [CHANGELOG](CHANGELOG.md).
 
@@ -54,9 +39,9 @@ qmd context add qmd://docs "Work documentation"
 qmd embed
 
 # Search across everything
-qmd search "project timeline"           # Fast keyword search
+qmd vsearch --no-expand "project timeline"           # Local vector diagnostics
 qmd vsearch "how to deploy"             # Semantic search
-qmd query "quarterly planning process"  # Hybrid + reranking (best quality)
+qmd vsearch --no-expand "quarterly planning process"  # Local vector diagnostics
 
 # Get a specific document
 qmd get "meetings/2024-01-15.md"
@@ -68,10 +53,10 @@ qmd get "#abc123"
 qmd multi-get "journals/2025-05*.md"
 
 # Search within a specific collection
-qmd search "API" -c notes
+qmd vsearch --no-expand "API" -c notes
 
 # Export a larger result set for an agent
-qmd search "API" --all --files --min-score 0.3
+qmd vsearch --no-expand "API" --all --files --min-score 0.3
 ```
 
 ### Using with AI Agents
@@ -80,10 +65,10 @@ QMD's `--json` and `--files` output formats are designed for agentic workflows:
 
 ```sh
 # Get structured results for an LLM
-qmd search "authentication" --json -n 10
+qmd vsearch --no-expand "authentication" --json -n 10
 
 # List a larger set of relevant files above a threshold
-qmd query "error handling" --all --files --min-score 0.4
+qmd vsearch --no-expand "error handling" --all --files --min-score 0.4
 
 # Retrieve full document content
 qmd get "docs/api-reference.md" --full
@@ -109,7 +94,6 @@ for configuration and supported source paths.
 Although the tool works perfectly fine when you just tell your agent to use it on the command line, it also exposes an MCP (Model Context Protocol) server for tighter integration.
 
 **Tools exposed:**
-- `query` — Vector + BM25 retrieval with independent TypeSafe ranking, or explicit typed retrieval variants (`lex`/`vec`/`hyde`)
 - `get` — Retrieve a document by path or docid (with fuzzy matching suggestions)
 - `multi_get` — Batch retrieve by glob pattern, comma-separated list, or docids
 - `status` — Index health and collection info
@@ -169,7 +153,6 @@ runs in a container and a liveness probe connects from a non-loopback address.
 
 The HTTP server exposes these endpoints:
 - `POST /mcp` — MCP Streamable HTTP (JSON responses, stateless)
-- `POST /query` (alias `/search`) — structured search without the MCP protocol
 - `GET /health` — liveness check with uptime
 
 
@@ -204,14 +187,6 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
 
 | Tool | Parameter | Type | Notes |
 |------|-----------|------|-------|
-| `query` | `query` | string | Plain query for vector + BM25 recall. Mutually exclusive with `searches`. |
-| `query` | `searches` | array | Typed sub-queries (`lex`/`vec`/`hyde`), 1–10. Mutually exclusive with `query`. |
-| `query` | `collections` | string[] | Filter by collection names (OR). **Array only** — singular `collection` is silently ignored. |
-| `query` | `intent` | string | Disambiguation context (does not search on its own) |
-| `query` | `limit` | number | Max results (default 10) |
-| `query` | `minScore` | number | Minimum relevance 0–1 (default 0) |
-| `query` | `candidateLimit` | number | Optional cap on candidates after deduplication |
-| `query` | `rerank` | boolean | TypeSafe scoring (default **true**); false explicitly keeps retrieval local |
 | `get` | `file` | string | Path, docid (`#abc123`), or `path:from:count` (e.g. `#abc123:120:40`) |
 | `get` | `fromLine` | number | Start line (1-indexed); overrides the `:from` suffix |
 | `get` | `maxLines` | number | Limit returned lines |
@@ -222,9 +197,9 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
 | `multi_get` | `lineNumbers` | boolean | Prefix lines with numbers (default **true**) |
 
 Unknown parameters are silently ignored (not rejected) — double-check names if
-results seem unscoped. The HTTP `/query` and `/search` endpoints return
-`qmd://collection/path` URIs in the `file` field; the MCP tool returns display
-paths.
+results seem unscoped. The removed HTTP `/query` and `/search` routes no longer return
+results. Use OpenClaw `memory_search` for ranked retrieval, then MCP indexed
+reads when using a separate standalone QMD index.
 
 ### SDK / Library Usage
 
@@ -494,7 +469,7 @@ The SDK requires explicit `dbPath` — no defaults are assumed. This makes it sa
 
 ## Architecture
 
-Plain `query` retrieves `ceil(1.5 × limit)` candidates from each of vector and
+The retained SDK `search({ query })` retrieves `ceil(1.5 × limit)` candidates from each of vector and
 BM25 search, with no local query expansion. Filters apply before retrieval limits.
 BM25 selects a complete stored chunk using FTS match highlights (including
 prefixes, stemming, phrases and CJK matches); unembedded documents use
@@ -515,10 +490,10 @@ from `allowedPaths` retrieval scope. Time context alone does not filter document
 
 ## Scores
 
-`query` returns TypeSafe usefulness normalized to 0–1. Confidence in `--explain`
+SDK `search` returns TypeSafe usefulness normalized to 0–1. Confidence in `explain`
 describes score concentration, not factual correctness. `vsearch` retains its
-vector similarity scores; `search` retains normalized BM25 scores. Without
-reranking, query uses the best reciprocal retrieval rank (1 / rank).
+vector similarity scores; SDK `searchLex` retains normalized BM25 scores. Without
+reranking, SDK hybrid search uses the best reciprocal retrieval rank (1 / rank).
 
 ### Score Interpretation
 
@@ -543,7 +518,7 @@ reranking, query uses the best reciprocal retrieval rank (1 / rank).
 ### GGUF Models (via node-llama-cpp)
 
 QMD retains three local GGUF model roles, downloaded when an operation needs them.
-Plain `query` uses local embeddings plus remote TypeSafe scoring; it does not load
+Legacy SDK hybrid search uses local embeddings plus remote TypeSafe scoring; it does not load
 the local generation or reranking models. Standalone `vsearch` uses the generation
 model for expansion unless `--no-expand` / SDK `expand:false` is supplied. Explicit
 SDK expansion and low-level local-rerank operations retain their respective models.
@@ -843,31 +818,17 @@ should allow them unattended. Your own `~/.config/qmd/*.yml` — including
 anything `qmd collection update-cmd` or `qmd collection add` writes — is
 never gated.
 
-### Search Commands
+### Search entry points
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                        Search Modes                              │
-├──────────┬───────────────────────────────────────────────────────┤
-│ search   │ BM25 full-text search only                           │
-│ vsearch  │ Vector semantic search only                          │
-│ query    │ Vector + BM25 recall, then TypeSafe ranking          │
-└──────────┴───────────────────────────────────────────────────────┘
+Use OpenClaw `memory_search` for ranked agent recall:
+
+```json
+{ "bm25Query": "authentication flow", "vectorQuery": "How does user authentication work?" }
 ```
 
-```sh
-# Full-text search (fast, keyword-based)
-qmd search "authentication flow"
-
-# Vector search (semantic similarity)
-qmd vsearch "how to login"
-
-# Hybrid search with re-ranking (best quality)
-qmd query "user authentication"
-```
-
-Two aliases exist for the semantic/hybrid modes: `vector-search` (→ `vsearch`)
-and `deep-search` (→ `query`).
+For vector-only local diagnostics, `qmd vsearch "how to login" --no-expand`
+remains available; `vector-search` is its alias. The CLI `query`, `search`
+and `deep-search` alias are removed.
 
 ### Options
 
@@ -876,14 +837,11 @@ and `deep-search` (→ `query`).
 -n <num>           # Number of results (default: 5, or 20 for --files/--json)
 -c, --collection   # Restrict search to a specific collection
 --all              # Raise the command-specific result cap (use with --min-score)
---min-score <num>  # Minimum score (default: 0 for search/query, 0.3 for vsearch)
+--min-score <num>  # Minimum score (default: 0.3 for vsearch)
 --full             # Show full document content
 --line-numbers     # Add line numbers to output
---explain          # Include retrieval score traces (query, JSON/CLI output)
 --index <name>     # Use named index
 --intent "<text>"  # Disambiguation context (e.g. "web page load times")
---no-rerank        # Local-only reciprocal-rank ordering; no TypeSafe calls
--C, --candidate-limit <n>  # Optional cap on deduplicated candidates
 --full-path        # Emit on-disk filesystem paths instead of qmd:// URIs
                    # (a result whose file has moved or been deleted since
                    #  indexing keeps its qmd:// URI + docid, and a notice is
@@ -911,8 +869,8 @@ The `-c`/`--collection` flag filters results by collection **name** (as shown by
 collection from any directory:
 
 ```sh
-qmd search "auth" -c notes           # single collection
-qmd search "auth" -c notes -c docs   # multiple collections (OR)
+qmd vsearch --no-expand "auth" -c notes           # single collection
+qmd vsearch --no-expand "auth" -c notes -c docs   # multiple collections (OR)
 ```
 
 With no `-c` flag, all default-included collections are searched. Collections
@@ -981,16 +939,16 @@ Template placeholders:
 
 ```sh
 # Get 10 results with minimum score 0.3
-qmd query -n 10 --min-score 0.3 "API design patterns"
+qmd vsearch --no-expand -n 10 --min-score 0.3 "API design patterns"
 
 # Output as markdown for LLM context
-qmd search --md --full "error handling"
+qmd vsearch --no-expand --md --full "error handling"
 
 # JSON output for scripting
-qmd query --json "quarterly reports"
+qmd vsearch --no-expand --json "quarterly reports"
 
 # Inspect TypeSafe score, confidence, evaluation time and retrieval methods
-qmd query --json --explain "quarterly reports"
+qmd vsearch --no-expand --json "quarterly reports"
 
 # Use separate index for different knowledge base
 qmd --index work search "quarterly reports"
@@ -1275,12 +1233,12 @@ Override them per-role without touching source via the `models:` block in
 
 The explicit low-level local reranking primitive uses node-llama-cpp's
 `createRankingContext()` and `rankAndSort()` API. It returns cross-encoder relevance
-scores (0.0–1.0); it is not used by `query`, whose scores come from TypeSafe.
+scores (0.0–1.0); it is not used by SDK hybrid search, whose scores come from TypeSafe.
 
 ### Qwen3 (Query Expansion)
 
 Used for standalone `vsearch` expansion and explicit SDK `expandQuery` calls via
-`LlamaChatSession`. Plain `query` does not automatically generate variations;
+`LlamaChatSession`. Legacy SDK hybrid search does not automatically generate variations;
 callers can supply typed variants themselves.
 
 ## License

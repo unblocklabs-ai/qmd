@@ -1,7 +1,7 @@
 {
   "name": "@unblocklabs/qmd",
-  "version": "2.11.1",
-  "description": "Query Markup Documents - Local BM25/vector retrieval with TypeSafe-ranked hybrid queries",
+  "version": "3.0.0",
+  "description": "Query Markup Documents - Local BM25/vector indexing and retrieval for Unblock Memory",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -41,7 +41,6 @@
     "eval:chunking": "tsx scripts/chunking-eval.ts",
     "index": "tsx src/cli/qmd.ts index",
     "vector": "tsx src/cli/qmd.ts vector",
-    "search": "tsx src/cli/qmd.ts search",
     "vsearch": "tsx src/cli/qmd.ts vsearch",
     "rerank": "tsx src/cli/qmd.ts rerank",
     "inspector": "npx @modelcontextprotocol/inspector tsx src/cli/qmd.ts mcp",

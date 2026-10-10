@@ -11,7 +11,6 @@ jobs:
 
     permissions:
       contents: write
-      id-token: write
 
     steps:
       - uses: actions/checkout@v4
@@ -34,13 +33,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
       - run: npm run test:types
       - run: npm run test:rules
       - run: npm run build
-      - run: npm publish --provenance --access public
+      - name: Pack GitHub release artifact
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          test "$(node -p 'require("./package.json").version')" = "$VERSION"
+          npm pack
 
       - name: Extract release notes
         id: notes
@@ -54,6 +56,7 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
-            --notes-file /tmp/release-notes.md
+            --notes-file /tmp/release-notes.md \
+            "unblocklabs-qmd-${GITHUB_REF_NAME#v}.tgz"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

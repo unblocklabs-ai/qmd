@@ -854,15 +854,6 @@ describe("MCP Server", () => {
       expect(typeof item.snippet).toBe("string");
     });
 
-    test("error responses should include isError flag", () => {
-      // Simulate what MCP server returns for errors
-      const errorResponse = {
-        content: [{ type: "text", text: "Collection not found: nonexistent" }],
-        isError: true,
-      };
-      expect(errorResponse.isError).toBe(true);
-      expect(errorResponse.content[0]!.type).toBe("text");
-    });
 
     test("embedded resources include name and title", () => {
       // Simulate what qmd_get returns
@@ -898,32 +889,6 @@ describe("MCP Server", () => {
       }
     });
 
-    test("REST /query and /search file field uses qmd:// URI prefix (#576)", () => {
-      // Regression test: the HTTP REST endpoint was returning r.displayPath (e.g.
-      // "docs/readme.md") instead of "qmd://docs/readme.md", while the CLI and MCP
-      // resource URIs always use the qmd:// scheme. This simulates the fix: the REST
-      // handler now applies encodeQmdPath and prepends "qmd://".
-      const results = searchFTS(testDb, "readme", 5);
-      expect(results.length).toBeGreaterThan(0);
-
-      // Simulate what the fixed REST handler produces for each result
-      const restResponseItems = results.map(r => ({
-        docid: `#${r.docid}`,
-        file: `qmd://${r.displayPath.split('/').map(s => encodeURIComponent(s)).join('/')}`,
-        title: r.title,
-        score: Math.round(r.score * 100) / 100,
-      }));
-
-      // Every file field must start with qmd://
-      for (const item of restResponseItems) {
-        expect(item.file).toMatch(/^qmd:\/\//);
-      }
-
-      // Spot-check the readme result
-      const readmeItem = restResponseItems.find(item => item.file.includes("readme"));
-      expect(readmeItem).toBeDefined();
-      expect(readmeItem!.file).toBe("qmd://docs/readme.md");
-    });
   });
 });
 
@@ -934,7 +899,7 @@ describe("MCP Server", () => {
 import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/server";
 import { _resetProductionModeForTesting } from "../src/store";
 
-describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
+describe("MCP HTTP Transport", () => {
   let handle: HttpServerHandle;
   let baseUrl: string;
   let httpTestDbPath: string;
@@ -1084,9 +1049,11 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
       }),
     });
     expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toContain("application/json");
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
     expect(res.headers.get("mcp-session-id")).toBeNull();
-    const json = await res.json() as any;
+    const data = (await res.text()).split(/\r?\n/).find(line => line.startsWith("data: "));
+    expect(data).toBeDefined();
+    const json = JSON.parse(data!.slice(6)) as { jsonrpc: string; id: number; result: { serverInfo: { name: string } } };
     expect(json.jsonrpc).toBe("2.0");
     expect(json.id).toBe(1);
     expect(json.result.serverInfo.name).toBe("qmd");
@@ -1099,10 +1066,10 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(headers.get("mcp-session-id")).toBeNull();
 
     const toolNames = json.result.tools.map((t: any) => t.name);
-    expect(toolNames).toEqual(["query", "get", "multi_get", "status"]);
+    expect(toolNames).toEqual(["get", "multi_get", "status"]);
   });
 
-  test("POST /mcp tools/call query returns results", async () => {
+  test("POST /mcp tools/call rejects the removed query tool", async () => {
     const { status, json } = await mcpRequest(
       "tools/call",
       { name: "query", arguments: { searches: [{ type: "lex", query: "readme" }] } },
@@ -1110,44 +1077,32 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
       3,
     );
     expect(status).toBe(200);
-    expect(json.result).toBeDefined();
-    expect(json.result.content.length).toBeGreaterThan(0);
-    expect(json.result.content[0].type).toBe("text");
+    expect(json.error?.code).toBe(-32602);
+    expect(json.error?.message).toContain("Tool query not found");
   });
 
-  test("POST /mcp tools/call get returns document", async () => {
+  test.each([
+    { file: "readme.md", isError: false },
+    { file: "missing-document.md", isError: true },
+  ])("POST /mcp get $file returns the document or an error envelope", async ({ file, isError }) => {
     const { status, json } = await mcpRequest(
       "tools/call",
-      { name: "get", arguments: { file: "readme.md" } },
+      { name: "get", arguments: { file } },
       { "Mcp-Name": "get" },
       4,
     );
     expect(status).toBe(200);
     expect(json.result).toBeDefined();
     expect(json.result.content.length).toBeGreaterThan(0);
+    expect(json.result.isError ?? false).toBe(isError);
+    if (isError) {
+      expect(json.result.content[0].type).toBe("text");
+      expect(json.result.content[0].text).toContain(`Document not found: ${file}`);
+    } else {
+      expect(json.result.content[0].resource.uri).toBe("qmd://docs/readme.md");
+    }
   });
 
-  test("POST /mcp tools/call query returns absolute source-file line numbers, not chunk-local", async () => {
-    const { status, json } = await mcpRequest(
-      "tools/call",
-      {
-        name: "query",
-        arguments: {
-          searches: [{ type: "lex", query: "UNIQUE_KEYWORD_XYZ" }],
-          rerank: false,
-        },
-      },
-      { "Mcp-Name": "query" },
-      5,
-    );
-    expect(status).toBe(200);
-    const results = json.result.structuredContent.results;
-    expect(results.length).toBeGreaterThan(0);
-    const hit = results.find((r: any) => r.file === "docs/absolute-line-fixture.md");
-    expect(hit).toBeDefined();
-    expect(hit.line).toBe(301);
-    expect(hit.snippet).toMatch(/^\d+: @@ -3\d\d,/);
-  });
 });
 
 
@@ -1277,7 +1232,7 @@ describe("MCP HTTP Transport — 2026-07-28 protocol", () => {
     expect(json.result.ttlMs).toBe(60_000);
     expect(json.result.cacheScope).toBe("private");
     const toolNames = json.result.tools.map((t: { name: string }) => t.name);
-    expect(toolNames).toEqual(["query", "get", "multi_get", "status"]);
+    expect(toolNames).toEqual(["get", "multi_get", "status"]);
     const serverInfo = json.result._meta?.["io.modelcontextprotocol/serverInfo"];
     expect(serverInfo?.name).toBe("qmd");
   });
@@ -1355,8 +1310,7 @@ describe("MCP HTTP Transport — 2026-07-28 protocol", () => {
 // HTTP Transport — CI-visible legacy FTS open (#792)
 // =============================================================================
 //
-// The suite above is skipIf(CI) because query tests load models. The original
-// #792 failure was in that suite's beforeAll: initTestDatabase still creates
+// The original #792 failure was in the transport suite's beforeAll: initTestDatabase creates
 // fts5(name, body, content='documents'), then startMcpHttpServer -> createStore
 // -> rebuildFTSForCjkNormalization ran DELETE FROM documents_fts and threw
 // `no such column: T.name`. Keep this helper seed and assert open succeeds

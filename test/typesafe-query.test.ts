@@ -2,8 +2,6 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import { createStore, type QMDStore } from "../src/index.js";
 import { openDatabase } from "../src/db.js";
 import { hashContent, insertContent, insertDocument, type SearchResult } from "../src/store.js";
@@ -249,29 +247,4 @@ test("query bounds concurrent API requests and stops the remaining queue on canc
   });
   await expect(store.search({ query: "staging", limit: 10, typesafe, signal: controller.signal })).rejects.toThrow();
   expect(calls).toBe(6);
-});
-
-test("CLI query retains its name and emits TypeSafe-scored JSON with the legacy expand prefix", async () => {
-  await document("cli.md", "Mira approved staging");
-  const preload = join(dir, "fetch.mjs");
-  await writeFile(preload, `globalThis.fetch = async (url, init) => {
-    if (url !== 'https://api.typesafe.ai/v1/systemone') throw Error('unexpected network');
-    const body = JSON.parse(init.body);
-    if (body.state.query !== 'staging' || !body.state.candidate.excerpt.includes('Mira')) throw Error('wrong state');
-    return Response.json({answers:{usefulness:{type:'score',score:3,confidence:1,probabilities:{'0':0,'1':0,'2':0,'3':1}}}});
-  };`);
-  await writeFile(join(dir, "index.yml"), JSON.stringify({ collections: { docs: { path: dir, pattern: "**/*.md" } } }));
-  const args = "Bun" in globalThis ? ["--preload", preload] : ["--import", preload, "--import", "tsx"];
-  const child = spawn(process.execPath, [...args, fileURLToPath(new URL("../src/cli/qmd.ts", import.meta.url)),
-    "query", "expand: staging", "--json", "--explain"], {
-    env: { ...process.env, INDEX_PATH: store.dbPath, QMD_CONFIG_DIR: dir,
-      TYPESAFE_API_KEY: "test-cli-key", TYPESAFE_API_KEY_FILE: "", GGML_METAL_NO_RESIDENCY: "1" },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let stdout = "", stderr = "";
-  child.stdout.on("data", chunk => { stdout += chunk; });
-  child.stderr.on("data", chunk => { stderr += chunk; });
-  const exit = await new Promise<number | null>((resolve, reject) => { child.on("close", resolve); child.on("error", reject); });
-  expect(exit, stderr).toBe(0);
-  expect(JSON.parse(stdout)[0]).toMatchObject({ score: 1, explain: { ranking: "typesafe", methods: ["bm25"] } });
 });

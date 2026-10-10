@@ -159,7 +159,7 @@ describe("checkRequestOrigin", () => {
 // Live server
 // =============================================================================
 
-describe.skipIf(!!process.env.CI)("MCP HTTP server rejects cross-origin requests", () => {
+describe("MCP HTTP server rejects cross-origin requests", () => {
   let handle: import("../src/mcp/server.js").HttpServerHandle;
   let baseUrl: string;
   let workDir: string;
@@ -276,21 +276,21 @@ describe.skipIf(!!process.env.CI)("MCP HTTP server rejects cross-origin requests
     expect(status).toBe(403);
   });
 
-  test("local clients still work", async () => {
-    const noOrigin = await fetch(`${baseUrl}/query`, {
+  test.each(["/query", "/search"])("local clients get 404 for removed %s route", async (route) => {
+    const noOrigin = await fetch(`${baseUrl}${route}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: searchBody,
     });
-    expect(noOrigin.status).toBe(200);
-    expect(await noOrigin.text()).toContain("hunter2");
+    expect(noOrigin.status).toBe(404);
+    expect(await noOrigin.text()).not.toContain("hunter2");
 
-    const loopbackOrigin = await fetch(`${baseUrl}/query`, {
+    const loopbackOrigin = await fetch(`${baseUrl}${route}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Origin: `http://localhost:${handle.port}` },
       body: searchBody,
     });
-    expect(loopbackOrigin.status).toBe(200);
+    expect(loopbackOrigin.status).toBe(404);
 
     const health = await fetch(`${baseUrl}/health`);
     expect(health.status).toBe(200);

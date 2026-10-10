@@ -95,70 +95,8 @@ afterAll(async () => {
 });
 
 describe("--full-path fallback for unresolvable results", () => {
-  test("search --json keeps the docid on the row it could not resolve", async () => {
-    const { stdout, stderr, exitCode } = await runQmd(
-      ["search", "searchterm-stale", "--full-path", "--json"],
-      { cwd: collectionDir, dbPath, configDir }
-    );
-    expect(exitCode).toBe(0);
 
-    const results = JSON.parse(stdout) as Array<{ file: string; docid?: string }>;
-    expect(results.length).toBe(2);
 
-    const resolved = results.find((r) => !r.file.startsWith("qmd://"));
-    const unresolved = results.find((r) => r.file.startsWith("qmd://"));
-    expect(resolved, "alpha.md should resolve on disk").toBeDefined();
-    expect(unresolved, "beta.md should fall back to its qmd:// URI").toBeDefined();
-
-    // Resolved row: the path is the identifier, so no docid.
-    expect(resolved!.file).toContain("alpha.md");
-    expect(resolved!.docid).toBeUndefined();
-    // Unresolved row: the docid is all that is left to address it by.
-    expect(unresolved!.docid).toMatch(/^#[a-f0-9]{6}$/);
-
-    expect(hasFullPathWarning(stderr)).toBe(true);
-    expect(stderr).toContain("qmd update");
-  });
-
-  test("search --format csv always emits the docid column", async () => {
-    const { stdout, exitCode } = await runQmd(
-      ["search", "searchterm-stale", "--full-path", "--format", "csv"],
-      { cwd: collectionDir, dbPath, configDir }
-    );
-    expect(exitCode).toBe(0);
-
-    const lines = stdout.trim().split("\n");
-    expect(lines[0]).toBe("docid,score,file,title,context,line,snippet");
-
-    // Resolved rows leave the column empty; the unresolved row fills it. The
-    // column count is the same either way, so positional parsing still works.
-    const resolvedRow = lines.find((l) => l.includes("alpha.md"));
-    const unresolvedRow = lines.find((l) => l.includes("qmd://stale/beta.md"));
-    expect(resolvedRow).toBeDefined();
-    expect(unresolvedRow).toBeDefined();
-    expect(resolvedRow!.startsWith(",")).toBe(true);
-    expect(unresolvedRow).toMatch(/^#[a-f0-9]{6},/);
-  });
-
-  test("search default CLI format keeps the docid next to the fallback URI", async () => {
-    const { stdout, stderr, exitCode } = await runQmd(
-      ["search", "searchterm-stale", "--full-path"],
-      { cwd: collectionDir, dbPath, configDir }
-    );
-    expect(exitCode).toBe(0);
-    // eslint-disable-next-line no-control-regex
-    const plain = stdout.replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b\]8;;[^\x07]*\x07/g, "");
-
-    const betaLine = plain.split("\n").find((l) => l.includes("qmd://stale/beta.md"));
-    expect(betaLine, "beta should fall back to its qmd:// URI").toBeDefined();
-    expect(betaLine).toMatch(/#[a-f0-9]{6}\s*$/);
-
-    const alphaLine = plain.split("\n").find((l) => l.includes("alpha.md") && !l.startsWith("Title"));
-    expect(alphaLine).toBeDefined();
-    expect(alphaLine).not.toMatch(/#[a-f0-9]{6}/);
-
-    expect(hasFullPathWarning(stderr)).toBe(true);
-  });
 
   test("get warns and falls back to qmd:// + docid", async () => {
     const { stdout, stderr, exitCode } = await runQmd(
@@ -180,31 +118,5 @@ describe("--full-path fallback for unresolvable results", () => {
     expect(hasFullPathWarning(stderr)).toBe(true);
   });
 
-  test("no warning when every result resolves", async () => {
-    const { stdout, stderr, exitCode } = await runQmd(
-      ["search", "alpha", "--full-path", "--json"],
-      { cwd: collectionDir, dbPath, configDir }
-    );
-    expect(exitCode).toBe(0);
-    const results = JSON.parse(stdout) as Array<{ file: string; docid?: string }>;
-    expect(results.length).toBe(1);
-    expect(results[0]!.file).not.toMatch(/^qmd:\/\//);
-    expect(results[0]!.docid).toBeUndefined();
-    expect(hasFullPathWarning(stderr)).toBe(false);
-  });
 
-  test("without --full-path nothing changes and nothing is warned", async () => {
-    const { stdout, stderr, exitCode } = await runQmd(
-      ["search", "searchterm-stale", "--json"],
-      { cwd: collectionDir, dbPath, configDir }
-    );
-    expect(exitCode).toBe(0);
-    const results = JSON.parse(stdout) as Array<{ file: string; docid?: string }>;
-    expect(results.length).toBe(2);
-    for (const r of results) {
-      expect(r.file).toMatch(/^qmd:\/\/stale\//);
-      expect(r.docid).toMatch(/^#[a-f0-9]{6}$/);
-    }
-    expect(hasFullPathWarning(stderr)).toBe(false);
-  });
 });
