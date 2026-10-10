@@ -47,7 +47,11 @@ When the user triggers `/release <version>`:
 
 7. **Push** — after explicit confirmation, run `git push origin main --tags`.
 
-8. **Watch CI** — after the push, start a background dispatch to watch the
+8. **Publish the GitHub Release** — after CI passes, create a non-draft GitHub
+   Release for the tag using the extracted changelog. The `published` release
+   event triggers npm trusted publishing; pushing the tag alone does not.
+
+9. **Watch publication** — after creating the release, start a background dispatch to watch the
    publish workflow. Use `interactive_shell` in dispatch mode with:
    ```
    gh run watch $(gh run list --workflow=publish.yml --limit=1 --json databaseId --jq '.[0].databaseId') --exit-status
@@ -126,7 +130,8 @@ through parallel contexts. GPU auto-detection replaces the unreliable
 
 Each GitHub release includes the full changelog for the **minor series** back
 to x.x.0. The `scripts/extract-changelog.sh` script handles this, and the
-publish workflow (`publish.yml`) calls it to populate the GitHub release.
+operator calls it to populate the GitHub release. The publish workflow
+(`publish.yml`) publishes to npm, without a separate GitHub tarball.
 
 ## Git Hooks
 

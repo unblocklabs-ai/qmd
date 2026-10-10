@@ -5,7 +5,7 @@ set -euo pipefail
 #
 # Renames the [Unreleased] section in CHANGELOG.md to the new version,
 # bumps package.json, commits, and creates a tag. The actual publish
-# happens via GitHub Actions when the tag is pushed.
+# happens via GitHub Actions when the GitHub Release is published.
 #
 # Usage: ./scripts/release.sh [patch|minor|major|<version>]
 # Examples:
@@ -126,6 +126,7 @@ git tag -a "v$NEW" -m "v$NEW"
 echo ""
 echo "Created commit and tag v$NEW"
 echo ""
-echo "Next: push to trigger the publish workflow"
+echo "Next: push, then publish the GitHub Release to trigger npm publishing"
 echo ""
 echo "  git push origin main --tags"
+echo "  gh release create v$NEW --title v$NEW --notes-file <release-notes-file>"
