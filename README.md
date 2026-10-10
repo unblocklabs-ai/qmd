@@ -21,9 +21,9 @@ You can read more about QMD's progress in the [CHANGELOG](CHANGELOG.md).
 
 ```sh
 # Install QMD globally (Node or Bun)
-npm install -g github:unblocklabs-ai/qmd
+npm install -g @unblocklabs/qmd
 # or
-bun install -g github:unblocklabs-ai/qmd
+bun install -g @unblocklabs/qmd
 
 # Create collections for your notes, docs, and meeting transcripts
 qmd collection add ~/notes --name notes
@@ -208,7 +208,7 @@ Use QMD as a library in your own Node.js or Bun applications.
 #### Installation
 
 ```sh
-npm install github:unblocklabs-ai/qmd
+npm install @unblocklabs/qmd
 ```
 
 #### Quick Start
@@ -556,9 +556,9 @@ Supported model families:
 ## Installation
 
 ```sh
-npm install -g github:unblocklabs-ai/qmd
+npm install -g @unblocklabs/qmd
 # or
-bun install -g github:unblocklabs-ai/qmd
+bun install -g @unblocklabs/qmd
 ```
 
 ### Development
