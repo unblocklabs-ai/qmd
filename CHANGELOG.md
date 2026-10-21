@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [3.0.1] - 2026-10-20
+
+### Changed
+
+- Update the fine-tuning environment's locked certifi CA bundle to 2026.10.19.
+  Other locked Python dependencies are unchanged.
+
 ## [3.0.0] - 2026-10-10
 
 ### Changed
