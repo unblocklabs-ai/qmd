@@ -25,6 +25,6 @@ dev = []
 [tool.uv]
 constraint-dependencies = [
   "authlib>=1.6.9",
-  "aiohttp>=3.13.4",
+  "aiohttp>=3.14.4",
   "cryptography>=46.0.7",
 ]

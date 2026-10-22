@@ -59,7 +59,7 @@
     "url": "https://github.com/unblocklabs-ai/qmd/issues"
   },
   "dependencies": {
-    "@modelcontextprotocol/server": "2.0.0",
+    "@modelcontextprotocol/server": "2.3.0",
     "better-sqlite3": "^13.0.3",
     "node-llama-cpp": "3.20.0",
     "picomatch": "4.0.5",
@@ -86,7 +86,8 @@
     "knip": "6.32.2",
     "oxlint": "1.78.0",
     "tsx": "4.23.12",
-    "vitest": "3.2.7"
+    "vite": "7.3.7",
+    "vitest": "4.1.12"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
@@ -97,7 +98,10 @@
       "tree-sitter-python",
       "tree-sitter-rust",
       "tree-sitter-typescript"
-    ]
+    ],
+    "overrides": {
+      "vite": "7.3.7"
+    }
   },
   "peerDependencies": {
     "typescript": "^5.9.3"
@@ -123,5 +127,8 @@
     "llm"
   ],
   "author": "Tobi Lutke <tobi@lutke.com>",
-  "license": "MIT"
+  "license": "MIT",
+  "overrides": {
+    "vite": "7.3.7"
+  }
 }

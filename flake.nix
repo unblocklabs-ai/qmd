@@ -36,6 +36,27 @@
         packageJson = builtins.fromJSON (builtins.readFile ./package.json);
         version = packageJson.version;
 
+        # nixpkgs' pinned Node 24 predates the October 2026 security fixes.
+        # Keep the supported major and use the official release source checksum.
+        nodejsSlim = pkgs.nodejs-slim_24.overrideAttrs (old: rec {
+          version = "24.22.1";
+          src = pkgs.fetchurl {
+            url = "https://nodejs.org/dist/v${version}/node-v${version}.tar.xz";
+            sha256 = "4f5379796280cdaeb0c2f358fd04b6a16cc4fb7dfa83b5a8c91a9d963b435231";
+          };
+          # This Node release requires the new Brotli BLOCK_SWITCH error code.
+          # The pinned nixpkgs Brotli 1.2.0 lacks it, so use Node's bundled,
+          # release-matched Brotli instead of mixing incompatible headers.
+          configureFlags = builtins.filter
+            (flag: !(pkgs.lib.hasPrefix "--shared-brotli" flag))
+            old.configureFlags;
+          buildInputs = builtins.filter
+            (input: pkgs.lib.getName input != "brotli")
+            old.buildInputs;
+        });
+        nodejs = pkgs.nodejs_24.override { nodejs-slim = nodejsSlim; };
+        node-gyp = pkgs.node-gyp.override { inherit nodejs; };
+
         # SQLite with loadable extension support for sqlite-vec
         sqliteWithExtensions = pkgs.sqlite.overrideAttrs (old: {
           configureFlags = (old.configureFlags or []) ++ [
@@ -44,8 +65,8 @@
         });
 
         nodeModulesHashes = {
-          x86_64-linux = "sha256-jvq2TO0SxEV1BHyT6C32VQ916wMTM/D1nsV2rNcJQSo=";
-          aarch64-darwin = "sha256-9vvR3KLmBc+4bfyWEyyM8FHWg+DfiDzUlwqUlm3NFc8=";
+          x86_64-linux = "sha256-aMiLlXFp/c8EgvJnH2pwBD+Ut2cQkCFkWrP5ZPnq4gY=";
+          aarch64-darwin = "sha256-OJhA/B03VT4nEEuVh8DUMxYz3rswwwp621vR1KFJFwk=";
 
           # Populate these on first build for additional hosts if/when needed.
           aarch64-linux = pkgs.lib.fakeHash;
@@ -101,8 +122,8 @@
           nativeBuildInputs = [
             pkgs.bun
             pkgs.makeWrapper
-            pkgs.nodejs
-            pkgs.node-gyp
+            nodejs
+            node-gyp
             pkgs.python3  # needed by node-gyp to compile better-sqlite3
           ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
             pkgs.darwin.cctools  # provides libtool needed by node-gyp on macOS
@@ -116,6 +137,8 @@
             cp -R ${nodeModules}/node_modules ./
             chmod -R u+w node_modules
 
+            test "$(node --version)" = "v24.22.1"
+            node -e 'const z = require("node:zlib"); const b = Buffer.from("qmd-nix-brotli-smoke"); if (!z.brotliDecompressSync(z.brotliCompressSync(b)).equals(b)) process.exit(1)'
             (cd node_modules/better-sqlite3 && node-gyp rebuild --release)
           '';
 
