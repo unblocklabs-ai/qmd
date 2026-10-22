@@ -38,13 +38,14 @@
 
         # nixpkgs' pinned Node 24 predates the October 2026 security fixes.
         # Keep the supported major and use the official release source checksum.
-        nodejs = pkgs.nodejs_24.overrideAttrs (_: rec {
+        nodejsSlim = pkgs.nodejs-slim_24.overrideAttrs (_: rec {
           version = "24.22.1";
           src = pkgs.fetchurl {
             url = "https://nodejs.org/dist/v${version}/node-v${version}.tar.xz";
             sha256 = "4f5379796280cdaeb0c2f358fd04b6a16cc4fb7dfa83b5a8c91a9d963b435231";
           };
         });
+        nodejs = pkgs.nodejs_24.override { nodejs-slim = nodejsSlim; };
         node-gyp = pkgs.node-gyp.override { inherit nodejs; };
 
         # SQLite with loadable extension support for sqlite-vec
