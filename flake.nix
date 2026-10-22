@@ -38,12 +38,21 @@
 
         # nixpkgs' pinned Node 24 predates the October 2026 security fixes.
         # Keep the supported major and use the official release source checksum.
-        nodejsSlim = pkgs.nodejs-slim_24.overrideAttrs (_: rec {
+        nodejsSlim = pkgs.nodejs-slim_24.overrideAttrs (old: rec {
           version = "24.22.1";
           src = pkgs.fetchurl {
             url = "https://nodejs.org/dist/v${version}/node-v${version}.tar.xz";
             sha256 = "4f5379796280cdaeb0c2f358fd04b6a16cc4fb7dfa83b5a8c91a9d963b435231";
           };
+          # This Node release requires the new Brotli BLOCK_SWITCH error code.
+          # The pinned nixpkgs Brotli 1.2.0 lacks it, so use Node's bundled,
+          # release-matched Brotli instead of mixing incompatible headers.
+          configureFlags = builtins.filter
+            (flag: !(pkgs.lib.hasPrefix "--shared-brotli" flag))
+            old.configureFlags;
+          buildInputs = builtins.filter
+            (input: pkgs.lib.getName input != "brotli")
+            old.buildInputs;
         });
         nodejs = pkgs.nodejs_24.override { nodejs-slim = nodejsSlim; };
         node-gyp = pkgs.node-gyp.override { inherit nodejs; };
@@ -129,6 +138,7 @@
             chmod -R u+w node_modules
 
             test "$(node --version)" = "v24.22.1"
+            node -e 'const z = require("node:zlib"); const b = Buffer.from("qmd-nix-brotli-smoke"); if (!z.brotliDecompressSync(z.brotliCompressSync(b)).equals(b)) process.exit(1)'
             (cd node_modules/better-sqlite3 && node-gyp rebuild --release)
           '';
 
