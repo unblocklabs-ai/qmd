@@ -23,15 +23,8 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      # Temporary lock-generation step; remove once the generated lock is committed.
-      - name: Generate updated nixpkgs lock
-        run: nix flake lock --override-input nixpkgs github:NixOS/nixpkgs/5adc50831c259f87faeb09ddf930d43597197473
-
-      - uses: actions/upload-artifact@v4
-        if: runner.os == 'Linux'
-        with:
-          name: updated-flake-lock
-          path: flake.lock
-
       - name: Build flake
-        run: nix build . --print-build-logs
+        run: nix build . --no-update-lock-file --print-build-logs
+
+      - name: Smoke test packaged CLI
+        run: ./result/bin/qmd --version

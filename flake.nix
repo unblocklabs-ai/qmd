@@ -127,6 +127,7 @@
             cp -R ${nodeModules}/node_modules ./
             chmod -R u+w node_modules
 
+            test "$(node --version)" = "v24.22.1"
             (cd node_modules/better-sqlite3 && node-gyp rebuild --release)
           '';
 
