@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [3.0.2] - 2026-10-30
+
+### Fixes
+
+- Ship MCP server SDK 2.3.0 as a direct runtime dependency so downstream
+  installations receive the HTTP transport, validation and authentication
+  security fixes without relying on application-level npm overrides.
+
 ## [3.0.1] - 2026-10-20
 
 ### Changed
