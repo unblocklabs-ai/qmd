@@ -4432,11 +4432,11 @@ describe("Embedding batching", () => {
     };
   }
 
-  function createFakeEmbedLlm() {
+  function createFakeEmbedLlm(embedModel?: string) {
     const embedBatchCalls: string[][] = [];
     const embedCalls: { text: string; options?: { model?: string } }[] = [];
     const embedBatchModelCalls: ({ model?: string } | undefined)[] = [];
-    return {
+    return Object.assign(new LlamaCpp({ embedModel }), {
       embedBatchCalls,
       embedCalls,
       embedBatchModelCalls,
@@ -4455,7 +4455,7 @@ describe("Embedding batching", () => {
           model: "fake-embed",
         }));
       },
-    };
+    });
   }
 
   test("generateEmbeddings flushes batches when maxDocsPerBatch is reached", async () => {
@@ -4464,7 +4464,7 @@ describe("Embedding batching", () => {
     const fakeLlm = createFakeEmbedLlm();
 
     setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = fakeLlm as any;
+    store.llm = fakeLlm;
 
     try {
       await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
@@ -4502,7 +4502,7 @@ describe("Embedding batching", () => {
     };
 
     setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = slowLlm as any;
+    store.llm = Object.assign(new LlamaCpp(), slowLlm);
 
     try {
       await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
@@ -4531,7 +4531,7 @@ describe("Embedding batching", () => {
     const fakeLlm = createFakeEmbedLlm();
 
     setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = fakeLlm as any;
+    store.llm = fakeLlm;
 
     const docOne = "# One\n\n" + "A".repeat(36);
     const docTwo = "# Two\n\n" + "B".repeat(36);
@@ -4567,7 +4567,7 @@ describe("Embedding batching", () => {
     const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
 
     setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = fakeLlm as any;
+    store.llm = fakeLlm;
 
     try {
       await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
@@ -4587,11 +4587,11 @@ describe("Embedding batching", () => {
   test("generateEmbeddings uses the active llm embed model when no explicit model is passed", async () => {
     const store = await createTestStore();
     const db = store.db;
-    const fakeLlm = createFakeEmbedLlm();
     const model = "hf:env/embed-model.gguf";
 
     setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = { ...fakeLlm, embedModelName: model } as any;
+    const fakeLlm = createFakeEmbedLlm(model);
+    store.llm = fakeLlm;
 
     try {
       await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
@@ -4611,11 +4611,10 @@ describe("Embedding batching", () => {
   test("generateEmbeddings persists semantic chunking and reuses its fingerprint", async () => {
     const store = await createTestStore();
     const db = store.db;
-    const fakeLlm = createFakeEmbedLlm();
     const model = "hf:test/semantic-embed-model.gguf";
 
     setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = { ...fakeLlm, embedModelName: model } as any;
+    store.llm = createFakeEmbedLlm(model);
 
     try {
       await insertTestDocument(db, "docs", { name: "first", body: "# First\n\nA compact semantic note." });
@@ -4659,7 +4658,7 @@ describe("Embedding batching", () => {
     const fakeLlm = createFakeEmbedLlm();
     const model = "hf:test/empty-semantic-model.gguf";
     setDefaultLlamaCpp(createFakeTokenizer() as LlamaCpp);
-    store.llm = fakeLlm as LlamaCpp;
+    store.llm = fakeLlm;
     try {
       await insertTestDocument(store.db, "docs", { name: "empty", hash: "emptyhash", body });
       store.ensureVecTable(3);
@@ -4695,7 +4694,7 @@ describe("Embedding batching", () => {
     };
 
     setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = fakeLlm as any;
+    store.llm = Object.assign(new LlamaCpp(), fakeLlm);
 
     try {
       await insertTestDocument(db, "docs", {
@@ -4733,7 +4732,7 @@ describe("Embedding batching", () => {
     };
 
     setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = fakeLlm as any;
+    store.llm = Object.assign(new LlamaCpp(), fakeLlm);
 
     try {
       await insertTestDocument(db, "docs", {
@@ -4759,7 +4758,7 @@ describe("Embedding batching", () => {
     const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
 
     setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = fakeLlm as any;
+    store.llm = fakeLlm;
 
     try {
       await insertTestDocument(store.db, "docs", { name: "one", body: "# One\n\nAlpha" });
@@ -4785,15 +4784,14 @@ describe("Embedding batching", () => {
     // Store is pinned to a 3-dim embed model. Docs AND the query must use it,
     // so vectors_vec is created as float[3].
     const storeModel = "hf:store/embeddinggemma-300M.gguf";
-    const storeLlm = {
-      embedModelName: storeModel,
+    const storeLlm = Object.assign(new LlamaCpp({ embedModel: storeModel }), {
       async embed(_text: string, _options?: { model?: string }) {
         return { embedding: [0.1, 0.2, 0.3], model: storeModel };
       },
       async embedBatch(texts: string[], _options?: { model?: string }) {
         return texts.map(() => ({ embedding: [0.1, 0.2, 0.3], model: storeModel }));
       },
-    };
+    });
 
     // The global default (env QMD_EMBED_MODEL) is a DIFFERENT, 4-dim model.
     // If the query is wrongly embedded with this, sqlite-vec rejects the 4-dim
@@ -4812,7 +4810,7 @@ describe("Embedding batching", () => {
     };
 
     setDefaultLlamaCpp(defaultLlm as any);
-    store.llm = storeLlm as any;
+    store.llm = storeLlm;
 
     try {
       await insertTestDocument(db, "docs", { name: "alpha", body: "# Alpha\n\nvector regression doc" });

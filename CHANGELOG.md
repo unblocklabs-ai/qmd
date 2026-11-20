@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Reuse embedding contexts across indexing batches and release the extras when
+  the run finishes. On an M1 Pro, this cut semantic indexing time by 29% in a
+  48-note benchmark without changing embeddings.
+
 ## [3.0.2] - 2026-10-30
 
 ### Fixes

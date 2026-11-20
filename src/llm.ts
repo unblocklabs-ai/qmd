@@ -853,7 +853,7 @@ export class LlamaCpp implements LLM {
   private inactivityTimeoutMs: number;
   private disposeModelsOnInactivity: boolean;
   private idleEmbeddingContexts: number | undefined;
-  private activeEmbedBatches = 0;
+  private embeddingPoolUsers = 0;
 
   // Track disposal state to prevent double-dispose
   private disposed = false;
@@ -1311,7 +1311,7 @@ export class LlamaCpp implements LLM {
 
   private async trimIdleEmbeddingContexts(): Promise<void> {
     if (this.idleEmbeddingContexts === undefined
-      || this.activeEmbedBatches > 0
+      || this.embeddingPoolUsers > 0
       || this.embedContexts.length <= this.idleEmbeddingContexts) {
       return;
     }
@@ -1319,6 +1319,17 @@ export class LlamaCpp implements LLM {
     const idleContexts = this.embedContexts.splice(this.idleEmbeddingContexts);
     for (const context of idleContexts) {
       await disposeWithTimeout("idle embedding context", () => context.dispose());
+    }
+  }
+
+  /** Defer trimming until a logical indexing operation finishes its last batch. */
+  async withEmbeddingPool<T>(operation: () => Promise<T>): Promise<T> {
+    this.embeddingPoolUsers++;
+    try {
+      return await operation();
+    } finally {
+      this.embeddingPoolUsers--;
+      await this.trimIdleEmbeddingContexts();
     }
   }
 
@@ -1562,7 +1573,7 @@ export class LlamaCpp implements LLM {
 
     if (texts.length === 0) return [];
 
-    this.activeEmbedBatches++;
+    this.embeddingPoolUsers++;
     try {
       const contexts = await this.ensureEmbedContexts();
       const n = contexts.length;
@@ -1621,7 +1632,7 @@ export class LlamaCpp implements LLM {
       console.error("Batch embedding error:", error);
       return texts.map(() => null);
     } finally {
-      this.activeEmbedBatches--;
+      this.embeddingPoolUsers--;
       await this.trimIdleEmbeddingContexts();
     }
   }

@@ -2168,7 +2168,7 @@ export async function generateEmbeddings(
   const embedModelUri = model;
 
   // Create a session manager for this llm instance
-  const result = await withLLMSessionForLlm(llm, async (session) => {
+  const result = await withLLMSessionForLlm(llm, (session) => llm.withEmbeddingPool(async () => {
     let chunksEmbedded = 0;
     let bytesProcessed = 0;
     let totalChunks = 0;
@@ -2422,7 +2422,7 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
+  }), { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,

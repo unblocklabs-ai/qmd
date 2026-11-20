@@ -1044,7 +1044,7 @@ describe("embed", () => {
 
     const fakeLlm = createFakeEmbedLlm();
     setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.internal.llm = fakeLlm as any;
+    Object.assign(store.internal.llm!, fakeLlm);
 
     try {
       await store.update();
@@ -1076,7 +1076,7 @@ describe("embed", () => {
 
     const fakeLlm = createFakeEmbedLlm();
     setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.internal.llm = fakeLlm as any;
+    Object.assign(store.internal.llm!, fakeLlm);
 
     try {
       await store.update();
@@ -1116,7 +1116,7 @@ describe("embed", () => {
 
     const fakeLlm = createFakeEmbedLlm();
     setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.internal.llm = fakeLlm as any;
+    Object.assign(store.internal.llm!, fakeLlm);
 
     const vectorCounts = () => store.internal.db.prepare(`
       SELECT d.collection, COUNT(DISTINCT v.hash) AS count
