@@ -80,7 +80,6 @@ import {
   getDefaultDbPath,
   reindexCollection,
   generateEmbeddings,
-  maybeAdoptLegacyEmbeddingFingerprint,
   syncConfigToDb,
   type ReindexResult,
   type ChunkStrategy,
@@ -3870,15 +3869,6 @@ async function showDoctor(): Promise<void> {
   checkModelCache(activeModels, nextSteps);
 
   await runDoctorDeviceChecks(nextSteps);
-
-  try {
-    const adoption = await maybeAdoptLegacyEmbeddingFingerprint(storeInstance, embedModel);
-    if (adoption.checked || adoption.adopted > 0) {
-      doctorCheck("legacy fingerprint adoption", adoption.adopted > 0, adoption.adopted > 0 ? `adopted ${adoption.adopted} legacy chunks; ${adoption.reason}` : adoption.reason);
-    }
-  } catch (error) {
-    doctorCheck("legacy fingerprint adoption", false, error instanceof Error ? error.message : String(error));
-  }
 
   try {
     const pending = getHashesNeedingEmbedding(db, undefined, embedModel);

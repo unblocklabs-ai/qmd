@@ -837,24 +837,22 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
 });
 
 describe("LlamaCpp embedding truncation", () => {
-  test("truncates against the active embedding context limit, not the model train context", async () => {
+  test.each([2048, 3000])("reserves control-token space in the active embedding context for %i tokens", async (length) => {
     const llm = new LlamaCpp({}) as any;
-    const getEmbeddingFor = vi.fn(async (text: string) => ({
+    const getEmbeddingFor = vi.fn(async (_input: string | number[]) => ({
       vector: new Float32Array([0.25, 0.5]),
-      text,
     }));
 
     llm.touchActivity = vi.fn();
     llm.embedModel = {
       trainContextSize: 8192,
       tokenize: (text: string) => Array.from({ length: text.length }, () => 1),
-      detokenize: (tokens: readonly number[]) => "x".repeat(tokens.length),
     };
     llm.ensureEmbedContext = vi.fn().mockResolvedValue({ getEmbeddingFor });
 
-    const result = await llm.embed("x".repeat(3000));
+    const result = await llm.embed("x".repeat(length));
 
-    expect(getEmbeddingFor).toHaveBeenCalledWith("x".repeat(2044));
+    expect(getEmbeddingFor).toHaveBeenCalledWith(Array.from({ length: 2044 }, () => 1));
     expect(result).toEqual({
       embedding: [0.25, 0.5],
       model: llm.embedModelUri,
@@ -1061,6 +1059,21 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
   });
 
   describe("embedBatch", () => {
+    test("EmbeddingGemma preserves distinct prefixes beyond the native batch boundary", async () => {
+      const tail = " review the budget and schedule a meeting".repeat(54);
+      const texts = ["orchard", "physics"].map(word => "Notes:" + (" " + word).repeat(160) + tail);
+      const [firstTokens, secondTokens] = await Promise.all(texts.map(text => llm.tokenize(text)));
+      expect(firstTokens!.length).toBeGreaterThan(512);
+      expect(firstTokens!.length).toBe(secondTokens!.length);
+      expect(firstTokens!.slice(500)).toEqual(secondTokens!.slice(500));
+
+      const [first, second] = await llm.embedBatch(texts);
+      expect(first?.embedding).toHaveLength(768);
+      expect(second?.embedding).toHaveLength(768);
+      expect(first!.embedding).not.toEqual(second!.embedding);
+      expect((await llm.embed(texts[0]!))?.embedding).toEqual(first!.embedding);
+    });
+
     test("returns embeddings for multiple texts", async () => {
       const texts = ["Hello world", "Test text", "Another document"];
       const results = await llm.embedBatch(texts);

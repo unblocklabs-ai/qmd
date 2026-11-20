@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixes
+
+- Embed long EmbeddingGemma inputs in one native batch so different prefixes
+  aren't discarded. Run `qmd embed` after upgrading to rebuild existing
+  vectors; stale vectors are excluded until replaced.
+
 ## [3.0.3] - 2026-11-20
 
 ### Changes

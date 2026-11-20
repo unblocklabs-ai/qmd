@@ -611,6 +611,9 @@ qmd collection update-cmd notes
 
 ### Generate Vector Embeddings
 
+After upgrading from QMD 3.0.3 or earlier, run `qmd embed` once to rebuild
+the vector index. Vector search skips old embeddings until they are replaced.
+
 ```sh
 # Embed all indexed documents (900 tokens/chunk, 15% overlap)
 qmd embed

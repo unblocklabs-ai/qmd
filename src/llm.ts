@@ -308,6 +308,10 @@ export const LFM2_INSTRUCT_MODEL = "hf:LiquidAI/LFM2.5-1.2B-Instruct-GGUF/LFM2.5
 export const DEFAULT_EMBED_MODEL_URI = DEFAULT_EMBED_MODEL;
 export const DEFAULT_RERANK_MODEL_URI = DEFAULT_RERANK_MODEL;
 export const DEFAULT_GENERATE_MODEL_URI = DEFAULT_GENERATE_MODEL;
+export const EMBED_CONTEXT_SIZE = (() => {
+  const size = parseInt(process.env.QMD_EMBED_CONTEXT_SIZE ?? "", 10);
+  return Number.isFinite(size) && size > 0 ? size : 2048;
+})();
 
 export type ModelResolutionConfig = {
   embed?: string;
@@ -1201,6 +1205,18 @@ export class LlamaCpp implements LLM {
    */
   private embedContextsCreatePromise: Promise<LlamaEmbeddingContext[]> | null = null;
 
+  private createEmbedContext(model: LlamaModel, threads: number): Promise<LlamaEmbeddingContext> {
+    // EmbeddingGemma uses bidirectional attention without a KV cache. Splitting
+    // one input across native batches makes the final pooling ignore earlier tokens.
+    const fullInput = model.fileInfo?.metadata.general?.architecture === "gemma-embedding";
+    const contextSize = fullInput ? this.resolveEmbedTokenLimit() : EMBED_CONTEXT_SIZE;
+    return model.createEmbeddingContext({
+      contextSize,
+      ...(fullInput ? { batchSize: contextSize } : {}),
+      ...(threads > 0 ? { threads } : {}),
+    });
+  }
+
   private async ensureEmbedContexts(): Promise<LlamaEmbeddingContext[]> {
     // Preserve the existing non-warm lifecycle: once the pool is loaded, reuse
     // it until the normal inactivity timer unloads it.
@@ -1218,7 +1234,7 @@ export class LlamaCpp implements LLM {
       try {
         perContextMB = estimateEmbedContextMB({
           modelBytes: statSync(this.embedModelPath).size,
-          contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
+          contextSize: EMBED_CONTEXT_SIZE,
         });
       } catch {
         // Keep the baseline if the file cannot be stat'd.
@@ -1250,10 +1266,7 @@ export class LlamaCpp implements LLM {
         const threads = await this.threadsPerContext(target);
         while (this.embedContexts.length < target) {
           try {
-            this.embedContexts.push(await model.createEmbeddingContext({
-              contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
-              ...(threads > 0 ? { threads } : {}),
-            }));
+            this.embedContexts.push(await this.createEmbedContext(model, threads));
           } catch {
             if (this.embedContexts.length === 0) throw new Error("Failed to create any embedding context");
             break;
@@ -1288,10 +1301,7 @@ export class LlamaCpp implements LLM {
       this.embedContextsCreatePromise = (async () => {
         if (this.embedContexts.length === 0) {
           const threads = await this.threadsPerContext(1);
-          this.embedContexts.push(await model.createEmbeddingContext({
-            contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
-            ...(threads > 0 ? { threads } : {}),
-          }));
+          this.embedContexts.push(await this.createEmbedContext(model, threads));
         }
         this.touchActivity();
         return this.embedContexts;
@@ -1410,10 +1420,6 @@ export class LlamaCpp implements LLM {
     return Number.isFinite(v) && v > 0 ? v : 4096;
   })();
 
-  private static readonly EMBED_CONTEXT_SIZE: number = (() => {
-    const v = parseInt(process.env.QMD_EMBED_CONTEXT_SIZE ?? "", 10);
-    return Number.isFinite(v) && v > 0 ? v : 2048;
-  })();
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length > 0) {
       this.touchActivity();
@@ -1505,36 +1511,26 @@ export class LlamaCpp implements LLM {
   // Core API methods
   // ==========================================================================
 
-  /**
-   * Truncate text to fit within the embedding model's context window.
-   * Uses the model's own tokenizer for accurate token counting, then
-   * detokenizes back to text if truncation is needed.
-   * Returns the (possibly truncated) text and whether truncation occurred.
-   */
   private resolveEmbedTokenLimit(): number {
     const trainedContextSize = this.embedModel?.trainContextSize;
     if (typeof trainedContextSize === "number" && Number.isFinite(trainedContextSize) && trainedContextSize > 0) {
-      return Math.max(1, Math.min(LlamaCpp.EMBED_CONTEXT_SIZE, trainedContextSize));
+      return Math.max(1, Math.min(EMBED_CONTEXT_SIZE, trainedContextSize));
     }
-    return LlamaCpp.EMBED_CONTEXT_SIZE;
+    return EMBED_CONTEXT_SIZE;
   }
 
-  private async truncateToContextSize(
+  /** Pass truncated token IDs directly; retokenizing a cut string can exceed the limit. */
+  private truncateToContextSize(
     text: string
-  ): Promise<{ text: string; truncated: boolean; limit: number }> {
-    if (!this.embedModel) return { text, truncated: false, limit: LlamaCpp.EMBED_CONTEXT_SIZE };
-
-    const maxTokens = this.resolveEmbedTokenLimit();
-    if (maxTokens <= 0) return { text, truncated: false, limit: maxTokens };
-
-    const tokens = this.embedModel.tokenize(text);
-    if (tokens.length <= maxTokens) return { text, truncated: false, limit: maxTokens };
-
-    // Leave a small margin (4 tokens) for BOS/EOS overhead
-    const safeLimit = Math.max(1, maxTokens - 4);
-    const truncatedTokens = tokens.slice(0, safeLimit);
-    const truncatedText = this.embedModel.detokenize(truncatedTokens);
-    return { text: truncatedText, truncated: true, limit: maxTokens };
+  ): { input: string | LlamaToken[]; truncated: boolean; limit: number } {
+    const limit = this.resolveEmbedTokenLimit();
+    // node-llama-cpp appends/prepends control tokens and reserves a slot in the sequence.
+    const safeLimit = Math.max(1, limit - 4);
+    const tokens = this.embedModel?.tokenize(text);
+    if (tokens && tokens.length > safeLimit) {
+      return { input: tokens.slice(0, safeLimit), truncated: true, limit };
+    }
+    return { input: text, truncated: false, limit };
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
@@ -1545,12 +1541,12 @@ export class LlamaCpp implements LLM {
       const context = await this.ensureEmbedContext();
 
       // Guard: truncate text that exceeds model context window to prevent GGML crash
-      const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
+      const { input, truncated, limit } = this.truncateToContextSize(text);
       if (truncated) {
         console.warn(`⚠ Text truncated to fit embedding context (${limit} tokens)`);
       }
 
-      const embedding = await context.getEmbeddingFor(safeText);
+      const embedding = await context.getEmbeddingFor(input);
 
       return {
         embedding: Array.from(embedding.vector),
@@ -1584,11 +1580,11 @@ export class LlamaCpp implements LLM {
         const embeddings: ({ embedding: number[]; model: string } | null)[] = [];
         for (const text of texts) {
           try {
-            const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
+            const { input, truncated, limit } = this.truncateToContextSize(text);
             if (truncated) {
               console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
             }
-            const embedding = await context.getEmbeddingFor(safeText);
+            const embedding = await context.getEmbeddingFor(input);
             this.touchActivity();
             embeddings.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
           } catch (err) {
@@ -1611,11 +1607,11 @@ export class LlamaCpp implements LLM {
           const results: (EmbeddingResult | null)[] = [];
           for (const text of chunk) {
             try {
-              const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
+              const { input, truncated, limit } = this.truncateToContextSize(text);
               if (truncated) {
                 console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
               }
-              const embedding = await ctx.getEmbeddingFor(safeText);
+              const embedding = await ctx.getEmbeddingFor(input);
               this.touchActivity();
               results.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
             } catch (err) {

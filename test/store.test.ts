@@ -3067,7 +3067,7 @@ describe("Index Status", () => {
     await cleanupTestDb(store);
   });
 
-  test("embedding health treats stale fingerprints as needing re-embedding", async () => {
+  test("pre-3.0.4 vectors are pending and excluded from vector search", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
     const model = "hf:test/embed-model.gguf";
@@ -3076,10 +3076,11 @@ describe("Index Status", () => {
     store.llm = { embedModelName: model } as any;
     store.ensureVecTable(3);
     await insertTestDocument(store.db, collectionName, { name: "doc1", hash: "hash1" });
-    store.insertEmbedding("hash1", 0, 0, new Float32Array([1, 2, 3]), model, now, 1, "stale1");
+    const preFullInputFingerprint = "2069c4"; // v3.0.3, regex strategy, model above
+    store.insertEmbedding("hash1", 0, 0, new Float32Array([1, 2, 3]), model, now, 1, preFullInputFingerprint);
 
-    expect(getEmbeddingFingerprint(model)).toMatch(/^[a-f0-9]{6}$/);
     expect(store.getHashesNeedingEmbedding()).toBe(1);
+    expect(await store.searchVec("doc1", model, 1, undefined, undefined, [1, 2, 3])).toEqual([]);
 
     await cleanupTestDb(store);
   });
