@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [3.0.4] - 2026-11-20
+
 ### Fixes
 
 - Embed long EmbeddingGemma inputs in one native batch so different prefixes
