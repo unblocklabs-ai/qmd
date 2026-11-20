@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [3.0.3] - 2026-11-20
+
 ### Changes
 
 - Reuse embedding contexts across indexing batches and release the extras when
