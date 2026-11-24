@@ -11,6 +11,9 @@ importers:
       '@modelcontextprotocol/server':
         specifier: 2.3.0
         version: 2.3.0
+      '@unblocklabs/decisions':
+        specifier: ^0.1.2
+        version: 0.1.2
       better-sqlite3:
         specifier: ^13.0.3
         version: 13.0.3
@@ -1059,6 +1062,10 @@ packages:
 
   '@types/node@25.5.2':
     resolution: {integrity: sha512-tO4ZIRKNC+MDWV4qKVZe3Ql/woTnmHDr5JD8UI5hn2pwBrHEwOEMZK7WlNb5RKB6EoJ02gwmQS9OrjuFnZYdpg==}
+
+  '@unblocklabs/decisions@0.1.2':
+    resolution: {integrity: sha512-jNpapQLhq3XE/TneyCmLPb3tM9j2c1eytXYHKOPC2hhw6TkjDZhocJdrP/MAFnxGWwZM/K47VAxJ50+Qvq+N8w==}
+    engines: {node: '>=22.0.0'}
 
   '@vitest/expect@3.2.7':
     resolution: {integrity: sha512-E8eBXaKibuvH2pSZErOjdVb5vF4PbKYcrnluBTYxEk1l/VhhwZg1kZQsdtjq+CsF5CFydf2Rdkz7jDHKSisi3w==}
@@ -2432,6 +2439,10 @@ snapshots:
   '@types/node@25.5.2':
     dependencies:
       undici-types: 7.18.2
+
+  '@unblocklabs/decisions@0.1.2':
+    dependencies:
+      zod: 4.2.1
 
   '@vitest/expect@3.2.7':
     dependencies:

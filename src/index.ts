@@ -78,7 +78,7 @@ import {
 import { discoverCandidates, type CandidateDiscoveryOptions, type DiscoveryCandidate } from "./query.js";
 export { formatDocForEmbedding, formatQueryForEmbedding } from "./llm.js";
 export type { CandidateDiscoveryOptions, DiscoveryCandidate } from "./query.js";
-export type { TypeSafeOptions } from "./typesafe-query.js";
+export type { DecisionModelOptions, TypeSafeOptions } from "./decision-query.js";
 import {
   setConfigSource,
   loadConfig,
@@ -167,14 +167,14 @@ export type UpdateResult = {
 /**
  * Options for the unified search() method.
  */
-export interface SearchOptions extends Pick<HybridQueryOptions, "typesafe" | "signal" | "allowedPaths" | "trace" | "timeContext"> {
-  /** Simple query string — literal vector + BM25 recall, then TypeSafe ranking */
+export interface SearchOptions extends Pick<HybridQueryOptions, "decisionModel" | "typesafe" | "signal" | "allowedPaths" | "trace" | "timeContext"> {
+  /** Simple query string — literal vector + BM25 recall, then decision-model ranking */
   query?: string;
   /** Explicit typed retrieval variants; plain query also performs no automatic expansion. */
   queries?: ExpandedQuery[];
   /** Domain intent hint — steers reranking and snippet/chunk selection */
   intent?: string;
-  /** Rerank with TypeSafe (default: true); false is explicit local-only retrieval */
+  /** Rerank with the configured decision model (default: true); false is explicit local-only retrieval */
   rerank?: boolean;
   /** Filter to a specific collection */
   collection?: string;
@@ -261,7 +261,7 @@ export interface QMDStore {
 
   // ── Search ──────────────────────────────────────────────────────────
 
-  /** Vector + BM25 retrieval with independent TypeSafe scoring */
+  /** Vector + BM25 retrieval with independent decision-model scoring */
   search(options: SearchOptions): Promise<HybridQueryResult[]>;
 
   /** Exact-depth local candidate discovery, without expansion or remote scoring. */
@@ -454,12 +454,12 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           candidateLimit: opts.candidateLimit,
           skipRerank,
           chunkStrategy: opts.chunkStrategy,
-          typesafe: opts.typesafe, signal: opts.signal, allowedPaths: opts.allowedPaths,
+          decisionModel: opts.decisionModel, typesafe: opts.typesafe, signal: opts.signal, allowedPaths: opts.allowedPaths,
           trace: opts.trace, timeContext: opts.timeContext,
         });
       }
 
-      // Literal vector + BM25 retrieval, then independent TypeSafe scoring.
+      // Literal vector + BM25 retrieval, then independent decision-model scoring.
       return hybridQuery(internal, opts.query!, {
         collection: collections.length > 0 ? collections : undefined,
         limit: opts.limit,
@@ -469,7 +469,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         candidateLimit: opts.candidateLimit,
         skipRerank,
         chunkStrategy: opts.chunkStrategy,
-        typesafe: opts.typesafe, signal: opts.signal, allowedPaths: opts.allowedPaths,
+        decisionModel: opts.decisionModel, typesafe: opts.typesafe, signal: opts.signal, allowedPaths: opts.allowedPaths,
         trace: opts.trace, timeContext: opts.timeContext,
       });
     },

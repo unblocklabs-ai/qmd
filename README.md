@@ -7,12 +7,12 @@ This repository, [`unblocklabs-ai/qmd`](https://github.com/unblocklabs-ai/qmd), 
 QMD provides local indexing, BM25/vector candidate discovery and indexed reads.
 Agent-facing ranked retrieval is consolidated in OpenClaw's `memory_search`
 from `@unblocklabs/unblock-memory`, which accepts `bm25Query` and `vectorQuery`
-and uses the same TypeSafe ranking core as Memory Whisperer.
+and uses the same decision-model ranking core as Memory Whisperer.
 
 The CLI `query`, `search` and `deep-search` alias, MCP `query`, and REST
 `/query` and `/search` are removed. `vsearch` remains a local vector diagnostic;
 SDK primitives and legacy SDK/benchmark hybrid APIs remain available.
-Use the plugin's TypeSafe configuration for `memory_search`; this CLI/MCP
+Use the plugin's decision-model configuration for `memory_search`; this CLI/MCP
 server no longer provides an agent-facing remote-ranked search.
 
 You can read more about QMD's progress in the [CHANGELOG](CHANGELOG.md).
@@ -274,7 +274,7 @@ a model operation.
 The unified `search()` method handles both simple queries and pre-expanded structured queries:
 
 ```typescript
-// Simple query — BM25 + literal vector recall, then TypeSafe scoring
+// Simple query — BM25 + literal vector recall, then decision-model scoring
 const results = await store.search({ query: "authentication flow" })
 
 // Vector-only search with expansion and exact winning chunk spans
@@ -474,13 +474,13 @@ BM25 search, with no local query expansion. Filters apply before retrieval limit
 BM25 selects a complete stored chunk using FTS match highlights (including
 prefixes, stemming, phrases and CJK matches); unembedded documents use
 deterministic chunking. Distinct excerpts from the same file remain separate.
-Each deduplicated excerpt is graded independently by TypeSafe and the highest
+Each deduplicated excerpt is graded independently by the decision model and the highest
 usefulness scores are returned. `minScore` filters final usefulness, not cosine
 similarity. `candidateLimit` optionally caps the shortlist before scoring.
 
 Explicit typed queries still route `lex` to phrase/negation-aware BM25 and
 `vec`/`hyde` to vector search; each variant has the same retrieval budget.
-All variants share the TypeSafe ranking policy. No local rank blending follows it.
+All variants share the decision-model ranking policy. No local rank blending follows it.
 
 Excerpts over 12,000 characters are skipped rather than truncated. Queries and
 intent are each limited to 12,000 characters. One `asOf` clock anchors temporal
@@ -490,7 +490,7 @@ from `allowedPaths` retrieval scope. Time context alone does not filter document
 
 ## Scores
 
-SDK `search` returns TypeSafe usefulness normalized to 0–1. Confidence in `explain`
+SDK `search` returns decision-model usefulness normalized to 0–1. Confidence in `explain`
 describes score concentration, not factual correctness. `vsearch` retains its
 vector similarity scores; SDK `searchLex` retains normalized BM25 scores. Without
 reranking, SDK hybrid search uses the best reciprocal retrieval rank (1 / rank).
@@ -518,7 +518,7 @@ reranking, SDK hybrid search uses the best reciprocal retrieval rank (1 / rank).
 ### GGUF Models (via node-llama-cpp)
 
 QMD retains three local GGUF model roles, downloaded when an operation needs them.
-Legacy SDK hybrid search uses local embeddings plus remote TypeSafe scoring; it does not load
+Legacy SDK hybrid search uses local embeddings plus remote decision-model scoring; it does not load
 the local generation or reranking models. Standalone `vsearch` uses the generation
 model for expansion unless `--no-expand` / SDK `expand:false` is supplied. Explicit
 SDK expansion and low-level local-rerank operations retain their respective models.
@@ -950,7 +950,7 @@ qmd vsearch --no-expand --md --full "error handling"
 # JSON output for scripting
 qmd vsearch --no-expand --json "quarterly reports"
 
-# Inspect TypeSafe score, confidence, evaluation time and retrieval methods
+# Inspect decision-model score, confidence, evaluation time and retrieval methods
 qmd vsearch --no-expand --json "quarterly reports"
 
 # Use separate index for different knowledge base
@@ -965,11 +965,11 @@ time, policy version, confidence and level probabilities to each result:
   "score": 0.9,
   "file": "qmd://docs/note.md",
   "explain": {
-    "ranking": "typesafe",
+    "ranking": "decision",
     "methods": ["vector", "bm25"],
     "score": 0.9,
     "asOf": "2026-09-18T12:00:00.000Z",
-    "policy": "jev-1.13.0:query-v1",
+    "policy": "liquid/d1.2-ultra:query-v1",
     "confidence": 0.7,
     "probabilities": { "0": 0, "1": 0, "2": 0.3, "3": 0.7 }
   }
@@ -1059,7 +1059,7 @@ Each query runs against four backends, reporting precision@k, recall, MRR, and F
 | `bm25` | Keyword search only (FTS5) | No |
 | `vector` | Semantic similarity only | Embedding model |
 | `hybrid` | BM25 + vector fusion (no reranking) | Embedding model |
-| `full` | Hybrid pipeline with TypeSafe scoring | Embedding model + TypeSafe credentials |
+| `full` | Hybrid pipeline with decision-model scoring | Embedding model + decision-model credentials |
 
 **Score interpretation:** `1.00` = perfect (all expected docs in top results),
 `0.00` = complete miss. The example fixture typically shows bm25 ~0.50, vector
@@ -1236,7 +1236,7 @@ Override them per-role without touching source via the `models:` block in
 
 The explicit low-level local reranking primitive uses node-llama-cpp's
 `createRankingContext()` and `rankAndSort()` API. It returns cross-encoder relevance
-scores (0.0–1.0); it is not used by SDK hybrid search, whose scores come from TypeSafe.
+scores (0.0–1.0); it is not used by SDK hybrid search, whose scores come from the decision model.
 
 ### Qwen3 (Query Expansion)
 

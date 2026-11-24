@@ -5,12 +5,12 @@ import { join } from "node:path";
 import { createStore, type QMDStore } from "../src/index.js";
 import { openDatabase } from "../src/db.js";
 import { hashContent, insertContent, insertDocument, type SearchResult } from "../src/store.js";
-import { queryApiKey } from "../src/typesafe-query.js";
+import { queryApiKey } from "../src/decision-query.js";
 
 let store: QMDStore;
 let dir: string;
 beforeEach(async () => {
-  dir = await mkdtemp(join(tmpdir(), "qmd-typesafe-query-"));
+  dir = await mkdtemp(join(tmpdir(), "qmd-decision-query-"));
   store = await createStore({ dbPath: join(dir, "index.sqlite"), config: { collections: {
     docs: { path: dir, pattern: "**/*.md" }, other: { path: dir, pattern: "**/*.md" },
   } } });
@@ -30,11 +30,20 @@ async function document(path: string, body: string, collection = "docs"): Promis
     docid: hash.slice(0, 6), title: path, collectionName: collection, modifiedAt: now,
     body, bodyLength: body.length, context: null, score: 0.9, source: "vec", chunkPos: 0, chunkLen: body.length };
 }
-function score(value: 0 | 1 | 2 | 3) {
-  return Response.json({ answers: { usefulness: { type: "score", score: value, confidence: 1,
-    probabilities: { "0": Number(value === 0), "1": Number(value === 1), "2": Number(value === 2), "3": Number(value === 3) } } } });
+function score(value: 0 | 1 | 2 | 3, model = "liquid/d1.2-ultra-20261116") {
+  return Response.json({
+    model,
+    answers: { usefulness: { type: "score", score: value, confidence: 1,
+      probabilities: { "0": Number(value === 0), "1": Number(value === 1), "2": Number(value === 2), "3": Number(value === 3) } } },
+  });
 }
-const typesafe = { apiKey: "test-only-key", timeoutMs: 1000 };
+function unwrapState(body: { state: unknown }) {
+  return (Array.isArray(body.state) ? body.state[0] : body.state) as {
+    timeContext: object;
+    candidate: { excerpt: string; sourcePath: string };
+  };
+}
+const decisionModel = { apiKey: "test-only-key", timeoutMs: 1000 };
 
 test("SDK discovery preserves exact lane depth and scopes without expansion or remote scoring", async () => {
   for (let i = 0; i < 12; i++) await document(`allowed-${i}.md`, `discoveryneedle evidence ${i}`);
@@ -58,30 +67,57 @@ test("SDK discovery preserves exact lane depth and scopes without expansion or r
   expect(expand).not.toHaveBeenCalled();
 });
 
-test("SDK query retrieves 1.5k per backend, deduplicates excerpts and uses TypeSafe rather than local models", async () => {
+test("SDK query retrieves 1.5k per backend, deduplicates excerpts and uses @unblocklabs/decisions rather than local models", async () => {
   const direct = await document("direct.md", "staging approved by Mira");
   const background = await document("background.md", "staging general background");
   store.internal.db.exec("CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)");
   const vector = vi.spyOn(store.internal, "searchVec").mockResolvedValue([background, direct]);
   const expand = vi.spyOn(store.internal, "expandQuery");
   const localRerank = vi.spyOn(store.internal, "rerank");
-  const requests: Array<{ state: { timeContext: object; candidate: { excerpt: string } } }> = [];
-  const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+  const requests: Array<{ url: string; model: string; isArrayState: boolean; state: ReturnType<typeof unwrapState> }> = [];
+  const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
     const body = JSON.parse(String(init?.body));
-    requests.push(body);
-    return score(body.state.candidate.excerpt.includes("Mira") ? 3 : 1);
+    const state = unwrapState(body);
+    requests.push({ url: String(url), model: body.model, isArrayState: Array.isArray(body.state), state });
+    return score(state.candidate.excerpt.includes("Mira") ? 3 : 1);
   });
   const timeContext = { sessionStartedFrom: "2026-09-01T00:00:00-04:00", sessionStartedTo: "2026-09-18T23:59:59-04:00" };
   const results = await store.search({ query: "Who approved staging?", limit: 2, minScore: 0.5,
-    collection: "docs", typesafe, explain: true, timeContext });
+    collection: "docs", decisionModel, explain: true, timeContext });
   expect(vector.mock.calls[0]?.[2]).toBe(3);
   expect(fetch).toHaveBeenCalledTimes(2);
   expect(expand).not.toHaveBeenCalled();
   expect(localRerank).not.toHaveBeenCalled();
   expect(results).toHaveLength(1);
-  expect(results[0]).toMatchObject({ file: direct.filepath, score: 1, explain: { ranking: "typesafe", methods: ["vector", "bm25"] } });
+  expect(results[0]).toMatchObject({
+    file: direct.filepath,
+    score: 1,
+    explain: { ranking: "decision", methods: ["vector", "bm25"], policy: "liquid/d1.2-ultra:query-v1" },
+  });
+  expect(requests[0]!.url).toBe("https://codex.unblocklabs.ai/v1/decisions");
+  expect(requests[0]!.model).toBe("liquid/d1.2-ultra");
+  expect(requests[0]!.isArrayState).toBe(true);
   expect(requests[0]!.state.timeContext).toEqual({ ...timeContext, asOf: results[0]!.explain!.asOf });
   expect(requests[1]!.state.timeContext).toEqual(requests[0]!.state.timeContext);
+});
+
+test("deprecated typesafe alias and legacy SystemOne endpoint remain supported; specifying both is rejected", async () => {
+  await document("legacy.md", "staging approved");
+  const requests: Array<{ url: string; model: string; isArrayState: boolean }> = [];
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+    const body = JSON.parse(String(init?.body));
+    requests.push({ url: String(url), model: body.model, isArrayState: Array.isArray(body.state) });
+    return score(3, "jev-1.13.0");
+  });
+  const results = await store.search({
+    query: "staging",
+    explain: true,
+    typesafe: { endpoint: "https://api.typesafe.ai/v1/systemone", apiKey: "legacy-key", timeoutMs: 1000 },
+  });
+  expect(results[0]?.explain?.policy).toBe("jev-1.13.0:query-v1");
+  expect(requests).toEqual([{ url: "https://api.typesafe.ai/v1/systemone", model: "jev-1.13.0", isArrayState: false }]);
+  await expect(store.search({ query: "staging", decisionModel, typesafe: decisionModel }))
+    .rejects.toThrow("decisionModel or typesafe, not both");
 });
 
 test("BM25 collection and exact-path scopes apply before LIMIT; source attribution is not deduped across files", async () => {
@@ -91,11 +127,11 @@ test("BM25 collection and exact-path scopes apply before LIMIT; source attributi
   await document("denied.md", "staging staging staging");
   const requests: string[] = [];
   vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
-    requests.push(JSON.parse(String(init?.body)).state.candidate.sourcePath);
+    requests.push(unwrapState(JSON.parse(String(init?.body))).candidate.sourcePath);
     return score(2);
   });
   const results = await store.search({ query: "staging", collection: "docs", limit: 1,
-    allowedPaths: { docs: ["allowed.md", "same.md"] }, typesafe });
+    allowedPaths: { docs: ["allowed.md", "same.md"] }, decisionModel });
   expect(results).toHaveLength(1);
   expect(requests.sort()).toEqual(["qmd://docs/allowed.md", "qmd://docs/same.md"]);
 });
@@ -108,14 +144,14 @@ test("both plain and typed query score the exact vector span, preserving other p
   vi.spyOn(store.internal, "searchVec").mockResolvedValue([{ ...doc, chunkPos: text.indexOf(chunk), chunkLen: chunk.length }]);
   const requests: string[] = [];
   vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
-    requests.push(JSON.parse(String(init?.body)).state.candidate.excerpt);
+    requests.push(unwrapState(JSON.parse(String(init?.body))).candidate.excerpt);
     return score(3);
   });
-  const plain = await store.search({ query: "staging", typesafe });
+  const plain = await store.search({ query: "staging", decisionModel });
   expect(plain.find(h => h.bestChunk === chunk)?.bestChunkPos).toBe(text.indexOf(chunk));
   expect(plain).toHaveLength(2);
   requests.length = 0;
-  const typed = await store.search({ queries: [{ type: "vec", query: "semantic evidence" }], typesafe });
+  const typed = await store.search({ queries: [{ type: "vec", query: "semantic evidence" }], decisionModel });
   expect(requests).toEqual([chunk]);
   expect(typed[0]).toMatchObject({ bestChunk: chunk, bestChunkPos: text.indexOf(chunk) });
 });
@@ -132,7 +168,7 @@ test.each([
   { query: "连接池", excerpt: "数据库连接池配置", typed: false },
   { query: '"connection pool" -redis', excerpt: "The connection\n  pool is healthy.", typed: true },
   { query: "cafe", excerpt: "The café opens at noon.", typed: false },
-])("BM25 sends the matching stored chunk to TypeSafe for $query", async ({ query, excerpt, typed }) => {
+])("BM25 sends the matching stored chunk to the decision model for $query", async ({ query, excerpt, typed }) => {
   const prefix = "🙂 General project background.\n\n数据库介绍\t\n";
   const doc = await document("multi.md", prefix + excerpt);
   const insert = store.internal.db.prepare(
@@ -143,11 +179,11 @@ test.each([
   insert.run(doc.hash, 0, prefix.length, excerpt.length, "test", new Date().toISOString());
   const sent: string[] = [];
   vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
-    sent.push(JSON.parse(String(init?.body)).state.candidate.excerpt);
+    sent.push(unwrapState(JSON.parse(String(init?.body))).candidate.excerpt);
     return score(3);
   });
   const options = typed ? { queries: [{ type: "lex" as const, query }] } : { query };
-  const results = await store.search({ ...options, typesafe });
+  const results = await store.search({ ...options, decisionModel });
   expect(sent).toEqual([excerpt]);
   expect(results[0]).toMatchObject({ bestChunk: excerpt, bestChunkPos: prefix.length });
 });
@@ -205,29 +241,41 @@ test("typed lexical phrase/negation and explicit no-rerank remain local", async 
 
 test("missing credentials fail before retrieval; malformed provider output never becomes an empty success", async () => {
   const vector = vi.spyOn(store.internal, "searchVec");
-  await expect(store.search({ query: "staging", typesafe: { apiKey: "" } })).rejects.toThrow("requires TYPESAFE");
+  await expect(store.search({ query: "staging", decisionModel: { apiKey: "" } })).rejects.toThrow("requires CODEX_LB_API_KEY");
   expect(vector).not.toHaveBeenCalled();
   await document("match.md", "staging evidence");
   vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ secretDiagnostic: "never include this" }));
-  await expect(store.search({ query: "staging", typesafe })).rejects.toThrow("TypeSafe query scoring failed for 1 candidates");
+  await expect(store.search({ query: "staging", decisionModel })).rejects.toThrow("Decision model query scoring failed for 1 candidates");
 });
 
-test("credential files support raw and dotenv formats without fallback or environment mutation", async () => {
-  const file = join(dir, "typesafe.env");
-  const before = process.env.TYPESAFE_API_KEY;
-  await writeFile(file, 'OTHER=ignored\nTYPESAFE_API_KEY="from-file"\n', { mode: 0o600 });
-  expect(await queryApiKey({ apiKeyFile: file })).toBe("from-file");
-  expect(process.env.TYPESAFE_API_KEY).toBe(before);
+test("credential files support raw and dotenv formats with origin isolation and no environment mutation", async () => {
+  const file = join(dir, "decisions.env");
+  const beforeCodex = process.env.CODEX_LB_API_KEY;
+  const beforeTypeSafe = process.env.TYPESAFE_API_KEY;
+  await writeFile(file, 'OTHER=ignored\nCODEX_LB_API_KEY="codex-from-file"\nTYPESAFE_API_KEY="ts-from-file"\n', { mode: 0o600 });
+  expect(await queryApiKey({ apiKeyFile: file })).toBe("codex-from-file");
+  expect(await queryApiKey({ endpoint: "https://api.typesafe.ai/v1/systemone", apiKeyFile: file })).toBe("ts-from-file");
+  expect(process.env.CODEX_LB_API_KEY).toBe(beforeCodex);
+  expect(process.env.TYPESAFE_API_KEY).toBe(beforeTypeSafe);
   await writeFile(file, "plain-key\n");
   expect(await queryApiKey({ apiKeyFile: file })).toBe("plain-key");
   await expect(queryApiKey({ apiKeyFile: join(dir, "missing") })).rejects.toThrow("credential file could not be read");
+  await expect(queryApiKey({ apiKey: "inline", apiKeyFile: file })).rejects.toThrow("apiKey or apiKeyFile, not both");
+  const prevCodexFile = process.env.CODEX_LB_API_KEY_FILE;
+  process.env.CODEX_LB_API_KEY_FILE = file;
+  try {
+    expect(await queryApiKey({ endpoint: "HTTPS://CODEX.UNBLOCKLABS.AI/v1/decisions" })).toBe("plain-key");
+  } finally {
+    if (prevCodexFile === undefined) delete process.env.CODEX_LB_API_KEY_FILE;
+    else process.env.CODEX_LB_API_KEY_FILE = prevCodexFile;
+  }
 });
 
-test("cancellation stops query and vsearch remains independent of TypeSafe", async () => {
+test("cancellation stops query and vsearch remains independent of the decision model", async () => {
   const controller = new AbortController();
   controller.abort();
   const fetch = vi.spyOn(globalThis, "fetch");
-  await expect(store.search({ query: "staging", typesafe, signal: controller.signal })).rejects.toThrow();
+  await expect(store.search({ query: "staging", decisionModel, signal: controller.signal })).rejects.toThrow();
   expect(fetch).not.toHaveBeenCalled();
   expect(await store.vsearch("staging", { expand: false })).toEqual([]);
   expect(fetch).not.toHaveBeenCalled();
@@ -245,6 +293,6 @@ test("query bounds concurrent API requests and stops the remaining queue on canc
       else init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
     });
   });
-  await expect(store.search({ query: "staging", limit: 10, typesafe, signal: controller.signal })).rejects.toThrow();
+  await expect(store.search({ query: "staging", limit: 10, decisionModel, signal: controller.signal })).rejects.toThrow();
   expect(calls).toBe(6);
 });

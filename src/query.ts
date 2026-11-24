@@ -1,7 +1,11 @@
 import { getDefaultLlamaCpp } from "./llm.js";
 import { randomUUID } from "node:crypto";
 import { chunkDocumentAsync, getStoredChunkSpans, normalizeCjkForFTS, type Store, type HybridQueryOptions, type HybridQueryResult } from "./store.js";
-import { judgeQueryExcerpt, queryApiKey, MAX_QUERY_EXCERPT_CHARS, QUERY_POLICY } from "./typesafe-query.js";
+import {
+  judgeQueryExcerpt,
+  MAX_QUERY_EXCERPT_CHARS,
+  resolveQueryDecisionContext,
+} from "./decision-query.js";
 
 type RetrievalQuery = { type: "lex" | "vec" | "hyde"; query: string; expression?: string | null };
 type Candidate = HybridQueryResult & { methods: Array<"vector" | "bm25">; retrievalScore: number };
@@ -118,25 +122,32 @@ export async function discoverCandidates(store: Store, options: CandidateDiscove
 }
 
 /** Shared query implementation for CLI, MCP and SDK. vsearch does not call this. */
-export async function typesafeQuery(store: Store, query: string, options: HybridQueryOptions = {},
+export async function decisionQuery(store: Store, query: string, options: HybridQueryOptions = {},
   searches?: readonly RetrievalQuery[]): Promise<HybridQueryResult[]> {
+  if (options.decisionModel !== undefined && options.typesafe !== undefined) {
+    throw new Error("query accepts decisionModel or typesafe, not both");
+  }
+  const decisionOptions = options.decisionModel ?? options.typesafe;
   const limit = options.limit ?? 10;
   const minScore = options.minScore ?? 0;
   const candidateLimit = options.candidateLimit;
-  const timeoutMs = options.typesafe?.timeoutMs ?? 10_000;
+  const timeoutMs = decisionOptions?.timeoutMs ?? 10_000;
   if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new Error("query limit must be an integer from 1 to 500");
   if (!Number.isFinite(minScore) || minScore < 0 || minScore > 1) throw new Error("query minScore must be from 0 to 1");
   if (candidateLimit !== undefined && (!Number.isInteger(candidateLimit) || candidateLimit < 1 || candidateLimit > 1500)) {
     throw new Error("query candidateLimit must be an integer from 1 to 1500");
   }
-  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) throw new Error("TypeSafe timeoutMs must be from 1 to 30000");
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) throw new Error("Decision model timeoutMs must be from 1 to 30000");
   if (!query.trim() || query.length > MAX_QUERY_EXCERPT_CHARS || (options.intent?.length ?? 0) > MAX_QUERY_EXCERPT_CHARS) {
     throw new Error("query and intent must each be at most 12000 characters; query must not be blank");
   }
   const signal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(60_000)]) : AbortSignal.timeout(60_000);
   signal.throwIfAborted();
   // Credential resolution precedes retrieval. No local-reranker fallback or guessed key.
-  const apiKey = options.skipRerank ? undefined : await queryApiKey(options.typesafe);
+  const decision = options.skipRerank ? undefined : await resolveQueryDecisionContext(decisionOptions);
+  const apiKey = decision?.apiKey;
+  const client = decision?.client;
+  const policy = decision?.policy;
   const from = options.timeContext?.sessionStartedFrom;
   const to = options.timeContext?.sessionStartedTo;
   if ((from !== undefined && !Number.isFinite(Date.parse(from))) ||
@@ -188,10 +199,10 @@ export async function typesafeQuery(store: Store, query: string, options: Hybrid
       signal.throwIfAborted();
       const hit = shortlist[next++]!;
       let judgment: Awaited<ReturnType<typeof judgeQueryExcerpt>> | undefined;
-      if (apiKey) {
+      if (apiKey && client) {
         try {
           judgment = await judgeQueryExcerpt({ query, intent: options.intent, timeContext,
-            candidate: { excerpt: hit.bestChunk, sourcePath: hit.file } }, { apiKey, signal, timeoutMs });
+            candidate: { excerpt: hit.bestChunk, sourcePath: hit.file } }, { client, apiKey, signal, timeoutMs });
         } catch {
           failed++;
           continue;
@@ -200,9 +211,9 @@ export async function typesafeQuery(store: Store, query: string, options: Hybrid
       const score = judgment ? judgment.score / 3 : hit.retrievalScore;
       const { methods, retrievalScore: _retrievalScore, ...result } = hit;
       results.push({ ...result, score, ...(options.explain ? { explain: {
-        ranking: apiKey ? "typesafe" as const : "retrieval" as const,
+        ranking: apiKey ? "decision" as const : "retrieval" as const,
         methods, score, asOf: timeContext.asOf,
-        ...(judgment ? { confidence: judgment.confidence, probabilities: judgment.probabilities, policy: QUERY_POLICY } : {}),
+        ...(judgment ? { confidence: judgment.confidence, probabilities: judgment.probabilities, policy } : {}),
       } } : {}) });
     }
   }));
@@ -210,7 +221,7 @@ export async function typesafeQuery(store: Store, query: string, options: Hybrid
   if (apiKey) options.hooks?.onRerankDone?.(performance.now() - started);
   // Array-only CLI/SDK contract cannot reliably communicate an empty partial batch.
   // Fail explicitly rather than misrepresent provider failures as no matching memories.
-  if (failed) throw new Error(`TypeSafe query scoring failed for ${failed} candidates; use vsearch for local search`);
+  if (failed) throw new Error(`Decision model query scoring failed for ${failed} candidates; use vsearch for local search`);
   return results.sort((a, b) => b.score - a.score || a.file.localeCompare(b.file) || a.bestChunkPos - b.bestChunkPos)
     .filter(hit => hit.score >= minScore).slice(0, limit);
 }

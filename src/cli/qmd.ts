@@ -3299,7 +3299,7 @@ function showHelp(): void {
   console.log("  qmd <command> [options]");
   console.log("");
   console.log("Primary commands:");
-  console.log("  Use OpenClaw memory_search for BM25 + vector retrieval with TypeSafe ranking.");
+  console.log("  Use OpenClaw memory_search for BM25 + vector retrieval with decision-model ranking.");
   console.log("  qmd vsearch <query>           - Vector similarity only");
   console.log("  qmd get <file>[:from[:count]] - Show a document (line-numbered; #docid in header)");
   console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
@@ -3343,7 +3343,7 @@ function showHelp(): void {
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
   console.log("  -C, --candidate-limit <n>  - Optional cap after deduplication (default: all candidates)");
-  console.log("  --no-rerank                - Local-only reciprocal-rank ordering; no TypeSafe calls");
+  console.log("  --no-rerank                - Local-only reciprocal-rank ordering; no decision-model calls");
   console.log("  --no-expand                - vsearch only: use the literal query without LLM expansion");
   console.log("  --no-gpu                   - Force CPU mode for llama.cpp operations (same as QMD_FORCE_CPU=1)");
   console.log("  --line-numbers             - Include line numbers (search; get/multi-get are on by default)");

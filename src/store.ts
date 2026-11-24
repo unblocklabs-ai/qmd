@@ -13,8 +13,8 @@
 
 import { openDatabase, loadSqliteVec } from "./db.js";
 import type { Database } from "./db.js";
-import { typesafeQuery } from "./query.js";
-import type { TypeSafeOptions } from "./typesafe-query.js";
+import { decisionQuery } from "./query.js";
+import type { DecisionModelOptions, TypeSafeOptions } from "./decision-query.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
@@ -2678,7 +2678,7 @@ export type RRFScoreTrace = {
 };
 
 export type HybridQueryExplain = {
-  ranking: "typesafe" | "retrieval";
+  ranking: "decision" | "retrieval";
   methods: Array<"vector" | "bm25">;
   score: number;
   asOf: string;
@@ -5615,13 +5615,15 @@ export interface HybridQueryOptions {
   allowedPaths?: AllowedDocumentPaths;
   trace?: VectorSearchTrace;
   signal?: AbortSignal;
+  decisionModel?: DecisionModelOptions;
+  /** @deprecated Use decisionModel. */
   typesafe?: TypeSafeOptions;
   /** Optional session-start bounds supplied by a session-aware caller, not claim dates. */
   timeContext?: { sessionStartedFrom?: string; sessionStartedTo?: string };
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // optional cap after deduplication; default all retrieved candidates
-  explain?: boolean;        // include TypeSafe judgment details
+  explain?: boolean;        // include decision-model judgment details
   intent?: string;          // domain intent hint for disambiguation
   skipRerank?: boolean;     // explicit local-only reciprocal-rank ordering
   chunkStrategy?: ChunkStrategy;
@@ -5635,7 +5637,7 @@ export interface HybridQueryResult {
   body: string;             // full document body (for snippet extraction)
   bestChunk: string;        // best chunk text
   bestChunkPos: number;     // char offset of best chunk in body
-  score: number;            // TypeSafe usefulness, or retrieval rank when explicitly skipping scoring
+  score: number;            // decision-model usefulness, or retrieval rank when explicitly skipping scoring
   context: string | null;   // user-set context
   docid: string;            // content hash prefix (6 chars)
   explain?: HybridQueryExplain;
@@ -5647,11 +5649,11 @@ export type RankedListMeta = {
   query: string;
 };
 
-/** BM25 + literal vector recall, deduplication and independent TypeSafe scoring. */
+/** BM25 + literal vector recall, deduplication and independent decision-model scoring. */
 export async function hybridQuery(
   store: Store, query: string, options?: HybridQueryOptions,
 ): Promise<HybridQueryResult[]> {
-  return typesafeQuery(store, query, options);
+  return decisionQuery(store, query, options);
 }
 
 export interface VectorSearchOptions {
@@ -5753,7 +5755,7 @@ export interface StructuredSearchOptions extends Omit<HybridQueryOptions, "colle
   collections?: string[];
 }
 
-/** Explicit typed retrieval variants, scored by the same TypeSafe query policy. */
+/** Explicit typed retrieval variants, scored by the same decision-model query policy. */
 export async function structuredSearch(
   store: Store, searches: ExpandedQuery[], options?: StructuredSearchOptions,
 ): Promise<HybridQueryResult[]> {
@@ -5779,7 +5781,7 @@ export async function structuredSearch(
     }
   }
 
-  return typesafeQuery(store, searches.map(s => s.type + ": " + s.query).join("\n"),
+  return decisionQuery(store, searches.map(s => s.type + ": " + s.query).join("\n"),
     { ...options, collection: options?.collections },
     searches.map(s => ({ ...s, ...(s.type === "lex" ? { expression: buildFTS5Query(s.query) } : {}) })));
 }
