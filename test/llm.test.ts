@@ -31,6 +31,7 @@ import {
   resolveGenerateModel,
   resolveRerankModel,
   resolveModels,
+  resolveHfEndpoint,
   pullModels,
   withLLMSession,
   canUnloadLLM,
@@ -1638,5 +1639,16 @@ describe("LlamaCpp generate sequence dispose (node-llama-cpp 3.20)", () => {
     } finally {
       setNodeLlamaCppModuleForTest(null);
     }
+  });
+
+  test("resolveHfEndpoint honors MODEL_ENDPOINT then HF_ENDPOINT and falls back on invalid URLs", () => {
+    expect(resolveHfEndpoint({})).toBe("https://huggingface.co");
+    expect(resolveHfEndpoint({ HF_ENDPOINT: "https://hf-mirror.com/" })).toBe("https://hf-mirror.com");
+    expect(resolveHfEndpoint({
+      MODEL_ENDPOINT: "https://models.internal.local:8443/hf/",
+      HF_ENDPOINT: "https://hf-mirror.com",
+    })).toBe("https://models.internal.local:8443/hf");
+    expect(resolveHfEndpoint({ HF_ENDPOINT: "not-a-url" })).toBe("https://huggingface.co");
+    expect(resolveHfEndpoint({ HF_ENDPOINT: "file:///etc/passwd" })).toBe("https://huggingface.co");
   });
 });

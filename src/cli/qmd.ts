@@ -84,7 +84,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, resolveHfEndpoint, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -644,10 +644,11 @@ async function showStatus(): Promise<void> {
 
   // Models
   {
-    // hf:org/repo/file.gguf → https://huggingface.co/org/repo
+    // hf:org/repo/file.gguf → https://huggingface.co/org/repo (or HF_ENDPOINT / MODEL_ENDPOINT mirror)
+    const hfBase = resolveHfEndpoint();
     const hfLink = (uri: string) => {
       const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
-      return match ? `https://huggingface.co/${match[1]}` : uri;
+      return match ? `${hfBase}/${match[1]}` : uri;
     };
     const activeModels = resolveModelsForCli();
     console.log(`\n${c.bold}Models${c.reset}`);
@@ -2707,7 +2708,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
     let results = await vectorSearchQuery(store, query, {
       collection: collectionSearchFilter(collectionNames),
       limit: opts.all ? 500 : (opts.limit || 10),
-      minScore: opts.minScore || 0.3,
+      minScore: opts.minScore ?? 0.3,
       intent: opts.intent,
       expand: !opts.noExpand,
       hooks: {
@@ -4378,7 +4379,7 @@ if (isMain) {
         process.exit(1);
       }
       // Default min-score for vector search is 0.3
-      if (!cli.values["min-score"]) {
+      if (cli.values["min-score"] === undefined) {
         cli.opts.minScore = 0.3;
       }
       await resolveLocalConfigTrust();

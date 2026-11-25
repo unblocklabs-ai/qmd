@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [3.1.1] - 2026-11-25
+
+### Fixes
+
+- Honor `MODEL_ENDPOINT` / `HF_ENDPOINT` mirror overrides and add a 10s timeout on `getRemoteEtag` Hugging Face `HEAD` preflight requests.
+- Honor explicit `--min-score 0` on `qmd vsearch` instead of falling back to `0.3`.
+
 ## [3.1.0] - 2026-11-25
 
 ### Changes

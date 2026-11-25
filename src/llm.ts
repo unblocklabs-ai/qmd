@@ -367,10 +367,30 @@ function parseHfUri(model: string): HfRef | null {
   return { repo, file };
 }
 
-async function getRemoteEtag(ref: HfRef): Promise<string | null> {
-  const url = `https://huggingface.co/${ref.repo}/resolve/main/${ref.file}`;
+const REMOTE_ETAG_TIMEOUT_MS = 10_000;
+
+export function resolveHfEndpoint(env: Record<string, string | undefined> = process.env): string {
+  const raw = (env.MODEL_ENDPOINT ?? env.HF_ENDPOINT ?? "").trim();
+  if (!raw) return "https://huggingface.co";
   try {
-    const resp = await fetch(url, { method: "HEAD" });
+    const parsed = new URL(raw);
+    if (parsed.protocol === "https:" || parsed.protocol === "http:") {
+      return parsed.toString().replace(/\/+$/, "");
+    }
+  } catch {
+    // Fall back to canonical Hugging Face origin on malformed env value.
+  }
+  return "https://huggingface.co";
+}
+
+async function getRemoteEtag(ref: HfRef): Promise<string | null> {
+  const baseUrl = resolveHfEndpoint();
+  const url = `${baseUrl}/${ref.repo}/resolve/main/${ref.file}`;
+  try {
+    const resp = await fetch(url, {
+      method: "HEAD",
+      signal: AbortSignal.timeout(REMOTE_ETAG_TIMEOUT_MS),
+    });
     if (!resp.ok) return null;
     const etag = resp.headers.get("etag");
     return etag || null;
