@@ -294,7 +294,7 @@ export type RerankDocument = {
 // HuggingFace model URIs for node-llama-cpp
 // Format: hf:<user>/<repo>/<file>
 // Override via QMD_EMBED_MODEL env var (e.g. hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf)
-const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+const DEFAULT_EMBED_MODEL = "hf:bek91/embeddinggemma-2-wsp-GGUF/embeddinggemma-2-wsp-Q8_0.gguf";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
@@ -1208,7 +1208,8 @@ export class LlamaCpp implements LLM {
   private createEmbedContext(model: LlamaModel, threads: number): Promise<LlamaEmbeddingContext> {
     // EmbeddingGemma uses bidirectional attention without a KV cache. Splitting
     // one input across native batches makes the final pooling ignore earlier tokens.
-    const fullInput = model.fileInfo?.metadata.general?.architecture === "gemma-embedding";
+    const architecture = model.fileInfo?.metadata.general?.architecture;
+    const fullInput = typeof architecture === "string" && /^gemma-embedding\d*$/i.test(architecture);
     const contextSize = fullInput ? this.resolveEmbedTokenLimit() : EMBED_CONTEXT_SIZE;
     return model.createEmbeddingContext({
       contextSize,

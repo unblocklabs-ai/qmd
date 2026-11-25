@@ -62,7 +62,7 @@
     "@modelcontextprotocol/server": "2.3.0",
     "@unblocklabs/decisions": "^0.1.2",
     "better-sqlite3": "^13.0.3",
-    "node-llama-cpp": "3.20.0",
+    "node-llama-cpp": "3.22.3",
     "picomatch": "4.0.5",
     "sqlite-vec": "0.1.9",
     "tinyglobby": "0.2.17",

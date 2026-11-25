@@ -531,7 +531,7 @@ SDK expansion and low-level local-rerank operations retain their respective mode
 
 | Model | Purpose | Size |
 |-------|---------|------|
-| `embeddinggemma-300M-Q8_0` | Vector embeddings (default) | ~300MB |
+| `embeddinggemma-2-wsp-Q8_0` | Vector embeddings (default) | ~300MB |
 | `qwen3-reranker-0.6b-q8_0` | Re-ranking | ~640MB |
 | `qmd-query-expansion-1.7B-q4_k_m` | Query expansion (fine-tuned) | ~1.1GB |
 
@@ -730,7 +730,7 @@ editor_uri: "vscode://file{path}:{line}:{col}"
 # built-in defaults. `qmd init` writes this block pre-filled with the
 # resolved defaults. See "Model Configuration" for the default URIs.
 models:
-  embed: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf"
+  embed: "hf:bek91/embeddinggemma-2-wsp-GGUF/embeddinggemma-2-wsp-Q8_0.gguf"
   rerank: "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf"
   generate: "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf"
 
@@ -1219,7 +1219,7 @@ query-adaptive boundaries. Tiny unlabeled two-atom notes may remain one chunk.
 The default models are defined in `src/llm.ts` as HuggingFace URIs:
 
 ```typescript
-const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+const DEFAULT_EMBED_MODEL = "hf:bek91/embeddinggemma-2-wsp-GGUF/embeddinggemma-2-wsp-Q8_0.gguf";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 ```
