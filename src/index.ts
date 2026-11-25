@@ -78,7 +78,7 @@ import {
 import { discoverCandidates, type CandidateDiscoveryOptions, type DiscoveryCandidate } from "./query.js";
 export { formatDocForEmbedding, formatQueryForEmbedding } from "./llm.js";
 export type { CandidateDiscoveryOptions, DiscoveryCandidate } from "./query.js";
-export type { DecisionModelOptions, TypeSafeOptions } from "./decision-query.js";
+export type { DecisionModelOptions } from "./decision-query.js";
 import {
   setConfigSource,
   loadConfig,
@@ -167,7 +167,7 @@ export type UpdateResult = {
 /**
  * Options for the unified search() method.
  */
-export interface SearchOptions extends Pick<HybridQueryOptions, "decisionModel" | "typesafe" | "signal" | "allowedPaths" | "trace" | "timeContext"> {
+export interface SearchOptions extends Pick<HybridQueryOptions, "decisionModel" | "signal" | "allowedPaths" | "trace" | "timeContext"> {
   /** Simple query string — literal vector + BM25 recall, then decision-model ranking */
   query?: string;
   /** Explicit typed retrieval variants; plain query also performs no automatic expansion. */
@@ -454,7 +454,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           candidateLimit: opts.candidateLimit,
           skipRerank,
           chunkStrategy: opts.chunkStrategy,
-          decisionModel: opts.decisionModel, typesafe: opts.typesafe, signal: opts.signal, allowedPaths: opts.allowedPaths,
+          decisionModel: opts.decisionModel, signal: opts.signal, allowedPaths: opts.allowedPaths,
           trace: opts.trace, timeContext: opts.timeContext,
         });
       }
@@ -469,7 +469,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         candidateLimit: opts.candidateLimit,
         skipRerank,
         chunkStrategy: opts.chunkStrategy,
-        decisionModel: opts.decisionModel, typesafe: opts.typesafe, signal: opts.signal, allowedPaths: opts.allowedPaths,
+        decisionModel: opts.decisionModel, signal: opts.signal, allowedPaths: opts.allowedPaths,
         trace: opts.trace, timeContext: opts.timeContext,
       });
     },

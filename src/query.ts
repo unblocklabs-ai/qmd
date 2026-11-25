@@ -124,14 +124,10 @@ export async function discoverCandidates(store: Store, options: CandidateDiscove
 /** Shared query implementation for CLI, MCP and SDK. vsearch does not call this. */
 export async function decisionQuery(store: Store, query: string, options: HybridQueryOptions = {},
   searches?: readonly RetrievalQuery[]): Promise<HybridQueryResult[]> {
-  if (options.decisionModel !== undefined && options.typesafe !== undefined) {
-    throw new Error("query accepts decisionModel or typesafe, not both");
-  }
-  const decisionOptions = options.decisionModel ?? options.typesafe;
   const limit = options.limit ?? 10;
   const minScore = options.minScore ?? 0;
   const candidateLimit = options.candidateLimit;
-  const timeoutMs = decisionOptions?.timeoutMs ?? 10_000;
+  const timeoutMs = options.decisionModel?.timeoutMs ?? 10_000;
   if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new Error("query limit must be an integer from 1 to 500");
   if (!Number.isFinite(minScore) || minScore < 0 || minScore > 1) throw new Error("query minScore must be from 0 to 1");
   if (candidateLimit !== undefined && (!Number.isInteger(candidateLimit) || candidateLimit < 1 || candidateLimit > 1500)) {
@@ -144,7 +140,7 @@ export async function decisionQuery(store: Store, query: string, options: Hybrid
   const signal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(60_000)]) : AbortSignal.timeout(60_000);
   signal.throwIfAborted();
   // Credential resolution precedes retrieval. No local-reranker fallback or guessed key.
-  const decision = options.skipRerank ? undefined : await resolveQueryDecisionContext(decisionOptions);
+  const decision = options.skipRerank ? undefined : await resolveQueryDecisionContext(options.decisionModel);
   const apiKey = decision?.apiKey;
   const client = decision?.client;
   const policy = decision?.policy;

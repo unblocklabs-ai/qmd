@@ -311,6 +311,11 @@ const results3 = await store.search({
 const fast = await store.search({ query: "auth", rerank: false })
 ```
 
+Reranking uses `@unblocklabs/decisions` with `https://codex.unblocklabs.ai/v1/decisions`
+and `liquid/d1.2-ultra` by default. Set `CODEX_LB_API_KEY` or `CODEX_LB_API_KEY_FILE`,
+or pass `decisionModel: { apiKey }` or `decisionModel: { apiKeyFile }` to `search()`.
+Custom `decisionModel.endpoint` URLs require one of those explicit credentials.
+
 For direct backend access:
 
 ```typescript
@@ -425,6 +430,7 @@ Key types exported for SDK consumers:
 import type {
   QMDStore,            // The store interface
   SearchOptions,       // Options for search()
+  DecisionModelOptions,// Decision client overrides for search()
   LexSearchOptions,    // Options for searchLex()
   VectorSearchOptions, // Options for searchVector()
   VSearchOptions,      // Options for vsearch()

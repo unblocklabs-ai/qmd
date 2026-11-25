@@ -20,8 +20,8 @@ When OpenClaw's `memory_search` is available, supply both retrieval queries:
 ```
 
 The keyword query finds names/identifiers; the semantic query defines what
-information is needed. BM25 and vector candidates share independent TypeSafe
-usefulness ranking. Scope with the tool's `corpora` and `sessionFilter`;
+information is needed. The decision model scores each candidate independently.
+Scope with the tool's `corpora` and `sessionFilter`;
 these are not QMD collection IDs or audience access controls.
 
 The QMD CLI `query`, `search` and `deep-search` alias, MCP `query`,

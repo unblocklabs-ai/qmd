@@ -4,9 +4,8 @@ import {
   DEFAULT_DECISIONS_ENDPOINT,
   DEFAULT_DECISIONS_MODEL,
   DecisionError,
-  decisionModelScope,
-  LEGACY_SYSTEMONE_ENDPOINT,
   score,
+  validateDecisionEndpoint,
   type DecisionClient,
   type ScoreAnswer,
 } from "@unblocklabs/decisions";
@@ -14,7 +13,7 @@ import {
 export interface DecisionModelOptions {
   /** Decision endpoint URL (defaults to https://codex.unblocklabs.ai/v1/decisions). */
   endpoint?: string;
-  /** Model alias sent in request body (defaults to liquid/d1.2-ultra, or jev-1.13.0 on legacy SystemOne). */
+  /** Model alias sent in request body (defaults to liquid/d1.2-ultra). */
   model?: string;
   apiKey?: string;
   /** Raw key or dotenv file. An explicit file never falls back to another key. */
@@ -22,9 +21,6 @@ export interface DecisionModelOptions {
   /** Per-request timeout; default 10 seconds, maximum 30 seconds. */
   timeoutMs?: number;
 }
-
-/** @deprecated Use DecisionModelOptions. */
-export type TypeSafeOptions = DecisionModelOptions;
 
 export const MAX_QUERY_EXCERPT_CHARS = 12_000;
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -37,70 +33,38 @@ export type QueryJudgment = {
   probabilities: Record<"0" | "1" | "2" | "3", number>;
 };
 
-function queryPolicy(model = DEFAULT_DECISIONS_MODEL, endpoint?: string): string {
-  return `${decisionModelScope(model, endpoint)}:query-v1`;
-}
-
-function canonicalEndpoint(endpoint?: string): string {
-  const raw = endpoint ?? DEFAULT_DECISIONS_ENDPOINT;
-  try {
-    return new URL(raw).href.replace(/\/+$/u, "");
-  } catch {
-    return raw.replace(/\/+$/u, "");
-  }
-}
-
-function ambientApiKeyFile(endpoint?: string): string | undefined {
-  const canonical = canonicalEndpoint(endpoint);
-  if (canonical === DEFAULT_DECISIONS_ENDPOINT) return process.env.CODEX_LB_API_KEY_FILE?.trim() || undefined;
-  if (canonical === LEGACY_SYSTEMONE_ENDPOINT) return process.env.TYPESAFE_API_KEY_FILE?.trim() || undefined;
-  return undefined;
-}
-
-function missingCredentialMessage(endpoint: string): string {
-  const canonical = canonicalEndpoint(endpoint);
-  if (canonical === LEGACY_SYSTEMONE_ENDPOINT) {
-    return "query requires TYPESAFE_API_KEY or TYPESAFE_API_KEY_FILE; use vsearch for local search";
-  }
-  if (canonical === DEFAULT_DECISIONS_ENDPOINT) {
-    return "query requires CODEX_LB_API_KEY or CODEX_LB_API_KEY_FILE; use vsearch for local search";
-  }
-  return "query requires an explicit decisionModel apiKey or apiKeyFile for custom endpoints; use vsearch for local search";
-}
-
-function resolveQueryDecisionClient(options: DecisionModelOptions = {}): {
-  client: DecisionClient;
-  explicitKeyFile?: string;
-} {
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_TIMEOUT_MS) {
-    throw new Error("Decision model timeoutMs must be from 1 to 30000");
-  }
-  const explicitKeyFile = options.apiKeyFile !== undefined
-    ? options.apiKeyFile
-    : (options.apiKey === undefined ? ambientApiKeyFile(options.endpoint) : undefined);
-  const client = createDecisionClient({
-    endpoint: options.endpoint,
-    model: options.model,
-    apiKey: options.apiKey,
-    apiKeyFile: explicitKeyFile,
-    timeoutMs,
-  });
-  return { client, explicitKeyFile };
-}
-
 export async function resolveQueryDecisionContext(options: DecisionModelOptions = {}): Promise<{
   client: DecisionClient;
   apiKey: string;
   policy: string;
 }> {
-  if (options.apiKey !== undefined && !options.apiKey.trim()) {
-    throw new Error(missingCredentialMessage(options.endpoint ?? DEFAULT_DECISIONS_ENDPOINT));
+  const endpoint = validateDecisionEndpoint(options.endpoint ?? DEFAULT_DECISIONS_ENDPOINT);
+  const isDefaultEndpoint = endpoint === DEFAULT_DECISIONS_ENDPOINT;
+  const missingCredentialMessage = isDefaultEndpoint
+    ? "query requires CODEX_LB_API_KEY or CODEX_LB_API_KEY_FILE; use vsearch for local search"
+    : "query requires an explicit decisionModel apiKey or apiKeyFile for custom endpoints; use vsearch for local search";
+  if (options.apiKey !== undefined && !options.apiKey.trim()) throw new Error(missingCredentialMessage);
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_TIMEOUT_MS) {
+    throw new Error("Decision model timeoutMs must be from 1 to 30000");
   }
-  const { client, explicitKeyFile } = resolveQueryDecisionClient(options);
-  if (explicitKeyFile) {
+  const { model = DEFAULT_DECISIONS_MODEL } = options;
+  const ambientKeyFile = isDefaultEndpoint && options.apiKey === undefined
+    ? process.env.CODEX_LB_API_KEY_FILE?.trim() || undefined
+    : undefined;
+  const client = createDecisionClient({
+    endpoint,
+    model,
+    dialect: "decisions",
+    apiKey: options.apiKey,
+    apiKeyFile: options.apiKeyFile === undefined ? ambientKeyFile : options.apiKeyFile,
+    ambientEnvKeys: isDefaultEndpoint ? ["CODEX_LB_API_KEY"] : [],
+    fileEnvKeys: isDefaultEndpoint ? ["CODEX_LB_API_KEY"] : ["CODEX_LB_API_KEY", "DECISION_MODEL_API_KEY"],
+    timeoutMs,
+  });
+  if (client.config.apiKeyFile) {
     try {
-      await access(explicitKeyFile);
+      await access(client.config.apiKeyFile);
     } catch {
       throw new Error("Decision model credential file could not be read");
     }
@@ -112,12 +76,10 @@ export async function resolveQueryDecisionContext(options: DecisionModelOptions 
     if (error instanceof DecisionError) throw new Error(error.message);
     throw error;
   }
-  if (!apiKey) throw new Error(missingCredentialMessage(client.config.endpoint));
-  return { client, apiKey, policy: queryPolicy(client.config.model, client.config.endpoint) };
-}
-
-export async function queryApiKey(options: DecisionModelOptions = {}): Promise<string> {
-  return (await resolveQueryDecisionContext(options)).apiKey;
+  if (!apiKey) throw new Error(missingCredentialMessage);
+  const resolvedModel = client.config.model;
+  const scope = isDefaultEndpoint && resolvedModel === DEFAULT_DECISIONS_MODEL ? resolvedModel : `${resolvedModel}@${endpoint}`;
+  return { client, apiKey, policy: `${scope}:query-v1` };
 }
 
 const USEFULNESS_QUESTIONS = {

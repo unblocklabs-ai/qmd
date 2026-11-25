@@ -681,7 +681,7 @@ describe("search (unified API)", () => {
     expect(results).toHaveLength(1);
   });
 
-  describe("literal hybrid retrieval without TypeSafe", () => {
+  describe("local-only literal hybrid retrieval", () => {
     test("search() with query and rerank:false returns results", async () => {
       const results = await store.search({ query: "authentication", rerank: false });
       expect(results.length).toBeGreaterThan(0);

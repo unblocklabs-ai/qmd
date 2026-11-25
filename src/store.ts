@@ -14,7 +14,7 @@
 import { openDatabase, loadSqliteVec } from "./db.js";
 import type { Database } from "./db.js";
 import { decisionQuery } from "./query.js";
-import type { DecisionModelOptions, TypeSafeOptions } from "./decision-query.js";
+import type { DecisionModelOptions } from "./decision-query.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
@@ -5616,8 +5616,6 @@ export interface HybridQueryOptions {
   trace?: VectorSearchTrace;
   signal?: AbortSignal;
   decisionModel?: DecisionModelOptions;
-  /** @deprecated Use decisionModel. */
-  typesafe?: TypeSafeOptions;
   /** Optional session-start bounds supplied by a session-aware caller, not claim dates. */
   timeContext?: { sessionStartedFrom?: string; sessionStartedTo?: string };
   limit?: number;           // default 10

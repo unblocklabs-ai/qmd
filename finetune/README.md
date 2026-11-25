@@ -13,7 +13,7 @@ pipeline_tag: text-generation
 
 # QMD Query Expansion Fine-Tuning
 
-Train small language models to expand search queries for [QMD](https://github.com/unblocklabs-ai/qmd). These models support standalone `vsearch` expansion and explicit SDK expansion; plain `query` retrieves the original query with BM25 and vector search before TypeSafe scoring.
+Train small language models to expand search queries for [QMD](https://github.com/unblocklabs-ai/qmd). These models support standalone `vsearch` expansion and explicit SDK expansion; SDK `search({ query })` retrieves the original query with BM25 and vector search before decision-model scoring.
 
 ## What This Does
 

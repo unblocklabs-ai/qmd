@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { createStore, type QMDStore } from "../src/index.js";
 import { openDatabase } from "../src/db.js";
 import { hashContent, insertContent, insertDocument, type SearchResult } from "../src/store.js";
-import { queryApiKey } from "../src/decision-query.js";
 
 let store: QMDStore;
 let dir: string;
@@ -30,18 +29,18 @@ async function document(path: string, body: string, collection = "docs"): Promis
     docid: hash.slice(0, 6), title: path, collectionName: collection, modifiedAt: now,
     body, bodyLength: body.length, context: null, score: 0.9, source: "vec", chunkPos: 0, chunkLen: body.length };
 }
-function score(value: 0 | 1 | 2 | 3, model = "liquid/d1.2-ultra-20261116") {
+function score(value: 0 | 1 | 2 | 3) {
   return Response.json({
-    model,
+    model: "liquid/d1.2-ultra-20261116",
     answers: { usefulness: { type: "score", score: value, confidence: 1,
       probabilities: { "0": Number(value === 0), "1": Number(value === 1), "2": Number(value === 2), "3": Number(value === 3) } } },
   });
 }
-function unwrapState(body: { state: unknown }) {
-  return (Array.isArray(body.state) ? body.state[0] : body.state) as {
-    timeContext: object;
-    candidate: { excerpt: string; sourcePath: string };
-  };
+function unwrapState(body: { state: Array<{
+  timeContext: object;
+  candidate: { excerpt: string; sourcePath: string };
+}> }) {
+  return body.state[0]!;
 }
 const decisionModel = { apiKey: "test-only-key", timeoutMs: 1000 };
 
@@ -101,23 +100,22 @@ test("SDK query retrieves 1.5k per backend, deduplicates excerpts and uses @unbl
   expect(requests[1]!.state.timeContext).toEqual(requests[0]!.state.timeContext);
 });
 
-test("deprecated typesafe alias and legacy SystemOne endpoint remain supported; specifying both is rejected", async () => {
-  await document("legacy.md", "staging approved");
-  const requests: Array<{ url: string; model: string; isArrayState: boolean }> = [];
+test("custom endpoint paths do not change the Decisions wire format", async () => {
+  await document("custom.md", "staging approved");
+  const endpoint = "https://decisions.example.test/v1/systemone";
+  const requests: Array<{ url: string; model: string; state: unknown }> = [];
   vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
     const body = JSON.parse(String(init?.body));
-    requests.push({ url: String(url), model: body.model, isArrayState: Array.isArray(body.state) });
-    return score(3, "jev-1.13.0");
+    requests.push({ url: String(url), model: body.model, state: body.state });
+    return score(3);
   });
   const results = await store.search({
     query: "staging",
     explain: true,
-    typesafe: { endpoint: "https://api.typesafe.ai/v1/systemone", apiKey: "legacy-key", timeoutMs: 1000 },
+    decisionModel: { ...decisionModel, endpoint },
   });
-  expect(results[0]?.explain?.policy).toBe("jev-1.13.0:query-v1");
-  expect(requests).toEqual([{ url: "https://api.typesafe.ai/v1/systemone", model: "jev-1.13.0", isArrayState: false }]);
-  await expect(store.search({ query: "staging", decisionModel, typesafe: decisionModel }))
-    .rejects.toThrow("decisionModel or typesafe, not both");
+  expect(results[0]?.explain?.policy).toBe(`liquid/d1.2-ultra@${endpoint}:query-v1`);
+  expect(requests).toEqual([{ url: endpoint, model: "liquid/d1.2-ultra", state: [expect.objectContaining({ query: "staging" })] }]);
 });
 
 test("BM25 collection and exact-path scopes apply before LIMIT; source attribution is not deduped across files", async () => {
@@ -248,26 +246,40 @@ test("missing credentials fail before retrieval; malformed provider output never
   await expect(store.search({ query: "staging", decisionModel })).rejects.toThrow("Decision model query scoring failed for 1 candidates");
 });
 
-test("credential files support raw and dotenv formats with origin isolation and no environment mutation", async () => {
+test("SDK search accepts Codex environment credentials and explicit raw or dotenv files without leaking ambient credentials to custom endpoints", async () => {
+  await document("match.md", "staging evidence");
   const file = join(dir, "decisions.env");
-  const beforeCodex = process.env.CODEX_LB_API_KEY;
-  const beforeTypeSafe = process.env.TYPESAFE_API_KEY;
-  await writeFile(file, 'OTHER=ignored\nCODEX_LB_API_KEY="codex-from-file"\nTYPESAFE_API_KEY="ts-from-file"\n', { mode: 0o600 });
-  expect(await queryApiKey({ apiKeyFile: file })).toBe("codex-from-file");
-  expect(await queryApiKey({ endpoint: "https://api.typesafe.ai/v1/systemone", apiKeyFile: file })).toBe("ts-from-file");
-  expect(process.env.CODEX_LB_API_KEY).toBe(beforeCodex);
-  expect(process.env.TYPESAFE_API_KEY).toBe(beforeTypeSafe);
-  await writeFile(file, "plain-key\n");
-  expect(await queryApiKey({ apiKeyFile: file })).toBe("plain-key");
-  await expect(queryApiKey({ apiKeyFile: join(dir, "missing") })).rejects.toThrow("credential file could not be read");
-  await expect(queryApiKey({ apiKey: "inline", apiKeyFile: file })).rejects.toThrow("apiKey or apiKeyFile, not both");
-  const prevCodexFile = process.env.CODEX_LB_API_KEY_FILE;
-  process.env.CODEX_LB_API_KEY_FILE = file;
+  await writeFile(file, 'OTHER=ignored\nCODEX_LB_API_KEY="codex-from-file"\n', { mode: 0o600 });
+  const inlineKey = process.env.CODEX_LB_API_KEY;
+  const keyFile = process.env.CODEX_LB_API_KEY_FILE;
+  const authorization: Array<string | null> = [];
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+    authorization.push(new Headers(init?.headers).get("authorization"));
+    return score(3);
+  });
+  const query = "staging";
   try {
-    expect(await queryApiKey({ endpoint: "HTTPS://CODEX.UNBLOCKLABS.AI/v1/decisions" })).toBe("plain-key");
+    process.env.CODEX_LB_API_KEY = "ambient-codex-key";
+    delete process.env.CODEX_LB_API_KEY_FILE;
+    await store.search({ query });
+    await store.search({ query, decisionModel: { apiKeyFile: file } });
+    expect(process.env.CODEX_LB_API_KEY).toBe("ambient-codex-key");
+    await writeFile(file, "plain-key\n");
+    process.env.CODEX_LB_API_KEY_FILE = file;
+    await store.search({ query, decisionModel: { endpoint: "HTTPS://CODEX.UNBLOCKLABS.AI/v1/decisions" } });
+
+    await expect(store.search({ query, decisionModel: { endpoint: "https://decisions.example.test/v1/decisions" } }))
+      .rejects.toThrow("requires an explicit decisionModel apiKey or apiKeyFile");
+    await expect(store.search({ query, decisionModel: { apiKeyFile: join(dir, "missing") } }))
+      .rejects.toThrow("credential file could not be read");
+    await expect(store.search({ query, decisionModel: { apiKey: "inline", apiKeyFile: file } }))
+      .rejects.toThrow("apiKey or apiKeyFile, not both");
+    expect(authorization).toEqual(["Bearer ambient-codex-key", "Bearer codex-from-file", "Bearer plain-key"]);
   } finally {
-    if (prevCodexFile === undefined) delete process.env.CODEX_LB_API_KEY_FILE;
-    else process.env.CODEX_LB_API_KEY_FILE = prevCodexFile;
+    if (inlineKey === undefined) delete process.env.CODEX_LB_API_KEY;
+    else process.env.CODEX_LB_API_KEY = inlineKey;
+    if (keyFile === undefined) delete process.env.CODEX_LB_API_KEY_FILE;
+    else process.env.CODEX_LB_API_KEY_FILE = keyFile;
   }
 });
 
