@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-11-25
+
+### Changes
+
+- Migrate SDK decision query scoring onto `@unblocklabs/decisions@^0.1.2` (`SearchOptions.decisionModel`, `explain.ranking: "decision"`) and remove legacy `typesafe` query compatibility.
+- Upgrade `node-llama-cpp` from `3.20.0` to `3.22.3` and update the default embedding model to `hf:bek91/embeddinggemma-2-wsp-GGUF/embeddinggemma-2-wsp-Q8_0.gguf`.
+
+### Fixes
+
+- Extend full-input native batching (`batchSize: contextSize`) in `LlamaCpp.createEmbedContext` to cover `gemma-embedding2` (`/^gemma-embedding\d*$/i`) so long EmbeddingGemma 2 inputs preserve distinct prefixes beyond 512 tokens.
+
 ## [3.0.4] - 2026-11-20
 
 ### Fixes
