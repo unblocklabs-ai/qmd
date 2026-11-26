@@ -2,9 +2,9 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createStore, type QMDStore } from "../src/index.js";
+import { createStore, type PassageRef, type QMDStore, type SearchOptions } from "../src/index.js";
 import { openDatabase } from "../src/db.js";
-import { hashContent, insertContent, insertDocument, type SearchResult } from "../src/store.js";
+import { getEmbeddingFingerprint, hashContent, insertContent, insertDocument, type SearchResult } from "../src/store.js";
 
 let store: QMDStore;
 let dir: string;
@@ -64,6 +64,73 @@ test("SDK discovery preserves exact lane depth and scopes without expansion or r
   expect(vectors[0]).toMatchObject({ method: "vector", bestChunk: semantic.body, bestChunkPos: 0 });
   expect(fetch).not.toHaveBeenCalled();
   expect(expand).not.toHaveBeenCalled();
+});
+
+test("SDK discovery and search preserve the winning vector row and document occurrence", async () => {
+  const prefix = "🙂 Background.\n\n";
+  const bestChunk = "Staging approved 🚀.";
+  const repeatedPos = prefix.length + bestChunk.length + 2;
+  const body = `${prefix}${bestChunk}\n\n${bestChunk}`;
+  const shared = await document("original.md", body);
+  await document("nested/Alias.md", body, "other");
+  const { db, llm } = store.internal;
+  const model = llm!.embedModelName;
+  const embedFingerprint = getEmbeddingFingerprint(model);
+  const embed = vi.spyOn(llm!, "embed").mockResolvedValue({ embedding: [1, 0, 0], model });
+  store.internal.ensureVecTable(3);
+  const insertSpan = db.prepare(`INSERT INTO content_vectors
+    (hash, seq, pos, chunk_len, model, embed_fingerprint, embedded_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+  const insertVector = db.prepare("INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)");
+  // The span does not identify the vector: the two rows share it but have different distances.
+  for (const [seq, pos, embedding] of [
+    [2, prefix.length, [-1, 0, 0]], [7, prefix.length, [1, 0, 0]], [8, repeatedPos, [0, 1, 0]],
+  ] as const) {
+    insertSpan.run(shared.hash, seq, pos, bestChunk.length, model, embedFingerprint, shared.modifiedAt);
+    insertVector.run(`${shared.hash}_${seq}`, new Float32Array(embedding));
+  }
+
+  const query = "staging";
+  const collection = ["other", "docs"];
+  const ref: PassageRef = {
+    collection: "other", path: "nested/Alias.md", docHash: shared.hash,
+    chunkPos: prefix.length, chunkLen: bestChunk.length, seq: 7, embedFingerprint,
+  };
+  const file = "qmd://other/nested/Alias.md";
+  const displayPath = "other/nested/Alias.md";
+  const [raw] = await store.searchVector(query, { collection });
+  expect(raw).toMatchObject({ filepath: file, displayPath, body, chunkPos: ref.chunkPos, chunkLen: ref.chunkLen });
+  expect(raw?.ref).toEqual(ref);
+
+  const [detailed] = await store.vsearch(query, { collection, expand: false });
+  expect(detailed).toMatchObject({ file, displayPath, bestChunk, chunkPos: ref.chunkPos, chunkLen: ref.chunkLen });
+  expect(detailed?.ref).toEqual(ref);
+
+  const [vector] = await store.discoverCandidates({ query, lane: "vec", collection, limit: 10 });
+  expect(vector).toMatchObject({ file, displayPath, body, bestChunk, bestChunkPos: prefix.length, method: "vector" });
+  expect(vector?.ref).toEqual(ref);
+
+  const lexical = await store.discoverCandidates({ query, lane: "lex", collection, limit: 10 });
+  expect(lexical.map(hit => ({ file: hit.file, displayPath: hit.displayPath, ref: hit.ref }))).toEqual([
+    { file: shared.filepath, displayPath: shared.displayPath,
+      ref: { ...ref, collection: "docs", path: "original.md", seq: null, embedFingerprint: null } },
+    { file, displayPath, ref: { ...ref, seq: null, embedFingerprint: null } },
+  ]);
+
+  const lexFirst: SearchOptions = { queries: [{ type: "lex", query }, { type: "vec", query }] };
+  for (const search of [{ query }, lexFirst]) {
+    const results = await store.search({ ...search, collections: collection, rerank: false, explain: true });
+    const fused = results.find(hit => hit.file === file);
+    expect(fused).toMatchObject({ bestChunk, bestChunkPos: prefix.length,
+      explain: { methods: expect.arrayContaining(["vector", "bm25"]) } });
+    expect(fused?.ref).toEqual(ref);
+  }
+
+  // When the vector finds the second occurrence, the first (retained) span is still lexical-only.
+  embed.mockResolvedValueOnce({ embedding: [0, 1, 0], model });
+  const fused = (await store.search({ ...lexFirst, collections: collection, rerank: false, explain: true }))
+    .find(hit => hit.file === file);
+  expect(fused).toMatchObject({ bestChunkPos: prefix.length,
+    explain: { methods: ["bm25", "vector"] }, ref: { ...ref, seq: null, embedFingerprint: null } });
 });
 
 test("SDK query retrieves 1.5k per backend, deduplicates excerpts and uses @unblocklabs/decisions rather than local models", async () => {
@@ -200,11 +267,20 @@ test("overlapping chunk boundaries prefer the whole FTS match and retain origina
 });
 
 test("unembedded lexical matches choose the matching deterministic chunk, not the introduction", async () => {
-  const prefix = "Background documentation.\n".repeat(300);
-  await document("unembedded.md", prefix + "Authentication is configured with OAuth.");
+  const prefix = "🙂 Background documentation.\n".repeat(300);
+  const body = prefix + "Authentication is configured with OAuth.";
+  const doc = await document("unembedded.md", body);
+  const identity = { collection: "docs", path: "unembedded.md", docHash: doc.hash,
+    seq: null, embedFingerprint: null };
+  const [raw] = await store.searchLex("auth");
+  expect(raw?.ref).toEqual({ ...identity, chunkPos: 0, chunkLen: body.length });
+
   const results = await store.search({ queries: [{ type: "lex", query: "auth" }], rerank: false });
-  expect(results[0]?.bestChunk).toContain("Authentication");
-  expect(results[0]?.bestChunkPos).toBeGreaterThan(0);
+  const hit = results[0]!;
+  expect(hit.bestChunk).toContain("Authentication");
+  expect(hit.bestChunkPos).toBeGreaterThan(0);
+  expect(hit.ref).toEqual({ ...identity, chunkPos: hit.bestChunkPos, chunkLen: hit.bestChunk.length });
+  expect(body.slice(hit.bestChunkPos, hit.bestChunkPos + hit.bestChunk.length)).toBe(hit.bestChunk);
 });
 
 test("query lazily repairs an old index before reading chunk spans, without a prior health check", async () => {

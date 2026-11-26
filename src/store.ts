@@ -2628,6 +2628,17 @@ export function handelize(path: string): string {
   return result;
 }
 
+/** Identifies the exact source occurrence and UTF-16 span in the indexed body. */
+export type PassageRef = {
+  collection: string;
+  path: string;               // Collection-relative path as stored in the index
+  docHash: string;            // SHA-256 hash as stored in the index
+  chunkPos: number;
+  chunkLen: number;
+  seq: number | null;         // null for lexical-only passages
+  embedFingerprint: string | null; // null for lexical-only passages
+};
+
 /**
  * Search result extends DocumentResult with score and source info
  */
@@ -2636,6 +2647,7 @@ export type SearchResult = DocumentResult & {
   source: "fts" | "vec";      // Search source (full-text or vector)
   chunkPos?: number;          // Character position of matching chunk (for vector search)
   chunkLen?: number;          // Exact UTF-16 length of the matching embedded chunk
+  ref?: PassageRef;
   /** Other active paths with the same canonical document content. */
   aliases?: Array<{
     filepath: string;
@@ -4170,6 +4182,8 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     SELECT
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
+      d.collection,
+      d.path,
       d.title,
       content.doc as body,
       d.hash,
@@ -4189,9 +4203,11 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   sql += ` ORDER BY fm.bm25_score ASC LIMIT ?`;
   params.push(limit);
 
-  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
+  const rows = db.prepare(sql).all<{
+    filepath: string; display_path: string; collection: string; path: string;
+    title: string; body: string; hash: string; bm25_score: number;
+  }>(...params);
   return rows.map(row => {
-    const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
     // Convert bm25 (negative, lower is better) into a stable [0..1) score where higher is better.
     // FTS5 BM25 scores are negative (e.g., -10 is strong, -2 is weak).
     // |x| / (1 + |x|) maps: strong(-10)→0.91, medium(-2)→0.67, weak(-0.5)→0.33, none(0)→0.
@@ -4203,13 +4219,17 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       title: row.title,
       hash: row.hash,
       docid: getDocid(row.hash),
-      collectionName,
+      collectionName: row.collection,
       modifiedAt: "",  // Not available in FTS query
       bodyLength: row.body.length,
       body: row.body,
       context: getContextForFile(db, row.filepath),
       score,
       source: "fts" as const,
+      ref: {
+        collection: row.collection, path: row.path, docHash: row.hash,
+        chunkPos: 0, chunkLen: row.body.length, seq: null, embedFingerprint: null,
+      },
     };
   });
 }
@@ -4362,9 +4382,12 @@ export async function searchVec(db: Database, query: string, model: string, limi
         SELECT
           cv.hash || '_' || cv.seq AS hash_seq,
           cv.hash,
+          cv.seq,
           cv.pos,
           cv.chunk_len,
+          cv.embed_fingerprint,
           d.collection,
+          d.path,
           'qmd://' || d.collection || '/' || d.path AS filepath,
           d.collection || '/' || d.path AS display_path,
           d.title,
@@ -4386,9 +4409,12 @@ export async function searchVec(db: Database, query: string, model: string, limi
       ) as Array<{
         hash_seq: string;
         hash: string;
+        seq: number;
         pos: number;
         chunk_len: number;
+        embed_fingerprint: string;
         collection: string;
+        path: string;
         filepath: string;
         display_path: string;
         title: string;
@@ -4462,6 +4488,11 @@ export async function searchVec(db: Database, query: string, model: string, limi
             source: "vec" as const,
             chunkPos: bestChunk.pos,
             chunkLen: bestChunk.chunk_len,
+            ref: {
+              collection: primary.collection, path: primary.path, docHash: bestChunk.hash,
+              chunkPos: bestChunk.pos, chunkLen: bestChunk.chunk_len,
+              seq: bestChunk.seq, embedFingerprint: bestChunk.embed_fingerprint,
+            },
             ...(aliases.length > 0 ? { aliases } : {}),
           } satisfies SearchResult;
         });
@@ -5638,6 +5669,7 @@ export interface HybridQueryResult {
   score: number;            // decision-model usefulness, or retrieval rank when explicitly skipping scoring
   context: string | null;   // user-set context
   docid: string;            // content hash prefix (6 chars)
+  ref?: PassageRef;
   explain?: HybridQueryExplain;
 }
 
@@ -5677,6 +5709,7 @@ export interface VectorSearchResult {
   bestChunk: string;
   chunkPos: number;
   chunkLen: number;
+  ref?: PassageRef;
 }
 
 /**
@@ -5730,6 +5763,7 @@ export async function vectorSearchQuery(
           bestChunk: r.body?.slice(r.chunkPos ?? 0, (r.chunkPos ?? 0) + (r.chunkLen ?? 0)) ?? "",
           chunkPos: r.chunkPos ?? 0,
           chunkLen: r.chunkLen ?? 0,
+          ref: r.ref,
         });
       }
     }

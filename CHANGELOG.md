@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-11-25
+
+### Features
+
+- Export canonical `PassageRef` (`collection`, `path`, `docHash`, `chunkPos`, `chunkLen`, `seq`, `embedFingerprint`) on lexical, vector, and hybrid SDK search results without any database migration.
+
 ## [3.1.1] - 2026-11-25
 
 ### Fixes

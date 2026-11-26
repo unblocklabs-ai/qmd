@@ -81,7 +81,7 @@ export async function discoverCandidates(store: Store, options: CandidateDiscove
       if (pos === undefined || len === undefined || pos < 0 || len <= 0 || pos + len > body.length) continue;
       add({ file: hit.filepath, displayPath: hit.displayPath, title: hit.title, body,
         bestChunk: body.slice(pos, pos + len), bestChunkPos: pos, score: hit.score,
-        context: hit.context, docid: hit.docid }, "vector", rank);
+        context: hit.context, docid: hit.docid, ref: hit.ref }, "vector", rank);
     }
   } else {
     const terms = expression === undefined
@@ -115,7 +115,10 @@ export async function discoverCandidates(store: Store, options: CandidateDiscove
       if (!selected) continue;
       add({ file, displayPath: `${row.collection}/${row.path}`, title: row.title, body: row.doc,
         bestChunk: selected.text, bestChunkPos: selected.pos, score: row.rank,
-        context: store.getContextForFile(file), docid: row.hash.slice(0, 6) }, "bm25", rank);
+        context: store.getContextForFile(file), docid: row.hash.slice(0, 6),
+        ref: { collection: row.collection, path: row.path, docHash: row.hash,
+          chunkPos: selected.pos, chunkLen: selected.text.length, seq: null, embedFingerprint: null },
+      }, "bm25", rank);
     }
   }
   return [...candidates.values()];
@@ -172,6 +175,14 @@ export async function decisionQuery(store: Store, query: string, options: Hybrid
     if (existing) {
       if (!existing.methods.includes(method)) existing.methods.push(method);
       existing.retrievalScore = Math.max(existing.retrievalScore, retrievalScore);
+      // Equal excerpt text can occur at different offsets. Only enrich the retained span.
+      const previous = existing.ref;
+      const incoming = hit.ref;
+      if (previous?.seq === null && incoming && incoming.seq !== null &&
+        previous.docHash === incoming.docHash && previous.chunkPos === incoming.chunkPos &&
+        previous.chunkLen === incoming.chunkLen) {
+        existing.ref = incoming;
+      }
     } else candidates.set(key, { ...hit, methods: [method], retrievalScore });
   };
   for (const request of requests) {
