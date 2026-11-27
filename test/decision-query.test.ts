@@ -384,3 +384,21 @@ test("query bounds concurrent API requests and stops the remaining queue on canc
   await expect(store.search({ query: "staging", limit: 10, decisionModel, signal: controller.signal })).rejects.toThrow();
   expect(calls).toBe(6);
 });
+
+test("query forwards candidate modifiedAt timestamp to decision model for freshness scoring", async () => {
+  const doc = await document("fresh.md", "staging deploy policy updated");
+  const seen: Array<{ excerpt: string; sourcePath: string; modifiedAt?: string }> = [];
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+    const body = JSON.parse(String(init?.body)) as { state: Array<{ candidate: { excerpt: string; sourcePath: string; modifiedAt?: string } }> };
+    seen.push(body.state[0]!.candidate);
+    return score(3);
+  });
+  const results = await store.search({ query: "staging", decisionModel });
+  expect(results).toHaveLength(1);
+  expect(results[0]?.modifiedAt).toBe(doc.modifiedAt);
+  expect(seen).toEqual([{
+    excerpt: "staging deploy policy updated",
+    sourcePath: "qmd://docs/fresh.md",
+    modifiedAt: doc.modifiedAt,
+  }]);
+});

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [3.3.1] - 2026-11-27
+
+### Fixes
+
+- Forward document `modifiedAt` timestamp on `HybridQueryResult` and into `judgeQueryExcerpt` (`candidate.modifiedAt`) so decision-model freshness scoring can see when candidate documents were last modified.
+
 ## [3.3.0] - 2026-11-27
 
 ### Features

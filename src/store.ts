@@ -5870,6 +5870,7 @@ export interface HybridQueryResult {
   score: number;            // decision-model usefulness, or retrieval rank when explicitly skipping scoring
   context: string | null;   // user-set context
   docid: string;            // content hash prefix (6 chars)
+  modifiedAt?: string;      // ISO timestamp of the source document's last modification
   ref?: PassageRef;
   explain?: HybridQueryExplain;
 }

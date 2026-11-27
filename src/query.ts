@@ -81,7 +81,8 @@ export async function discoverCandidates(store: Store, options: CandidateDiscove
       if (pos === undefined || len === undefined || pos < 0 || len <= 0 || pos + len > body.length) continue;
       add({ file: hit.filepath, displayPath: hit.displayPath, title: hit.title, body,
         bestChunk: body.slice(pos, pos + len), bestChunkPos: pos, score: hit.score,
-        context: hit.context, docid: hit.docid, ref: hit.ref }, "vector", rank);
+        context: hit.context, docid: hit.docid, ...(hit.modifiedAt ? { modifiedAt: hit.modifiedAt } : {}),
+        ref: hit.ref }, "vector", rank);
     }
   } else {
     const terms = expression === undefined
@@ -90,7 +91,7 @@ export async function discoverCandidates(store: Store, options: CandidateDiscove
     const collections = typeof options.collection === "string" ? [options.collection] : options.collection;
     const scope = JSON.stringify(options.allowedPaths ?? {});
     const marker = `qmd-match-${randomUUID()}`;
-    const rows = store.db.prepare(`SELECT d.collection, d.path, d.hash, d.title, c.doc,
+    const rows = store.db.prepare(`SELECT d.collection, d.path, d.hash, d.title, d.modified_at, c.doc,
         bm25(documents_fts, 1.5, 4.0, 1.0) AS rank, highlight(documents_fts, 2, ?, ?) AS highlighted
       FROM documents_fts JOIN documents d ON d.id = documents_fts.rowid
         JOIN content c ON c.hash = d.hash
@@ -100,7 +101,7 @@ export async function discoverCandidates(store: Store, options: CandidateDiscove
           OR EXISTS (SELECT 1 FROM json_each(?) scope, json_each(scope.value) paths
             WHERE scope.key = d.collection AND paths.value = d.path))
       ORDER BY rank, d.collection, d.path LIMIT ?`).all<{
-        collection: string; path: string; hash: string; title: string; doc: string; rank: number; highlighted: string;
+        collection: string; path: string; hash: string; title: string; modified_at: string; doc: string; rank: number; highlighted: string;
       }>(marker, marker, terms, collections ? JSON.stringify(collections) : null,
         collections ? JSON.stringify(collections) : null, scope, scope, options.limit);
     for (const [rank, row] of rows.entries()) {
@@ -116,6 +117,7 @@ export async function discoverCandidates(store: Store, options: CandidateDiscove
       add({ file, displayPath: `${row.collection}/${row.path}`, title: row.title, body: row.doc,
         bestChunk: selected.text, bestChunkPos: selected.pos, score: row.rank,
         context: store.getContextForFile(file), docid: row.hash.slice(0, 6),
+        ...(row.modified_at ? { modifiedAt: row.modified_at } : {}),
         ref: { collection: row.collection, path: row.path, docHash: row.hash,
           chunkPos: selected.pos, chunkLen: selected.text.length, seq: null, embedFingerprint: null },
       }, "bm25", rank);
@@ -209,7 +211,8 @@ export async function decisionQuery(store: Store, query: string, options: Hybrid
       if (apiKey && client) {
         try {
           judgment = await judgeQueryExcerpt({ query, intent: options.intent, timeContext,
-            candidate: { excerpt: hit.bestChunk, sourcePath: hit.file } }, { client, apiKey, signal, timeoutMs });
+            candidate: { excerpt: hit.bestChunk, sourcePath: hit.file,
+              ...(hit.modifiedAt ? { modifiedAt: hit.modifiedAt } : {}) } }, { client, apiKey, signal, timeoutMs });
         } catch {
           failed++;
           continue;

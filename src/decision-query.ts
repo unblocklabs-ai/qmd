@@ -97,7 +97,7 @@ const USEFULNESS_QUESTIONS = {
       time: {
         reference: "`timeContext.asOf` is the evaluation time. Resolve current/now/latest against it unless `query` names another reference period.",
         retrieval: "`timeContext.sessionStartedFrom` and `timeContext.sessionStartedTo`, when present, are inclusive session-start retrieval bounds, not dates of the facts in the excerpt. They filter sessions only, not memory or knowledge files. Use the query to determine the requested factual period; do not assume that every claim inside a matching session occurred during the retrieval window.",
-        evidence: "`candidate.startedAt` dates the session, not each event or claim. A recent session or filename can quote old facts. Use explicit dates and qualifications in the excerpt; do not invent missing claim dates or assume a plan happened.",
+        evidence: "`candidate.startedAt` dates the session and `candidate.modifiedAt` dates the source document's last modification — neither automatically dates each event or claim inside. A recent session, file modification, or filename can quote old facts. Use explicit dates and qualifications in the excerpt; do not invent missing claim dates or assume a plan happened.",
         freshness: "For changing states such as active projects, progress, blockers or client status, an old snapshot without evidence that it remains applicable is at most marginal background, not a current answer. An excerpt need not be from today, but it must support the requested period to earn useful-partial or direct-high-value scores.",
         durable: "Do not apply blanket age penalties: durable identity/relationship facts, corrections, and evidence explicitly requested for a historical period can remain highly useful.",
       },
@@ -133,7 +133,7 @@ export async function judgeQueryExcerpt(
     query: string;
     intent?: string;
     timeContext: { asOf: string; sessionStartedFrom?: string; sessionStartedTo?: string };
-    candidate: { excerpt: string; sourcePath: string };
+    candidate: { excerpt: string; sourcePath: string; modifiedAt?: string };
   },
   options: { client: DecisionClient; apiKey: string; timeoutMs: number; signal: AbortSignal },
 ): Promise<QueryJudgment> {
