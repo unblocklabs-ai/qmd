@@ -37,7 +37,6 @@ import {
 } from "./llm.js";
 import type {
   NamedCollection,
-  Collection,
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
@@ -901,11 +900,11 @@ export function resolveVirtualPath(db: Database, virtualPath: string): string | 
   const parsed = parseVirtualPath(virtualPath);
   if (!parsed) return null;
 
-  const coll = getCollectionByName(db, parsed.collectionName);
-  if (!coll) return null;
+  const coll = getStoreCollection(db, parsed.collectionName);
+  if (!coll || coll.projected) return null;
 
-  const resolved = resolve(coll.pwd, parsed.path);
-  if (!isPathInsideDir(coll.pwd, resolved)) return null;
+  const resolved = resolve(coll.path, parsed.path);
+  if (!isPathInsideDir(coll.path, resolved)) return null;
   return resolved;
 }
 
@@ -919,6 +918,7 @@ export function toVirtualPath(db: Database, absolutePath: string): string | null
 
   // Find which collection this absolute path belongs to
   for (const coll of collections) {
+    if (coll.projected) continue;
     if (absolutePath.startsWith(coll.path + '/') || absolutePath === coll.path) {
       // Extract relative path
       const relativePath = absolutePath.startsWith(coll.path + '/')
@@ -1344,6 +1344,14 @@ function initializeDatabase(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
 
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS collection_generations (
+      collection TEXT PRIMARY KEY,
+      generation INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL
+    )
+  `);
+
   // Cache table for LLM API calls
   db.exec(`
     CREATE TABLE IF NOT EXISTS llm_cache (
@@ -1382,9 +1390,11 @@ function initializeDatabase(db: Database): void {
       ignore_patterns TEXT,
       include_by_default INTEGER DEFAULT 1,
       update_command TEXT,
-      context TEXT
+      context TEXT,
+      projected INTEGER NOT NULL DEFAULT 0
     )
   `);
+  ensureProjectedCollectionColumn(db);
 
   // Store config — key-value metadata (e.g. config_hash for sync optimization)
   db.exec(`
@@ -1407,6 +1417,18 @@ function initializeDatabase(db: Database): void {
 // Store Collections — DB accessor functions
 // =============================================================================
 
+function ensureProjectedCollectionColumn(db: Database): void {
+  const hasProjectedColumn = () => !!db.prepare(
+    "SELECT 1 FROM pragma_table_info('store_collections') WHERE name = 'projected'"
+  ).get();
+  if (hasProjectedColumn()) return;
+  db.transaction(() => {
+    if (!hasProjectedColumn()) {
+      db.exec("ALTER TABLE store_collections ADD COLUMN projected INTEGER NOT NULL DEFAULT 0");
+    }
+  }).immediate();
+}
+
 type StoreCollectionRow = {
   name: string;
   path: string;
@@ -1415,6 +1437,7 @@ type StoreCollectionRow = {
   include_by_default: number;
   update_command: string | null;
   context: string | null;
+  projected: number;
 };
 
 function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
@@ -1426,6 +1449,7 @@ function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
     ...(row.include_by_default === 0 ? { includeByDefault: false } : {}),
     ...(row.update_command ? { update: row.update_command } : {}),
     ...(row.context ? { context: JSON.parse(row.context) as ContextMap } : {}),
+    ...(row.projected === 1 ? { projected: true } : {}),
   };
 }
 
@@ -1483,25 +1507,27 @@ export function getStoreContexts(db: Database): Array<{ collection: string; path
   return results;
 }
 
-export function upsertStoreCollection(db: Database, name: string, collection: Omit<Collection, 'pattern'> & { pattern?: string }): void {
+export function upsertStoreCollection(db: Database, name: string, collection: CollectionConfig["collections"][string]): void {
   db.prepare(`
-    INSERT INTO store_collections (name, path, pattern, ignore_patterns, include_by_default, update_command, context)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO store_collections (name, path, pattern, ignore_patterns, include_by_default, update_command, context, projected)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(name) DO UPDATE SET
       path = excluded.path,
       pattern = excluded.pattern,
       ignore_patterns = excluded.ignore_patterns,
       include_by_default = excluded.include_by_default,
       update_command = excluded.update_command,
-      context = excluded.context
+      context = excluded.context,
+      projected = excluded.projected
   `).run(
     name,
-    collection.path,
+    collection.path ?? "",
     collection.pattern || '**/*.md',
     collection.ignore ? JSON.stringify(collection.ignore) : null,
     collection.includeByDefault === false ? 0 : 1,
     collection.update || null,
     collection.context ? JSON.stringify(collection.context) : null,
+    collection.projected ? 1 : 0,
   );
 }
 
@@ -1558,6 +1584,8 @@ export function setStoreGlobalContext(db: Database, value: string | undefined): 
  * External config always wins. Skips sync if config hash hasn't changed.
  */
 export function syncConfigToDb(db: Database, config: CollectionConfig): void {
+  // Config sync can be called on an older DB before a Store has opened it.
+  ensureProjectedCollectionColumn(db);
   // Check config hash — skip sync if unchanged
   const configJson = JSON.stringify(config);
   const hash = createHash('sha256').update(configJson).digest('hex');
@@ -1750,6 +1778,9 @@ export async function reindexCollection(
   }
 ): Promise<ReindexResult> {
   const db = store.db;
+  if (getStoreCollection(db, collectionName)?.projected) {
+    return { indexed: 0, updated: 0, unchanged: 0, removed: 0, orphanedCleaned: 0, skipped: 0, skippedFiles: [] };
+  }
   const now = new Date().toISOString();
   const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
 
@@ -1861,6 +1892,7 @@ export async function reindexCollection(
   }
 
   const orphanedCleaned = cleanupOrphanedContent(db);
+  if (indexed || updated || removed) bumpCollectionGeneration(db, collectionName, now);
 
   return { indexed, updated, unchanged, removed, orphanedCleaned, skipped: skippedFiles.length, skippedFiles };
 }
@@ -1912,6 +1944,7 @@ export type EmbedOptions = {
    * {@link DEFAULT_EMBED_MAX_DURATION_MS} (30 minutes).
    */
   maxDurationMs?: number;
+  signal?: AbortSignal;
   onProgress?: (info: EmbedProgress) => void;
 };
 
@@ -2138,6 +2171,7 @@ export async function generateEmbeddings(
   store: Store,
   options?: EmbedOptions
 ): Promise<EmbedResult> {
+  options?.signal?.throwIfAborted();
   const db = store.db;
   const llm = getLlm(store);
   const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
@@ -2185,6 +2219,10 @@ export async function generateEmbeddings(
     const failureList = () => [...failures.values()];
     const activeErrorCount = () => failures.size;
     const chunkKey = (chunk: ChunkItem) => `${chunk.hash}:${chunk.seq}`;
+    const persistChunk = (chunk: ChunkItem, embedding: number[]) => insertEmbedding(
+      db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding), model, now,
+      chunk.expectedTotalChunks, fingerprint, chunk.chunkLen, true,
+    );
     const reasonFromError = (error: unknown) => {
       const raw = error instanceof Error ? error.message : String(error);
       return raw.length > 180 ? `${raw.slice(0, 177)}...` : raw;
@@ -2214,9 +2252,11 @@ export async function generateEmbeddings(
           recordFailure(chunk, "embedding returned no vector");
           return false;
         }
-        insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, chunk.expectedTotalChunks, fingerprint, chunk.chunkLen);
-        chunksEmbedded++;
-        successesSinceRetry++;
+        options?.signal?.throwIfAborted();
+        if (persistChunk(chunk, result.embedding)) {
+          chunksEmbedded++;
+          successesSinceRetry++;
+        }
         clearFailure(chunk);
         return true;
       } catch (error) {
@@ -2302,7 +2342,10 @@ export async function generateEmbeddings(
         removeStaleEmbeddingChunks(db, doc.hash, model, fingerprint);
         db.prepare("DELETE FROM content_embedding_empty WHERE hash = ? AND model = ?").run(doc.hash, model);
         if (chunks.length === 0) {
-          db.prepare("INSERT INTO content_embedding_empty (hash, model, embed_fingerprint) VALUES (?, ?, ?)").run(doc.hash, model, fingerprint);
+          db.prepare(`
+            INSERT INTO content_embedding_empty (hash, model, embed_fingerprint)
+            SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM documents WHERE hash = ? AND active = 1)
+          `).run(doc.hash, model, fingerprint, doc.hash);
         }
 
         for (let seq = 0; seq < chunks.length; seq++) {
@@ -2368,13 +2411,15 @@ export async function generateEmbeddings(
 
         try {
           const embeddings = await session.embedBatch(texts, { model });
+          options?.signal?.throwIfAborted();
           for (let i = 0; i < chunkBatch.length; i++) {
             const chunk = chunkBatch[i]!;
             const embedding = embeddings[i];
             if (embedding) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, chunk.expectedTotalChunks, fingerprint, chunk.chunkLen);
-              chunksEmbedded++;
-              successesSinceRetry++;
+              if (persistChunk(chunk, embedding.embedding)) {
+                chunksEmbedded++;
+                successesSinceRetry++;
+              }
               clearFailure(chunk);
             } else {
               recordFailure(chunk, "batch embedding returned no vector");
@@ -2424,7 +2469,8 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }), { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
+  }), { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings', signal: options?.signal });
+  options?.signal?.throwIfAborted();
 
   return {
     docsProcessed: totalDocs,
@@ -3027,9 +3073,155 @@ export function runCleanup(db: Database): CleanupStats {
 // =============================================================================
 
 export async function hashContent(content: string): Promise<string> {
-  const hash = createHash("sha256");
-  hash.update(content);
-  return hash.digest("hex");
+  return documentHash(content);
+}
+
+function documentHash(content: string): string {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+export type ProjectedDocumentMetadata = { title?: string; createdAt?: string; modifiedAt?: string };
+export type ProjectedDocument = ProjectedDocumentMetadata & { path: string; content: string };
+export type ProjectedSyncOptions = { embed?: boolean; chunkStrategy?: ChunkStrategy; cleanup?: boolean; signal?: AbortSignal };
+
+export function getCollectionGeneration(db: Database, collection: string): number {
+  return db.prepare("SELECT generation FROM collection_generations WHERE collection = ?")
+    .get<{ generation: number }>(collection)?.generation ?? 0;
+}
+
+function bumpCollectionGeneration(db: Database, collection: string, now: string): number {
+  return db.prepare(`
+    INSERT INTO collection_generations (collection, generation, updated_at) VALUES (?, 1, ?)
+    ON CONFLICT(collection) DO UPDATE SET generation = generation + 1, updated_at = excluded.updated_at
+    RETURNING generation
+  `).get<{ generation: number }>(collection, now)!.generation;
+}
+
+function requireProjectedCollection(db: Database, collection: string): void {
+  if (!db.prepare("SELECT 1 FROM store_collections WHERE name = ? AND projected = 1").get(collection)) {
+    throw new Error(`Collection '${collection}' is not a configured projected collection`);
+  }
+}
+
+function validateProjectedPath(path: string): void {
+  if (path.includes("\0") || path.includes("\\") || /^[a-z]:/i.test(path)
+    || path.split("/").some(part => !part || part === "." || part === "..")) {
+    throw new Error("Projected document paths must be nonempty, collection-relative slash-separated paths");
+  }
+}
+
+function writeProjectedDocument(db: Database, collection: string, doc: ProjectedDocument, now: string) {
+  validateProjectedPath(doc.path);
+  const hash = documentHash(doc.content);
+  const title = doc.title ?? extractTitle(doc.content, doc.path);
+  const previous = db.prepare(`
+    SELECT id, hash, title, active, created_at, modified_at FROM documents WHERE collection = ? AND path = ?
+  `).get<{ id: number; hash: string; title: string; active: number; created_at: string; modified_at: string }>(collection, doc.path);
+  const createdAt = doc.createdAt ?? previous?.created_at ?? now;
+  const changed = !previous?.active || previous.hash !== hash || previous.title !== title
+    || previous.created_at !== createdAt || (doc.modifiedAt !== undefined && previous.modified_at !== doc.modifiedAt);
+  if (changed) {
+    if (previous?.hash !== hash) insertContent(db, hash, doc.content, now);
+    const modifiedAt = doc.modifiedAt ?? now;
+    if (previous) {
+      db.prepare("UPDATE documents SET hash = ?, title = ?, created_at = ?, modified_at = ?, active = 1 WHERE id = ?")
+        .run(hash, title, createdAt, modifiedAt, previous.id);
+      rebuildDocumentFTS(db, previous.id);
+    } else {
+      insertDocument(db, collection, doc.path, title, hash, createdAt, modifiedAt);
+    }
+  }
+  return { changed, hash, docid: getDocid(hash) };
+}
+
+export function upsertProjectedDocument(db: Database, collection: string, doc: ProjectedDocument) {
+  return db.transaction(() => {
+    requireProjectedCollection(db, collection);
+    const now = new Date().toISOString();
+    const result = writeProjectedDocument(db, collection, doc, now);
+    const generation = result.changed ? bumpCollectionGeneration(db, collection, now) : getCollectionGeneration(db, collection);
+    return { ...result, generation };
+  }).immediate();
+}
+
+export function retractProjectedDocument(db: Database, collection: string, path: string) {
+  validateProjectedPath(path);
+  return db.transaction(() => {
+    requireProjectedCollection(db, collection);
+    const deactivated = db.prepare("UPDATE documents SET active = 0 WHERE collection = ? AND path = ? AND active = 1")
+      .run(collection, path).changes > 0;
+    const generation = deactivated ? bumpCollectionGeneration(db, collection, new Date().toISOString()) : getCollectionGeneration(db, collection);
+    return { deactivated, generation };
+  }).immediate();
+}
+
+export async function syncProjectedCollection(
+  store: Store,
+  collection: string,
+  docs: Iterable<ProjectedDocument>,
+  options?: ProjectedSyncOptions,
+) {
+  const db = store.db;
+  const signal = options?.signal;
+  signal?.throwIfAborted();
+  const result = db.transaction(() => {
+    requireProjectedCollection(db, collection);
+    if (options?.embed && options.chunkStrategy && options.chunkStrategy !== getEmbeddingChunkStrategy(db)) {
+      // Hash-addressed vectors share a single strategy. Allow the initial choice,
+      // but do not silently invalidate another collection's vectors.
+      if (db.prepare(`
+        SELECT 1 FROM store_config WHERE key = ?
+        UNION ALL SELECT 1 FROM content_vectors
+        UNION ALL SELECT 1 FROM content_embedding_empty LIMIT 1
+      `).get(EMBEDDING_CHUNK_STRATEGY_KEY)) {
+        throw new Error("Changing chunk strategy requires embedding the full index; omit --collection");
+      }
+      setEmbeddingChunkStrategy(db, options.chunkStrategy);
+    }
+
+    const now = new Date().toISOString();
+    const seen = new Set<string>();
+    let upserted = 0, retracted = 0;
+    for (const doc of docs) {
+      signal?.throwIfAborted();
+      if (seen.has(doc.path)) throw new Error(`Duplicate projected document path: ${doc.path}`);
+      seen.add(doc.path);
+      if (writeProjectedDocument(db, collection, doc, now).changed) upserted++;
+    }
+    signal?.throwIfAborted();
+    for (const path of getActiveDocumentPaths(db, collection)) {
+      if (seen.has(path)) continue;
+      deactivateDocument(db, collection, path);
+      retracted++;
+    }
+
+    let cleaned = 0;
+    if (options?.cleanup ?? true) {
+      const vectors = cleanupOrphanedVectors(db);
+      if (!vectors && countOrphanedVectors(db) > 0) {
+        throw new Error("Cannot clean projected embeddings without sqlite-vec");
+      }
+      cleaned += vectors;
+      cleaned += db.prepare(`
+        DELETE FROM content_embedding_empty
+        WHERE NOT EXISTS (SELECT 1 FROM documents d WHERE d.hash = content_embedding_empty.hash AND d.active = 1)
+      `).run().changes;
+      cleaned += db.prepare("DELETE FROM documents WHERE collection = ? AND active = 0").run(collection).changes;
+      cleaned += cleanupOrphanedContent(db);
+    }
+    const generation = upserted || retracted || cleaned
+      ? bumpCollectionGeneration(db, collection, now) : getCollectionGeneration(db, collection);
+    return { upserted, unchanged: seen.size - upserted, retracted, generation };
+  }).immediate();
+
+  // The corpus and its acknowledgement commit before running model inference.
+  const embeddings = options?.embed
+    ? await generateEmbeddings(store, { collection, chunkStrategy: options.chunkStrategy, signal })
+    : undefined;
+  if (embeddings?.errors) {
+    throw new Error(`Projected collection '${collection}' has ${embeddings.errors} failed embedding chunks`);
+  }
+  return { ...result, embedded: embeddings?.chunksEmbedded ?? 0 };
 }
 
 const titleExtractors: Record<string, (content: string) => string | null> = {
@@ -3748,7 +3940,7 @@ function getCollectionByName(db: Database, name: string): { name: string; pwd: s
  * List all collections with document counts from database.
  * Merges store_collections config with database statistics.
  */
-export function listCollections(db: Database): { name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null; includeByDefault: boolean }[] {
+export function listCollections(db: Database): { name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null; includeByDefault: boolean; projected?: boolean }[] {
   const collections = getStoreCollections(db);
 
   // Get document counts from database for each collection
@@ -3770,6 +3962,7 @@ export function listCollections(db: Database): { name: string; pwd: string; glob
       active_count: stats?.active_count || 0,
       last_modified: stats?.last_modified || null,
       includeByDefault: coll.includeByDefault !== false,
+      ...(coll.projected ? { projected: true } : {}),
     };
   });
 
@@ -4647,10 +4840,16 @@ export function insertEmbedding(
   totalChunks: number = 1,
   fingerprint: string = getEmbeddingFingerprint(model, getEmbeddingChunkStrategy(db)),
   chunkLen: number = 0,
-): void {
+  requireActiveDocument = false,
+): boolean {
   const hashSeq = `${hash}_${seq}`;
 
-  withLazyContentVectorMigration(db, () => db.transaction(() => {
+  return withLazyContentVectorMigration(db, () => db.transaction(() => {
+    // Model inference runs outside SQLite. A sync may retract the last owner
+    // of this hash in the meantime; never recreate its orphaned vector.
+    if (requireActiveDocument && !db.prepare("SELECT 1 FROM documents WHERE hash = ? AND active = 1 LIMIT 1").get(hash)) {
+      return false;
+    }
     // Completion metadata and vector data must commit (or roll back) together.
     const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, chunk_len, model, embed_fingerprint, total_chunks, embedded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
     insertContentVectorStmt.run(hash, seq, pos, chunkLen, model, fingerprint, totalChunks, embeddedAt);
@@ -4660,7 +4859,8 @@ export function insertEmbedding(
     const insertVecStmt = db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
     deleteVecStmt.run(hashSeq);
     insertVecStmt.run(hashSeq, embedding);
-  })());
+    return true;
+  }).immediate());
 }
 
 function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<string, number>, model: string): number {
@@ -4976,7 +5176,7 @@ function getIgnoredLookupMatch(db: Database, query: string): DocumentExcludedByI
     if (parsedVirtual) {
       if (parsedVirtual.collectionName !== coll.name) continue;
       candidates.push(parsedVirtual.path);
-    } else if (normalizedQuery.startsWith(coll.path + '/')) {
+    } else if (!coll.projected && normalizedQuery.startsWith(coll.path + '/')) {
       candidates.push(normalizedQuery.slice(coll.path.length + 1));
     } else if (!normalizedQuery.startsWith('/')) {
       const collectionPrefix = `${coll.name}/`;
@@ -5086,7 +5286,7 @@ export function findDocument(db: Database, filename: string, options: { includeB
       let relativePath: string | null = null;
 
       // If filepath is absolute and starts with collection path, extract relative part
-      if (filepath.startsWith(coll.path + '/')) {
+      if (!coll.projected && filepath.startsWith(coll.path + '/')) {
         relativePath = filepath.slice(coll.path.length + 1);
       }
       // Otherwise treat filepath as relative to collection
@@ -5163,7 +5363,7 @@ export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: 
   if (!row) {
     const collections = getStoreCollections(db);
     for (const coll of collections) {
-      if (filepath.startsWith(coll.path + '/')) {
+      if (!coll.projected && filepath.startsWith(coll.path + '/')) {
         const relativePath = filepath.slice(coll.path.length + 1);
         row = db.prepare(`
           SELECT content.doc as body

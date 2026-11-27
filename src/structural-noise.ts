@@ -16,23 +16,33 @@ function codeRanges(text: string): { start: number; end: number; closingStart?: 
   return ranges;
 }
 
+export type StructuralNoiseSpan = { start: number; end: number; reason: string };
+export type StructuralNoiseDetector = (content: string) => Iterable<StructuralNoiseSpan>;
+export type StructuralNoiseOptions = {
+  /** Default: true. Markdown closing-fence detection is always enabled. */
+  includeDefaultNoiseDetectors?: boolean;
+  extraNoiseDetectors?: readonly StructuralNoiseDetector[];
+};
+
 /** Only a recognized source-level REM heading/marker span, never arbitrary short content. */
-function dreamingSpans(text: string, fences: readonly { start: number; end: number }[]): { start: number; end: number }[] {
-  const spans: { start: number; end: number }[] = [];
+export const OPENCLAW_REM_NOISE_DETECTOR: StructuralNoiseDetector = function* (text) {
   for (const m of text.matchAll(/^## REM Sleep\n<!-- openclaw:dreaming:rem:start -->\n/gm)) {
-    const start = m.index, end = start + m[0].length;
-    if (!fences.some(r => r.start < end && r.end > start)) spans.push({ start, end });
+    yield { start: m.index, end: m.index + m[0].length, reason: "dreaming-heading-marker" };
   }
-  return spans;
-}
+};
 
 /** A source-aware chunk eligibility check: do not change the original Markdown or its offsets. */
-export function createStructuralNoiseCheck(content: string): (start: number, end: number) => string | undefined {
+export function createStructuralNoiseCheck(content: string, options?: StructuralNoiseOptions): (start: number, end: number) => string | undefined {
   const fences = codeRanges(content);
-  const dreaming = dreamingSpans(content, fences);
+  const detectors = options?.extraNoiseDetectors ?? [];
+  const spans = (options?.includeDefaultNoiseDetectors === false
+    ? detectors : [OPENCLAW_REM_NOISE_DETECTOR, ...detectors])
+    .flatMap(detect => Array.from(detect(content)))
+    .filter(({ start, end }) => !fences.some(r => r.start < end && r.end > start));
   return (start, end) => {
     const text = content.slice(start, end);
-    if (dreaming.some(e => e.start <= start && e.end >= end) && text.trim()) return "dreaming-heading-marker";
+    const span = spans.find(e => e.start <= start && e.end >= end);
+    if (span && text.trim()) return span.reason;
     // Only a closing fence of a known fenced block, with substantive content elsewhere in that block.
     if (/^\s*(?:`{3,}|~{3,})\s*$/.test(text)) {
       const range = fences.find(r => r.end === end && r.closingStart === start && r.start < start);

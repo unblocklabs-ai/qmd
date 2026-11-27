@@ -64,6 +64,48 @@ describe("semantic chunking math", () => {
 });
 
 describe("Markdown and journal boundaries", () => {
+  test("source adapters can omit their own markers, replace legacy rules, and format only embedding text", async () => {
+    const marker = "<!-- import receipt -->\n";
+    const rem = "## REM Sleep\n<!-- openclaw:dreaming:rem:start -->\n";
+    const legacy = "<!-- lcm-memory-backfill:run=abc -->\n";
+    const structuralNoise = {
+      includeDefaultNoiseDetectors: false,
+      extraNoiseDetectors: [(content: string) => content.startsWith(marker)
+        ? [{ start: 0, end: marker.length, reason: "import-receipt" }] : []],
+    };
+    const sourceOptions = {
+      structuralNoise,
+      isBackfillMarker: (line: string) => line.startsWith("<!-- migration:"),
+      isSpeakerHeader: (line: string) => line.startsWith("Voice: "),
+      speakerContext: (_content: string, _position: number, text: string) => `attribution-tag ${text}`,
+    };
+    let omissions = 0;
+    const opts = options({ ...sourceOptions, onStructuralOmission: () => { omissions++; } });
+    expect(await chunkMarkdownSemantically(marker, "notes.md", opts)).toEqual([]);
+    expect(omissions).toBe(1);
+    expect((await chunkMarkdownSemantically(rem, "notes.md", opts)).map(chunk => chunk.text)).toEqual([rem]);
+    expect((await chunkMarkdownSemantically(legacy, "notes.md", opts)).map(chunk => chunk.text)).toEqual([legacy]);
+    expect(await chunkMarkdownSemantically("<!-- migration: done -->\n", "notes.md", opts)).toEqual([]);
+
+    const voice = "Voice: Alex\n> first spoken line\n";
+    const text = voice + "A separate paragraph follows this speech.\n\nThen another paragraph.\n";
+    const atoms = await scanMarkdownAtoms(text, "notes.md", countWords, sourceOptions);
+    expect(atoms[0]?.text).toBe(voice);
+    const embeddingInputs: string[] = [];
+    const chunks = await chunkMarkdownSemantically(text, "notes.md", options({
+      ...sourceOptions,
+      minTokens: 2,
+      embedBatch: async texts => {
+        embeddingInputs.push(...texts);
+        return texts.map(topicalVector);
+      },
+    }));
+    expect(embeddingInputs.length).toBeGreaterThan(0);
+    expect(embeddingInputs.every(input => input.startsWith("attribution-tag "))).toBe(true);
+    expect(chunks.map(chunk => chunk.text).join("")).toBe(text);
+    for (const chunk of chunks) expect(text.slice(chunk.pos, chunk.pos + chunk.text.length)).toBe(chunk.text);
+  });
+
   test("REM eligibility preserves source offsets, reflections, and literal examples", async () => {
     const marker = "## REM Sleep\n<!-- openclaw:dreaming:rem:start -->\n";
     let omitted = 0;

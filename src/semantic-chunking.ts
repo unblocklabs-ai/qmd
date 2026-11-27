@@ -1,4 +1,4 @@
-import { createStructuralNoiseCheck } from "./structural-noise.js";
+import { createStructuralNoiseCheck, type StructuralNoiseOptions } from "./structural-noise.js";
 
 export const SEMANTIC_CHUNKING_VERSION = 7;
 
@@ -25,7 +25,16 @@ export type SemanticChunk = {
   tokens: number;
 };
 
-export type SemanticChunkOptions = {
+export type ChunkingOptions = {
+  /** Overrides the default OpenClaw speaker and backfill markers, respectively. */
+  isSpeakerHeader?: (line: string) => boolean;
+  isBackfillMarker?: (line: string) => boolean;
+  /** Format text for embedding only; this cannot change indexed text or offsets. */
+  speakerContext?: (content: string, position: number, text: string) => string;
+  structuralNoise?: StructuralNoiseOptions;
+};
+
+export type SemanticChunkOptions = ChunkingOptions & {
   minTokens?: number;
   maxTokens?: number;
   similarityWindow?: number;
@@ -40,8 +49,8 @@ export type SemanticChunkOptions = {
 };
 
 type ResolvedOptions = Required<
-  Omit<SemanticChunkOptions, "embedBatch" | "countTokens" | "signal" | "onStructuralOmission">
-> & Pick<SemanticChunkOptions, "embedBatch" | "countTokens" | "signal">;
+  Omit<SemanticChunkOptions, keyof ChunkingOptions | "embedBatch" | "countTokens" | "signal" | "onStructuralOmission">
+> & Pick<SemanticChunkOptions, "embedBatch" | "countTokens" | "signal" | "speakerContext">;
 
 type AtomKind = "prose" | "speaker" | "heading" | "rule" | "marker" | "fence" | "table" | "list";
 
@@ -66,7 +75,11 @@ const FENCE_RE = /^ {0,3}(`{3,}|~{3,})/;
 const SPEAKER_RE = /^\*\*Speaker: ("(?:[^"\\\r\n]|\\.)*")\*\*$/u;
 
 /** Add attribution for embeddings only; indexed chunks keep exact source offsets. */
-export function withSpeakerContext(content: string, position: number, text: string): string {
+export function withSpeakerContext(content: string, position: number, text: string, options?: Pick<ChunkingOptions, "speakerContext">): string {
+  return (options?.speakerContext ?? openClawSpeakerContext)(content, position, text);
+}
+
+function openClawSpeakerContext(content: string, position: number, text: string): string {
   const before = content.slice(0, position);
   const start = before.lastIndexOf("\n**Speaker: ") + 1;
   if (start === 0 && !content.startsWith("**Speaker: ")) return text;
@@ -82,6 +95,11 @@ export function withSpeakerContext(content: string, position: number, text: stri
 }
 // Generated provenance, not arbitrary HTML comments (which can contain useful text).
 const BACKFILL_MARKER_RE = /^ {0,3}<!--\s*lcm-memory-backfill:[^<>\r\n]*-->\s*$/;
+export const OPENCLAW_CHUNKING_SOURCE = {
+  isSpeakerHeader: (line: string) => SPEAKER_RE.test(line),
+  isBackfillMarker: (line: string) => BACKFILL_MARKER_RE.test(line),
+  speakerContext: openClawSpeakerContext,
+} satisfies Required<Pick<ChunkingOptions, "isSpeakerHeader" | "isBackfillMarker" | "speakerContext">>;
 const TYPED_FACT_RE = /^\s*(?:[-+*]\s+)?(?:Decision|Preference|Task|Outcome|Observation)\s*:/i;
 const SESSION_RE = /^\s*(?:[-+*]\s+)?(?:Session|Conversation)(?:\s+(?:ID|#))?\s*[:#]/i;
 const TIMESTAMP_RE = /^\s*(?:[-+*]\s+)?(?:\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}(?::\d{2})?|\[?\d{1,2}:\d{2}(?::\d{2})?\]?)(?:\s|$)/;
@@ -125,6 +143,7 @@ function resolvedOptions(options: SemanticChunkOptions): ResolvedOptions {
     embedBatch: options.embedBatch,
     countTokens: options.countTokens,
     signal: options.signal,
+    speakerContext: options.speakerContext,
   };
 
   if (resolved.minTokens < 0 || resolved.maxTokens < 1 || resolved.minTokens > resolved.maxTokens) {
@@ -201,9 +220,9 @@ function topLevelListIndent(line: string): number | null {
   return indent !== null && indent <= 3 ? indent : null;
 }
 
-function blockKind(line: string): AtomKind {
-  if (SPEAKER_RE.test(line)) return "speaker";
-  if (BACKFILL_MARKER_RE.test(line)) return "marker";
+function blockKind(line: string, source: typeof OPENCLAW_CHUNKING_SOURCE): AtomKind {
+  if (source.isSpeakerHeader(line)) return "speaker";
+  if (source.isBackfillMarker(line)) return "marker";
   if (HEADING_RE.test(line)) return "heading";
   if (RULE_RE.test(line)) return "rule";
   if (topLevelListIndent(line) !== null) return "list";
@@ -244,7 +263,12 @@ function listEntryEnd(
   return end;
 }
 
-function scanMarkdownBlocks(content: string): ScannedAtom[] {
+function scanMarkdownBlocks(content: string, options?: ChunkingOptions): ScannedAtom[] {
+  const source = {
+    ...OPENCLAW_CHUNKING_SOURCE,
+    isSpeakerHeader: options?.isSpeakerHeader ?? OPENCLAW_CHUNKING_SOURCE.isSpeakerHeader,
+    isBackfillMarker: options?.isBackfillMarker ?? OPENCLAW_CHUNKING_SOURCE.isBackfillMarker,
+  };
   const lines = linesOf(content);
   const atoms: ScannedAtom[] = [];
   let lineIndex = 0;
@@ -263,7 +287,7 @@ function scanMarkdownBlocks(content: string): ScannedAtom[] {
 
     const meaningfulLine = lineBody(lines[lineIndex]!);
     const boundaryBefore = startsHardBoundary(meaningfulLine);
-    let kind = blockKind(meaningfulLine);
+    let kind = blockKind(meaningfulLine, source);
     let endLine: number;
     const fence = meaningfulLine.match(FENCE_RE)?.[1];
     const table = tableEnd(lines, lineIndex);
@@ -285,7 +309,7 @@ function scanMarkdownBlocks(content: string): ScannedAtom[] {
       endLine = lineIndex + 1;
       while (endLine < lines.length && !isBlank(lines[endLine]!)) {
         const candidate = lineBody(lines[endLine]!);
-        if (FENCE_RE.test(candidate) || BACKFILL_MARKER_RE.test(candidate) || startsHardBoundary(candidate) !== "none") break;
+        if (FENCE_RE.test(candidate) || source.isBackfillMarker(candidate) || startsHardBoundary(candidate) !== "none") break;
         if (tableEnd(lines, endLine) !== null) break;
         if (topLevelListIndent(candidate) !== null) break;
         endLine++;
@@ -314,8 +338,9 @@ export async function scanMarkdownAtoms(
   content: string,
   _filepath: string,
   countTokens: (text: string) => Promise<number>,
+  options?: ChunkingOptions,
 ): Promise<TextAtom[]> {
-  const atoms = scanMarkdownBlocks(content);
+  const atoms = scanMarkdownBlocks(content, options);
   await Promise.all(atoms.map(async atom => {
     atom.tokens = await countTokens(atom.text);
   }));
@@ -629,7 +654,7 @@ async function embedAll(atoms: readonly TextAtom[], options: ResolvedOptions, co
   for (let start = 0; start < atoms.length; start += options.embeddingBatchSize) {
     options.signal?.throwIfAborted();
     const batch = atoms.slice(start, start + options.embeddingBatchSize);
-    const embedded = await options.embedBatch(batch.map(atom => withSpeakerContext(content, atom.start, atom.text)));
+    const embedded = await options.embedBatch(batch.map(atom => withSpeakerContext(content, atom.start, atom.text, options)));
     if (embedded.length !== batch.length) {
       throw new Error(`Embedding callback returned ${embedded.length} vectors for ${batch.length} atoms`);
     }
@@ -718,7 +743,7 @@ export async function chunkMarkdownSemantically(
   if (content.length === 0 || content.trim().length === 0) return [];
   const resolved = resolvedOptions(options);
   resolved.signal?.throwIfAborted();
-  const scanned = scanMarkdownBlocks(content);
+  const scanned = scanMarkdownBlocks(content, options);
   const regions: ScannedAtom[][] = [];
   let current: ScannedAtom[] = [];
   for (const atom of scanned) {
@@ -738,7 +763,7 @@ export async function chunkMarkdownSemantically(
   }
   // Check the original Markdown structure, so literal markers/rules in code
   // fences remain searchable. Never rewrite text: positions stay source-exact.
-  const noiseReason = createStructuralNoiseCheck(content);
+  const noiseReason = createStructuralNoiseCheck(content, options.structuralNoise);
   return chunks.filter(chunk => {
     if (noiseReason(chunk.pos, chunk.pos + chunk.text.length)) {
       options.onStructuralOmission?.();

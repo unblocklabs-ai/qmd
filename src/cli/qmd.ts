@@ -711,14 +711,12 @@ function builtinModels(): BuiltinModels {
  */
 function collectSensitiveSnapshot(): SensitiveSnapshot {
   const config = loadConfig();
+  const filesystemCollections = Object.entries(config.collections ?? {}).filter(([, col]) => !col.projected);
   return {
-    hooks: Object.entries(config.collections ?? {})
+    hooks: filesystemCollections
       .filter(([, col]) => !!col.update)
       .map(([name, col]) => ({ collection: name, command: col.update! })),
-    paths: Object.entries(config.collections ?? {}).map(([name, col]) => ({
-      collection: name,
-      path: col.path,
-    })),
+    paths: filesystemCollections.flatMap(([name, col]) => col.path === undefined ? [] : [{ collection: name, path: col.path }]),
     models: {
       embed: config.models?.embed,
       rerank: config.models?.rerank,
@@ -893,7 +891,7 @@ async function updateCollections(): Promise<void> {
   // Clear Ollama cache on update
   clearCache(db);
 
-  const collections = listCollections(db);
+  const collections = listCollections(db).filter(col => !col.projected);
 
   if (collections.length === 0) {
     console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);

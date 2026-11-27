@@ -2092,7 +2092,7 @@ class LLMSession implements ILLMSession {
       } else {
         options.signal.addEventListener("abort", () => {
           this.abortController.abort(options.signal!.reason);
-        }, { once: true });
+        }, { once: true, signal: this.abortController.signal });
       }
     }
 

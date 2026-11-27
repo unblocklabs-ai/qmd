@@ -27,6 +27,10 @@ import {
   DEFAULT_MULTI_GET_MAX_BYTES,
   reindexCollection,
   generateEmbeddings,
+  upsertProjectedDocument,
+  retractProjectedDocument,
+  syncProjectedCollection,
+  getCollectionGeneration,
   listCollections as storeListCollections,
   syncConfigToDb,
   getStoreCollections,
@@ -66,6 +70,9 @@ import {
   type EmbedProgress,
   type EmbedResult,
   type ChunkStrategy,
+  type ProjectedDocument,
+  type ProjectedDocumentMetadata,
+  type ProjectedSyncOptions,
   type VectorSearchStage,
   type VectorSearchTiming,
   type VectorSearchTrace,
@@ -81,9 +88,9 @@ export { formatDocForEmbedding, formatQueryForEmbedding } from "./llm.js";
 export type { CandidateDiscoveryOptions, DiscoveryCandidate } from "./query.js";
 export type { DecisionModelOptions } from "./decision-query.js";
 import {
-  setConfigSource,
   loadConfig,
-  addCollection as collectionsAddCollection,
+  saveConfig,
+  putCollection,
   removeCollection as collectionsRemoveCollection,
   renameCollection as collectionsRenameCollection,
   addContext as collectionsAddContext,
@@ -93,7 +100,18 @@ import {
   type CollectionConfig,
   type NamedCollection,
   type ContextMap,
+  type ConfigAccess,
 } from "./collections.js";
+
+export { openReadOnlySnapshot, type ReadOnlySnapshot, type SnapshotDocument } from "./snapshot.js";
+export {
+  createStructuralNoiseCheck, OPENCLAW_REM_NOISE_DETECTOR,
+  type StructuralNoiseDetector, type StructuralNoiseOptions, type StructuralNoiseSpan,
+} from "./structural-noise.js";
+export {
+  chunkMarkdownSemantically, scanMarkdownAtoms, withSpeakerContext, OPENCLAW_CHUNKING_SOURCE,
+  type ChunkingOptions, type SemanticChunk, type SemanticChunkOptions, type TextAtom,
+} from "./semantic-chunking.js";
 
 // Re-export types for SDK consumers
 export type {
@@ -125,6 +143,9 @@ export type {
   VectorSearchTrace,
   AllowedDocumentPaths,
   VectorSearchResult,
+  ProjectedDocument,
+  ProjectedDocumentMetadata,
+  ProjectedSyncOptions,
 };
 
 /** Options for vsearch() — expanded vector-only semantic search. */
@@ -295,7 +316,7 @@ export interface QMDStore {
   // ── Collection Management ───────────────────────────────────────────
 
   /** Add or update a collection */
-  addCollection(name: string, opts: { path: string; pattern?: string; ignore?: string[] }): Promise<void>;
+  addCollection(name: string, opts: CollectionConfig["collections"][string]): Promise<void>;
 
   /** Remove a collection */
   removeCollection(name: string): Promise<boolean>;
@@ -304,7 +325,7 @@ export interface QMDStore {
   renameCollection(oldName: string, newName: string): Promise<boolean>;
 
   /** List all collections with document stats */
-  listCollections(): Promise<{ name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null; includeByDefault: boolean }[]>;
+  listCollections(): Promise<ReturnType<typeof storeListCollections>>;
 
   /** Get names of collections included by default in queries */
   getDefaultCollectionNames(): Promise<string[]>;
@@ -333,6 +354,18 @@ export interface QMDStore {
     collections?: string[];
     onProgress?: (info: UpdateProgress) => void;
   }): Promise<UpdateResult>;
+
+  /** Insert, update, or reactivate a document in a projected collection. */
+  upsertDocument(collection: string, path: string, content: string, opts?: ProjectedDocumentMetadata): Promise<{ changed: boolean; hash: string; docid: string; generation: number }>;
+
+  /** Deactivate a projected document. Repeating a retraction is a no-op. */
+  retractDocument(collection: string, path: string): Promise<{ deactivated: boolean; generation: number }>;
+
+  /** Reconcile the complete desired set of paths, atomically with its generation. */
+  syncProjectedCollection(collection: string, docs: Iterable<ProjectedDocument>, opts?: ProjectedSyncOptions): Promise<{ upserted: number; unchanged: number; retracted: number; embedded: number; generation: number }>;
+
+  /** Read the latest committed collection generation (zero before the first change). */
+  getCollectionGeneration(collection: string): Promise<number>;
 
   /** Generate vector embeddings for documents that need them */
   embed(options?: {
@@ -394,27 +427,24 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     throw new Error("Provide either configPath or config, not both");
   }
 
-  // Create the internal store (opens DB, creates tables)
+  const { configPath, config: inlineConfig } = options;
+  const configAccess: ConfigAccess | undefined = configPath
+    ? { load: () => loadConfig(configPath), save: config => saveConfig(config, configPath) }
+    : inlineConfig
+      ? { load: () => inlineConfig, save: () => {} }
+      : undefined;
+  const config = configAccess?.load();
   const internal = createStoreInternal(options.dbPath);
   const db = internal.db;
-
-  // Track whether we have a YAML config path for write-through
-  const hasYamlConfig = !!options.configPath;
-
-  // Sync config into SQLite store_collections
-  let config: CollectionConfig | undefined;
-  if (options.configPath) {
-    // YAML mode: inject config source for write-through, sync to DB
-    setConfigSource({ configPath: options.configPath });
-    config = loadConfig();
-    syncConfigToDb(db, config);
-  } else if (options.config) {
-    // Inline config mode: inject config source for mutations, sync to DB
-    setConfigSource({ config: options.config });
-    config = options.config;
-    syncConfigToDb(db, config);
+  try {
+    if (config) {
+      config.collections ??= {};
+      syncConfigToDb(db, config);
+    }
+  } catch (error) {
+    internal.close();
+    throw error;
   }
-  // else: DB-only mode — no external config, use existing store_collections
 
   // Create a per-store LlamaCpp instance — lazy-loads models on first use and,
   // unless explicitly kept warm, unloads them after 5 min inactivity.
@@ -489,23 +519,18 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
     // Collection Management — write to SQLite + write-through to YAML/inline if configured
     addCollection: async (name, opts) => {
-      upsertStoreCollection(db, name, { path: opts.path, pattern: opts.pattern, ignore: opts.ignore });
-      if (hasYamlConfig || options.config) {
-        collectionsAddCollection(name, opts.path, opts.pattern);
-      }
+      const collection = { ...opts, pattern: opts.pattern ?? "**/*.md" };
+      upsertStoreCollection(db, name, collection);
+      if (configAccess) putCollection(name, collection, configAccess);
     },
     removeCollection: async (name) => {
       const result = deleteStoreCollection(db, name);
-      if (hasYamlConfig || options.config) {
-        collectionsRemoveCollection(name);
-      }
+      if (configAccess) collectionsRemoveCollection(name, configAccess);
       return result;
     },
     renameCollection: async (oldName, newName) => {
       const result = renameStoreCollection(db, oldName, newName);
-      if (hasYamlConfig || options.config) {
-        collectionsRenameCollection(oldName, newName);
-      }
+      if (configAccess) collectionsRenameCollection(oldName, newName, configAccess);
       return result;
     },
     listCollections: async () => storeListCollections(db),
@@ -517,30 +542,24 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     // Context Management — write to SQLite + write-through to YAML/inline if configured
     addContext: async (collectionName, pathPrefix, contextText) => {
       const result = updateStoreContext(db, collectionName, pathPrefix, contextText);
-      if (hasYamlConfig || options.config) {
-        collectionsAddContext(collectionName, pathPrefix, contextText);
-      }
+      if (configAccess) collectionsAddContext(collectionName, pathPrefix, contextText, configAccess);
       return result;
     },
     removeContext: async (collectionName, pathPrefix) => {
       const result = removeStoreContext(db, collectionName, pathPrefix);
-      if (hasYamlConfig || options.config) {
-        collectionsRemoveContext(collectionName, pathPrefix);
-      }
+      if (configAccess) collectionsRemoveContext(collectionName, pathPrefix, configAccess);
       return result;
     },
     setGlobalContext: async (context) => {
       setStoreGlobalContext(db, context);
-      if (hasYamlConfig || options.config) {
-        collectionsSetGlobalContext(context);
-      }
+      if (configAccess) collectionsSetGlobalContext(context, configAccess);
     },
     getGlobalContext: async () => getStoreGlobalContext(db),
     listContexts: async () => getStoreContexts(db),
 
     // Indexing — reads collections from SQLite
     update: async (updateOpts) => {
-      const collections = getStoreCollections(db);
+      const collections = getStoreCollections(db).filter(c => !c.projected);
       const filtered = updateOpts?.collections
         ? collections.filter(c => updateOpts.collections!.includes(c.name))
         : collections;
@@ -574,6 +593,11 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       };
     },
 
+    upsertDocument: async (collection, path, content, opts) => upsertProjectedDocument(db, collection, { ...opts, path, content }),
+    retractDocument: async (collection, path) => retractProjectedDocument(db, collection, path),
+    syncProjectedCollection: (collection, docs, opts) => syncProjectedCollection(internal, collection, docs, opts),
+    getCollectionGeneration: async collection => getCollectionGeneration(db, collection),
+
     embed: async (embedOpts) => {
       return generateEmbeddings(internal, {
         force: embedOpts?.force,
@@ -594,9 +618,6 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     close: async () => {
       await llm.dispose();
       internal.close();
-      if (hasYamlConfig || options.config) {
-        setConfigSource(undefined); // Reset config source
-      }
     },
   };
 

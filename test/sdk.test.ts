@@ -9,10 +9,11 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } fr
 import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { existsSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, writeFileSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import YAML from "yaml";
 import {
   createStore,
+  openReadOnlySnapshot,
   type QMDStore,
   type CollectionConfig,
   type StoreOptions,
@@ -23,6 +24,8 @@ import {
   type ExpandQueryOptions,
 } from "../src/index.js";
 import { setDefaultLlamaCpp } from "../src/llm.js";
+import { getConfigPath, setConfigSource } from "../src/collections.js";
+import { reindexCollection, resolveVirtualPath } from "../src/store.js";
 
 // =============================================================================
 // Test Helpers
@@ -60,6 +63,181 @@ afterAll(async () => {
 function freshDbPath(): string {
   return join(testDir, `test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
 }
+
+describe("projected corpus", () => {
+  test("filesystem updates ignore projected collections, including after reopening without config", async () => {
+    const dbPath = freshDbPath();
+    const writer = await createStore({ dbPath, config: { collections: {
+      docs: { path: docsDir },
+      sessions: { projected: true, path: docsDir },
+    } } });
+    try {
+      await writer.upsertDocument("sessions", "virtual/first.md", "Projectedonly transcript");
+    } finally {
+      await writer.close();
+    }
+    const store = await createStore({ dbPath });
+    try {
+      expect(await store.update()).toMatchObject({ indexed: 3, removed: 0 });
+      expect(await reindexCollection(store.internal, docsDir, "**/*.md", "sessions"))
+        .toMatchObject({ indexed: 0, removed: 0 });
+      expect((await store.searchLex("projectedonly")).map(hit => hit.filepath)).toEqual(["qmd://sessions/virtual/first.md"]);
+      expect(await store.listCollections()).toContainEqual(expect.objectContaining({ name: "sessions", active_count: 1, projected: true }));
+      expect(resolveVirtualPath(store.internal.db, "qmd://sessions/auth.md")).toBeNull();
+      expect(await store.getCollectionGeneration("sessions")).toBe(1);
+    } finally {
+      await store.close();
+    }
+  });
+
+  test("acks changes to exact body and metadata, keeps no-ops at the current generation, and reactivates", async () => {
+    const store = await createStore({ dbPath: freshDbPath() });
+    try {
+      await store.addCollection("projected", { projected: true });
+      const path = "space & case/Note.md";
+      const content = "# Raw\r\n\r\nplainbodytoken\r\n";
+      const metadata = { title: "Source title", createdAt: "2020-01-01T00:00:00Z", modifiedAt: "2020-02-01T00:00:00Z" };
+      const first = await store.upsertDocument("projected", path, content, metadata);
+      expect(first).toMatchObject({ changed: true, generation: 1 });
+      expect(first.docid).toBe(first.hash.slice(0, 6));
+      expect(await store.upsertDocument("projected", path, content, metadata)).toEqual({ ...first, changed: false });
+      expect(await store.getDocumentBody(`qmd://projected/${path}`)).toBe(content);
+      expect(await store.get(`#${first.docid}`)).toMatchObject({ title: "Source title" });
+
+      const renamed = await store.upsertDocument("projected", path, content, { ...metadata, title: "Changed title" });
+      expect(renamed).toEqual({ ...first, generation: 2 });
+      expect(await store.get(`#${first.docid}`)).toMatchObject({ title: "Changed title" });
+      expect(await store.retractDocument("projected", path)).toEqual({ deactivated: true, generation: 3 });
+      expect(await store.searchLex("plainbodytoken")).toEqual([]);
+      expect(await store.retractDocument("projected", path)).toEqual({ deactivated: false, generation: 3 });
+      expect(await store.upsertDocument("projected", path, content, metadata)).toEqual({ ...first, generation: 4 });
+      expect(await store.getCollectionGeneration("projected")).toBe(4);
+      await expect(store.upsertDocument("projected", "../unsafe", content)).rejects.toThrow("collection-relative");
+      await expect(store.upsertDocument("unknown", path, content)).rejects.toThrow("not a configured projected collection");
+    } finally {
+      await store.close();
+    }
+  });
+
+  test("sync commits neither staged rows nor retractions for an incomplete source", async () => {
+    const store = await createStore({ dbPath: freshDbPath(), config: { collections: { projected: { projected: true } } } });
+    try {
+      await store.upsertDocument("projected", "retained.md", "original");
+      const controller = new AbortController();
+      function* interrupted() {
+        yield { path: "staged.md", content: "don't commit" };
+        controller.abort(new Error("source closed"));
+      }
+      await expect(store.syncProjectedCollection("projected", interrupted(), { signal: controller.signal, embed: true }))
+        .rejects.toThrow("source closed");
+      await expect(store.syncProjectedCollection("projected", [
+        { path: "same.md", content: "first" }, { path: "same.md", content: "second" },
+      ])).rejects.toThrow("Duplicate projected document path");
+      expect(await store.getDocumentBody("qmd://projected/retained.md")).toBe("original");
+      expect(await store.getDocumentBody("qmd://projected/staged.md")).toBeNull();
+      expect(await store.getCollectionGeneration("projected")).toBe(1);
+    } finally {
+      await store.close();
+    }
+  });
+
+  test("pins active documents, bodies and generations to the same live SQLite read", async () => {
+    const dbPath = freshDbPath();
+    const store = await createStore({ dbPath, config: { collections: { projected: { projected: true } } } });
+    try {
+      const modifiedAt = "2026-01-02T03:04:05Z";
+      const first = await store.upsertDocument("projected", "one.md", "first", { title: "One", modifiedAt });
+      await store.upsertDocument("projected", "inactive.md", "inactive");
+      await store.retractDocument("projected", "inactive.md");
+      const read = openReadOnlySnapshot(dbPath);
+      try {
+        await store.upsertDocument("projected", "one.md", "second");
+        expect(read.listActiveDocuments(["missing", "projected", "projected"])).toEqual([
+          { id: expect.any(Number), collection: "projected", path: "one.md", hash: first.hash, title: "One", modifiedAt },
+        ]);
+        expect(read.listActiveDocuments([])).toEqual([]);
+        expect(read.getDocumentBody("projected", "inactive.md")).toBeNull();
+        expect(read.getDocumentBody("projected", "one.md")).toBe("first");
+        expect(read.getCollectionGeneration("projected")).toBe(3);
+        expect(read.getCollectionGeneration("missing")).toBe(0);
+        const latest = openReadOnlySnapshot(dbPath);
+        try {
+          expect(latest.getCollectionGeneration("projected")).toBe(4);
+          expect(latest.getDocumentBody("projected", "one.md")).toBe("second");
+        } finally {
+          latest.close();
+        }
+      } finally {
+        read.close();
+      }
+    } finally {
+      await store.close();
+    }
+  });
+
+  test("opens an idle or legacy index without writing files, bootstrapping schema, or changing config", async () => {
+    const dir = await mkdtemp(join(testDir, "snapshot-"));
+    const dbPath = join(dir, "index #1.sqlite");
+    const store = await createStore({ dbPath, config: { collections: { projected: { projected: true } } } });
+    try {
+      await store.upsertDocument("projected", "one.md", "original");
+      store.internal.db.exec("DROP TABLE collection_generations");
+      // Bun can leave empty WAL sidecars after close. Entering WAL mode without
+      // subsequent writes gives both drivers a checkpointed, sidecar-free file.
+      store.internal.db.exec("PRAGMA journal_mode = DELETE; PRAGMA journal_mode = WAL");
+    } finally {
+      await store.close();
+    }
+    const before = readFileSync(dbPath);
+    expect(readdirSync(dir)).toEqual(["index #1.sqlite"]);
+    setConfigSource({ configPath: join(dir, "unrelated.yml") });
+    try {
+      const read = openReadOnlySnapshot(dbPath);
+      try {
+        expect(read.listActiveDocuments()).toHaveLength(1);
+        expect(read.getDocumentBody("projected", "one.md")).toBe("original");
+        expect(read.getCollectionGeneration("projected")).toBe(0);
+        expect(readdirSync(dir)).toEqual(["index #1.sqlite"]);
+      } finally {
+        read.close();
+      }
+      expect(getConfigPath()).toBe(join(dir, "unrelated.yml"));
+      expect(readFileSync(dbPath)).toEqual(before);
+      expect(() => openReadOnlySnapshot(join(dir, "missing.sqlite"))).toThrow(/ENOENT/);
+      expect(readdirSync(dir)).toEqual(["index #1.sqlite"]);
+    } finally {
+      setConfigSource();
+    }
+  });
+
+  test("concurrent inline stores isolate config changes and closing either leaves the global source alone", async () => {
+    const a: CollectionConfig = { collections: { a: { projected: true } } };
+    const b: CollectionConfig = { collections: { b: { projected: true } } };
+    const sentinel = join(testDir, "unrelated-global.yml");
+    setConfigSource({ configPath: sentinel });
+    const [left, right] = await Promise.all([
+      createStore({ dbPath: freshDbPath(), config: a }),
+      createStore({ dbPath: freshDbPath(), config: b }),
+    ]);
+    try {
+      await Promise.all([left.addContext("a", "/", "left only"), right.setGlobalContext("right only")]);
+      expect(a.collections.a?.context).toEqual({ "/": "left only" });
+      expect(a.global_context).toBeUndefined();
+      expect(b.collections.b?.context).toBeUndefined();
+      expect(b.global_context).toBe("right only");
+      expect(getConfigPath()).toBe(sentinel);
+      await left.close();
+      await right.addCollection("right-new", { projected: true });
+      expect(Object.keys(a.collections)).toEqual(["a"]);
+      expect(Object.keys(b.collections)).toEqual(["b", "right-new"]);
+      expect((await right.listCollections()).map(row => row.name)).toEqual(["b", "right-new"]);
+    } finally {
+      await right.close();
+      setConfigSource();
+    }
+    expect(existsSync(sentinel)).toBe(false);
+  });
+});
 
 test("update deactivates a blanked file and restores it when content returns", async () => {
   const root = await mkdtemp(join(testDir, "blanked-"));
@@ -1031,6 +1209,39 @@ describe("embed", () => {
       },
     };
   }
+
+  test("projected sync embeds only pending content and removes stale rows without breaking shared embeddings", async () => {
+    const store = await createStore({ dbPath: freshDbPath(), config: {
+      collections: { projected: { projected: true }, retained: { projected: true } },
+    } });
+    Object.assign(store.internal.llm!, createFakeTokenizer(), createFakeEmbedLlm());
+    const keep = { path: "keep.md", content: "shared log" };
+    const remove = { path: "remove.md", content: "revoked log" };
+    try {
+      const shared = await store.upsertDocument("retained", "also.md", keep.content);
+      const first = await store.syncProjectedCollection("projected", [keep, remove], { embed: true, chunkStrategy: "semantic" });
+      expect(first).toEqual({ upserted: 2, unchanged: 0, retracted: 0, embedded: 2, generation: 1 });
+      expect(await store.syncProjectedCollection("projected", [keep, remove], { embed: true })).toEqual({
+        upserted: 0, unchanged: 2, retracted: 0, embedded: 0, generation: 1,
+      });
+      expect(await store.syncProjectedCollection("projected", [], { cleanup: false })).toEqual({
+        upserted: 0, unchanged: 0, retracted: 2, embedded: 0, generation: 2,
+      });
+      const db = store.internal.db;
+      expect(db.prepare("SELECT hash FROM content_vectors ORDER BY hash").all()).toHaveLength(2);
+      expect(await store.syncProjectedCollection("projected", [])).toEqual({
+        upserted: 0, unchanged: 0, retracted: 0, embedded: 0, generation: 3,
+      });
+      expect(db.prepare("SELECT hash FROM content").all()).toEqual([{ hash: shared.hash }]);
+      expect(db.prepare("SELECT hash FROM content_vectors").all()).toEqual([{ hash: shared.hash }]);
+      expect(db.prepare("SELECT hash_seq FROM vectors_vec").all()).toEqual([{ hash_seq: `${shared.hash}_0` }]);
+      expect(await store.getDocumentBody("qmd://retained/also.md")).toBe(keep.content);
+      expect((await store.syncProjectedCollection("projected", [])).generation).toBe(3);
+      expect(await store.getCollectionGeneration("retained")).toBe(shared.generation);
+    } finally {
+      await store.close();
+    }
+  });
 
   test("store.embed forwards batch limit options", async () => {
     const store = await createStore({

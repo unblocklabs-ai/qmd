@@ -269,6 +269,48 @@ Set `idleEmbeddingContexts` to choose a different positive retained count. By
 default, QMD keeps the batch pool until unloading it after five minutes without
 a model operation.
 
+#### Projected collections
+
+Use a projected collection when an application owns the source records. QMD
+indexes the supplied bodies verbatim and skips the collection during filesystem
+updates. Paths are collection-relative logical IDs such as `sessions/123.md`.
+
+```typescript
+import { createStore, openReadOnlySnapshot } from '@unblocklabs/qmd'
+
+const store = await createStore({
+  dbPath: './index.sqlite',
+  config: { collections: { sessions: { projected: true } } },
+})
+const { generation } = await store.syncProjectedCollection('sessions', [
+  { path: '123.md', title: 'Planning session', content: 'We agreed to ship Friday.' },
+], { embed: true })
+
+const snapshot = openReadOnlySnapshot('./index.sqlite')
+try {
+  console.log(snapshot.getCollectionGeneration('sessions'))
+  console.log(snapshot.getDocumentBody('sessions', '123.md'))
+} finally {
+  snapshot.close()
+  await store.close()
+}
+```
+
+`upsertDocument` and `retractDocument` change one path. Sync reconciles the
+entire set, retracts omitted paths, and removes orphaned content and embeddings
+by default. The generation advances once per committed change or cleanup, not
+on a no-op. Optional embedding runs after that commit; use
+`getCollectionGeneration` to recover the acknowledgement if embedding fails or
+is aborted. Chunk strategy is shared by the index.
+
+Snapshots see committed data and do not run migrations or initialize models.
+Close snapshots promptly: a live snapshot holds a SQLite read transaction. If a
+checkpointed source starts changing, close and reopen its snapshot.
+
+For source adapters that call `chunkMarkdownSemantically` directly, pass
+`ChunkingOptions` to customize speaker and backfill markers and add structural
+noise detectors. The existing rules remain the defaults.
+
 #### Search
 
 The unified `search()` method handles both simple queries and pre-expanded structured queries:

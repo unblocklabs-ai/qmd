@@ -11,12 +11,14 @@
  * SQLite build before creating any database instances.
  */
 
+import { createRequire } from "node:module";
+
 export const isBun = "Bun" in globalThis;
 
 export type SQLiteValue = string | number | bigint | Buffer | Uint8Array | Float32Array | null;
 type SQLiteParams = readonly SQLiteValue[];
 
-type DatabaseConstructor = new (path: string) => Database;
+type DatabaseConstructor = new (path: string, options?: { readonly?: boolean }) => Database;
 type LoadableSqliteDatabase = Pick<Database, "loadExtension">;
 
 let _Database: DatabaseConstructor;
@@ -121,6 +123,20 @@ export function openDatabase(path: string): Database {
   db.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
   enableWal(db, busyTimeoutMs);
   return db;
+}
+
+type SnapshotDatabase = {
+  exec(sql: string): void;
+  prepare(sql: string): { all(...params: string[]): unknown[]; get(...params: string[]): unknown };
+  close(): void;
+};
+
+export function openSnapshotDatabase(uri: URL): SnapshotDatabase {
+  if (isBun) return new _Database(uri.href, { readonly: true });
+  // Node's driver honors SQLite URI options without configuring the process-wide
+  // better-sqlite3 addon. Load it only when the snapshot API is used.
+  const { DatabaseSync }: typeof import("node:sqlite") = createRequire(import.meta.url)("node:sqlite");
+  return new DatabaseSync(uri.href, { readOnly: true });
 }
 
 /**
