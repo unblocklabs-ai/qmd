@@ -11,6 +11,7 @@
  * SQLite build before creating any database instances.
  */
 
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 
 export const isBun = "Bun" in globalThis;
@@ -18,7 +19,10 @@ export const isBun = "Bun" in globalThis;
 export type SQLiteValue = string | number | bigint | Buffer | Uint8Array | Float32Array | null;
 type SQLiteParams = readonly SQLiteValue[];
 
-type DatabaseConstructor = new (path: string, options?: { readonly?: boolean }) => Database;
+type DatabaseConstructor = {
+  new (path: string, options?: { readonly?: boolean }): Database;
+  deserialize?: (data: Uint8Array, options?: { readonly?: boolean }) => SnapshotDatabase;
+};
 type LoadableSqliteDatabase = Pick<Database, "loadExtension">;
 
 let _Database: DatabaseConstructor;
@@ -132,10 +136,25 @@ type SnapshotDatabase = {
 };
 
 export function openSnapshotDatabase(path: string, uri: URL, idle: boolean): SnapshotDatabase {
-  if (isBun) return new _Database(uri.href, { readonly: true });
+  if (isBun) {
+    try {
+      return new _Database(uri.href, { readonly: true });
+    } catch {
+      if (!idle) return new _Database(path, { readonly: true });
+      // Linux Bun's bundled SQLite lacks SQLITE_USE_URI; deserialize the idle checkpointed
+      // file in memory with WAL header bytes 18-19 switched to legacy mode so zero sidecars are created.
+      const bytes = readFileSync(path);
+      if (bytes.length >= 20 && bytes[18] === 2 && bytes[19] === 2) {
+        bytes[18] = 1;
+        bytes[19] = 1;
+      }
+      if (!_Database.deserialize) throw new Error("bun:sqlite Database.deserialize unavailable for read-only snapshot");
+      return _Database.deserialize(bytes, { readonly: true });
+    }
+  }
   // Live WAL files may already be open in this process via better-sqlite3; reuse the same
   // SQLite library so closing the snapshot never drops another connection's POSIX locks on macOS.
-  if (!idle) return new _Database(path, { readonly: true }) as SnapshotDatabase;
+  if (!idle) return new _Database(path, { readonly: true });
   // Idle checkpointed WAL files: node:sqlite honors ?immutable=1 so opening creates zero sidecars.
   const { DatabaseSync }: typeof import("node:sqlite") = createRequire(import.meta.url)("node:sqlite");
   return new DatabaseSync(uri.href, { readOnly: true });
