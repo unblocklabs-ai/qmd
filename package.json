@@ -1,6 +1,6 @@
 {
   "name": "@unblocklabs/qmd",
-  "version": "3.2.0",
+  "version": "3.3.0",
   "description": "Query Markup Documents - Local BM25/vector indexing and retrieval for Unblock Memory",
   "type": "module",
   "main": "dist/index.js",
@@ -104,7 +104,7 @@
     "typescript": "^5.9.3"
   },
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.16.0"
   },
   "keywords": [
     "markdown",

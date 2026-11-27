@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-11-27
+
+### Features
+
+- Add first-class projected collections (`projected: true`) with `upsertDocument`, `retractDocument`, `syncProjectedCollection`, and `getCollectionGeneration` (monotonic per-collection generation tracking and orphan cleanup, skipping filesystem scans on `update()`).
+- Export `openReadOnlySnapshot(dbPath)` for genuinely read-only SQLite reads without clobbering global config, and isolate inline `createStore({ config })` config sources per store.
+- Export pluggable `StructuralNoiseOptions` / `ChunkingOptions` hooks (`OPENCLAW_REM_NOISE_DETECTOR`, `OPENCLAW_CHUNKING_SOURCE`) while keeping standalone defaults backwards-compatible.
+
 ## [3.2.0] - 2026-11-25
 
 ### Features

@@ -1586,39 +1586,35 @@ export function setStoreGlobalContext(db: Database, value: string | undefined): 
 export function syncConfigToDb(db: Database, config: CollectionConfig): void {
   // Config sync can be called on an older DB before a Store has opened it.
   ensureProjectedCollectionColumn(db);
-  // Check config hash — skip sync if unchanged
   const configJson = JSON.stringify(config);
   const hash = createHash('sha256').update(configJson).digest('hex');
 
-  const existingHash = db.prepare(`SELECT value FROM store_config WHERE key = 'config_hash'`).get() as { value: string } | null | undefined;
-  if (existingHash != null && existingHash.value === hash) {
-    return; // Config unchanged, skip sync
-  }
-
-  // Sync collections
-  const configNames = new Set(Object.keys(config.collections));
-
-  for (const [name, coll] of Object.entries(config.collections)) {
-    upsertStoreCollection(db, name, coll);
-  }
-
-  // Delete collections not in config
-  const dbCollections = db.prepare(`SELECT name FROM store_collections`).all() as { name: string }[];
-  for (const row of dbCollections) {
-    if (!configNames.has(row.name)) {
-      db.prepare(`DELETE FROM store_collections WHERE name = ?`).run(row.name);
+  db.transaction(() => {
+    const existingHash = db.prepare(`SELECT value FROM store_config WHERE key = 'config_hash'`).get() as { value: string } | null | undefined;
+    if (existingHash != null && existingHash.value === hash) {
+      return; // Config unchanged, skip sync
     }
-  }
 
-  // Sync global context
-  if (config.global_context !== undefined) {
-    setStoreGlobalContext(db, config.global_context);
-  } else {
-    setStoreGlobalContext(db, undefined);
-  }
+    const configNames = new Set(Object.keys(config.collections));
+    for (const [name, coll] of Object.entries(config.collections)) {
+      upsertStoreCollection(db, name, coll);
+    }
 
-  // Save config hash
-  db.prepare(`INSERT INTO store_config (key, value) VALUES ('config_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(hash);
+    const dbCollections = db.prepare(`SELECT name FROM store_collections`).all() as { name: string }[];
+    for (const row of dbCollections) {
+      if (!configNames.has(row.name)) {
+        db.prepare(`DELETE FROM store_collections WHERE name = ?`).run(row.name);
+      }
+    }
+
+    if (config.global_context !== undefined) {
+      setStoreGlobalContext(db, config.global_context);
+    } else {
+      setStoreGlobalContext(db, undefined);
+    }
+
+    db.prepare(`INSERT INTO store_config (key, value) VALUES ('config_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(hash);
+  }).immediate();
 }
 
 
@@ -1866,6 +1862,7 @@ export async function reindexCollection(
         const stat = statSync(filepath);
         updateDocument(db, existing.id, title, hash,
           stat ? new Date(stat.mtime).toISOString() : now);
+        bumpCollectionGeneration(db, collectionName, now);
         updated++;
       }
     } else {
@@ -1875,6 +1872,7 @@ export async function reindexCollection(
       insertDocument(db, collectionName, path, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
         stat ? new Date(stat.mtime).toISOString() : now);
+      bumpCollectionGeneration(db, collectionName, now);
     }
 
     processed++;
@@ -1892,7 +1890,7 @@ export async function reindexCollection(
   }
 
   const orphanedCleaned = cleanupOrphanedContent(db);
-  if (indexed || updated || removed) bumpCollectionGeneration(db, collectionName, now);
+  if (removed) bumpCollectionGeneration(db, collectionName, now);
 
   return { indexed, updated, unchanged, removed, orphanedCleaned, skipped: skippedFiles.length, skippedFiles };
 }
@@ -2339,6 +2337,9 @@ export async function generateEmbeddings(
           );
         }
 
+        if (session.signal.aborted || options?.signal?.aborted) {
+          throw new Error("Embedding aborted before writing chunks");
+        }
         removeStaleEmbeddingChunks(db, doc.hash, model, fingerprint);
         db.prepare("DELETE FROM content_embedding_empty WHERE hash = ? AND model = ?").run(doc.hash, model);
         if (chunks.length === 0) {

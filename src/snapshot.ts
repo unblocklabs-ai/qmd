@@ -35,7 +35,7 @@ export function openReadOnlySnapshot(dbPath: string): ReadOnlySnapshot {
   };
   const initial = idle ? version() : undefined;
   uri.search = idle ? "immutable=1" : "readonly_shm=1";
-  const db = openSnapshotDatabase(uri);
+  const db = openSnapshotDatabase(path, uri, idle);
   const assertUnchanged = () => {
     if (idle && (version() !== initial || walSize() !== 0 || existsSync(`${path}-journal`))) {
       throw new Error("SQLite snapshot source changed; close and reopen the snapshot");

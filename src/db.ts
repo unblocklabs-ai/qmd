@@ -131,10 +131,12 @@ type SnapshotDatabase = {
   close(): void;
 };
 
-export function openSnapshotDatabase(uri: URL): SnapshotDatabase {
+export function openSnapshotDatabase(path: string, uri: URL, idle: boolean): SnapshotDatabase {
   if (isBun) return new _Database(uri.href, { readonly: true });
-  // Node's driver honors SQLite URI options without configuring the process-wide
-  // better-sqlite3 addon. Load it only when the snapshot API is used.
+  // Live WAL files may already be open in this process via better-sqlite3; reuse the same
+  // SQLite library so closing the snapshot never drops another connection's POSIX locks on macOS.
+  if (!idle) return new _Database(path, { readonly: true }) as SnapshotDatabase;
+  // Idle checkpointed WAL files: node:sqlite honors ?immutable=1 so opening creates zero sidecars.
   const { DatabaseSync }: typeof import("node:sqlite") = createRequire(import.meta.url)("node:sqlite");
   return new DatabaseSync(uri.href, { readOnly: true });
 }
